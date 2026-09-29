@@ -1,0 +1,13 @@
+[package]
+name = "resonance-node"
+description = "A Resonance relay node: the room-scoped TURN core on a UDP socket."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+getrandom = "0.3"
+resonance-turn.workspace = true
+socket2 = "0.6"

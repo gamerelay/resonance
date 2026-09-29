@@ -1,0 +1,24 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --release
+      - run: FUZZ_ITERS=2000000 cargo test --release --test fuzz
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: interop/go.mod
+      - name: interop with pion's TURN client
+        run: cd interop && go test -count=1 ./...
