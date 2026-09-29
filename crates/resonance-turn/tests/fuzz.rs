@@ -65,18 +65,26 @@ fn nothing_panics_and_nothing_goes_astray() {
         .map(|i| format!("{}:ins:g{}:p{i}", UNIX + 7200, i % 2))
         .collect();
 
-    // A nonce, then an allocation and a permission for each client.
+    // A nonce (each client's own: they're bound to its address), then an allocation and a
+    // permission for each client.
     let mut out = Output::default();
-    let mut first = Vec::new();
-    Writer::new(&mut first, method::ALLOCATE, Class::Request, [0; 12]);
-    s.handle(t, clients[0], &first, &mut out);
-    let nonce = Message::parse(out.iter().next().unwrap().1)
-        .unwrap()
-        .str_attr(attr::NONCE)
-        .unwrap()
-        .to_owned();
+    let mut nonces = Vec::new();
     let mut relayed = Vec::new();
     for (i, (&c, name)) in clients.iter().zip(&names).enumerate() {
+        out.clear();
+        let mut first = Vec::new();
+        Writer::new(
+            &mut first,
+            method::ALLOCATE,
+            Class::Request,
+            [0x80 + i as u8; 12],
+        );
+        s.handle(t, c, &first, &mut out);
+        let nonce = Message::parse(out.iter().next().unwrap().1)
+            .unwrap()
+            .str_attr(attr::NONCE)
+            .unwrap()
+            .to_owned();
         out.clear();
         let req = signed(method::ALLOCATE, [i as u8 + 1; 12], name, &nonce, |w| {
             w.attr(attr::REQUESTED_TRANSPORT, &[17, 0, 0, 0]);
@@ -84,30 +92,32 @@ fn nothing_panics_and_nothing_goes_astray() {
         s.handle(t, c, &req, &mut out);
         let m = Message::parse(out.iter().next().unwrap().1).unwrap();
         relayed.push(m.xor_address(attr::XOR_RELAYED_ADDRESS).expect("allocated"));
+        nonces.push(nonce);
     }
     let known: HashSet<SocketAddr> = clients.iter().copied().collect();
 
     // The seed corpus: every kind of valid packet a client sends.
     let mut corpus: Vec<(usize, Vec<u8>)> = Vec::new();
     for (i, name) in names.iter().enumerate() {
+        let nonce = &nonces[i];
         let peer = relayed[(i + 2) % relayed.len()];
         let tx = [0x40 + i as u8; 12];
         corpus.push((
             i,
-            signed(method::CREATE_PERMISSION, tx, name, &nonce, |w| {
+            signed(method::CREATE_PERMISSION, tx, name, nonce, |w| {
                 w.xor_address(attr::XOR_PEER_ADDRESS, peer);
             }),
         ));
         corpus.push((
             i,
-            signed(method::CHANNEL_BIND, tx, name, &nonce, |w| {
+            signed(method::CHANNEL_BIND, tx, name, nonce, |w| {
                 w.attr(attr::CHANNEL_NUMBER, &[0x40, i as u8, 0, 0])
                     .xor_address(attr::XOR_PEER_ADDRESS, peer);
             }),
         ));
         corpus.push((
             i,
-            signed(method::REFRESH, tx, name, &nonce, |w| {
+            signed(method::REFRESH, tx, name, nonce, |w| {
                 w.u32(attr::LIFETIME, 600);
             }),
         ));

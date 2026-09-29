@@ -2,6 +2,8 @@
 //! this node's own key (Resonance v0 §3). Username `expiry:instance:roomGroup:player`, password
 //! base64(HMAC-SHA1(node key, username)).
 
+use std::net::{IpAddr, SocketAddr};
+
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
@@ -52,8 +54,10 @@ pub fn long_term_key(username: &str, realm: &str, password: &str) -> [u8; 16] {
     h.finalize().into()
 }
 
-/// Nonces need no state: the time they lapse and a MAC over it, with a key made at startup.
-/// `<expiry hex>-<16 hex of HMAC-SHA256(key, expiry)>`.
+/// Nonces need no state: the time they lapse and a MAC over it and the client's address, with a
+/// key made at startup. `<expiry hex>-<16 hex of HMAC-SHA256(key, expiry, ip, port)>`. Bound to
+/// the address, so a nonce seen on the wire is no use from anywhere else (a browser that changes
+/// its source port starts over unauthenticated anyway).
 pub struct Nonces {
     key: [u8; 32],
     pub lifetime_s: u64,
@@ -67,38 +71,34 @@ impl Nonces {
         }
     }
 
-    fn mac(&self, expiry: u64) -> [u8; 8] {
+    fn mac(&self, expiry: u64, client: SocketAddr) -> String {
         let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.key).expect("any key length");
         mac.update(&expiry.to_be_bytes());
-        let sum = mac.finalize().into_bytes();
-        sum[..8].try_into().unwrap()
-    }
-
-    pub fn issue(&self, unix_now: u64) -> String {
-        let expiry = unix_now + self.lifetime_s;
-        let m = self.mac(expiry);
-        let mut s = format!("{expiry:x}-");
-        for b in m {
-            s.push_str(&format!("{b:02x}"));
+        match client.ip().to_canonical() {
+            IpAddr::V4(ip) => mac.update(&ip.octets()),
+            IpAddr::V6(ip) => mac.update(&ip.octets()),
         }
-        s
+        mac.update(&client.port().to_be_bytes());
+        let sum = mac.finalize().into_bytes();
+        sum[..8].iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// Ours and unexpired. Ours but expired is `Stale` (the client retries with a fresh one).
-    pub fn check(&self, nonce: &str, unix_now: u64) -> NonceCheck {
+    pub fn issue(&self, unix_now: u64, client: SocketAddr) -> String {
+        let expiry = unix_now + self.lifetime_s;
+        format!("{expiry:x}-{}", self.mac(expiry, client))
+    }
+
+    /// Ours, for this client, and unexpired. Ours but expired is `Stale` (the client retries
+    /// with a fresh one); anything else, another client's included, is `Bad`.
+    pub fn check(&self, nonce: &str, unix_now: u64, client: SocketAddr) -> NonceCheck {
         let Some((exp, mac)) = nonce.split_once('-') else {
             return NonceCheck::Bad;
         };
         let Ok(expiry) = u64::from_str_radix(exp, 16) else {
             return NonceCheck::Bad;
         };
-        let want = self.mac(expiry);
-        let mut hex = String::with_capacity(16);
-        for b in want {
-            hex.push_str(&format!("{b:02x}"));
-        }
-        // Not secret-dependent timing worth guarding: a nonce isn't a credential.
-        if mac != hex {
+        // A nonce isn't a credential, so timing here gives nothing away.
+        if mac != self.mac(expiry, client) {
             return NonceCheck::Bad;
         }
         if expiry <= unix_now {
@@ -161,16 +161,44 @@ mod tests {
     #[test]
     fn nonces() {
         let n = Nonces::new([9; 32]);
-        let nonce = n.issue(1000);
-        assert_eq!(n.check(&nonce, 1000), NonceCheck::Ok);
-        assert_eq!(n.check(&nonce, 1000 + 3600), NonceCheck::Stale);
+        let me: SocketAddr = "198.51.100.1:5000".parse().unwrap();
+        let nonce = n.issue(1000, me);
+        assert_eq!(n.check(&nonce, 1000, me), NonceCheck::Ok);
         assert_eq!(
-            Nonces::new([8; 32]).check(&nonce, 1000),
+            n.check(&nonce, 1000, "[::ffff:198.51.100.1]:5000".parse().unwrap()),
+            NonceCheck::Ok,
+            "IPv4-mapped is the same client"
+        );
+        assert_eq!(n.check(&nonce, 1000 + 3600, me), NonceCheck::Stale);
+        assert_eq!(
+            Nonces::new([8; 32]).check(&nonce, 1000, me),
             NonceCheck::Bad,
             "another node's"
         );
-        for bad in ["", "x", "abc-def", "e10-0000000000000000"] {
-            assert_eq!(n.check(bad, 1000), NonceCheck::Bad);
+        assert_eq!(
+            n.check(&nonce, 1000, "198.51.100.2:5000".parse().unwrap()),
+            NonceCheck::Bad,
+            "another IP"
+        );
+        assert_eq!(
+            n.check(&nonce, 1000, "198.51.100.1:5001".parse().unwrap()),
+            NonceCheck::Bad,
+            "another port"
+        );
+        for i in 0..nonce.len() {
+            let mut b = nonce.clone().into_bytes();
+            b[i] = if b[i] == b'0' { b'1' } else { b'0' };
+            let tampered = String::from_utf8(b).unwrap();
+            assert_ne!(n.check(&tampered, 1000, me), NonceCheck::Ok, "{tampered}");
+        }
+        for bad in [
+            "",
+            "x",
+            "abc-def",
+            "e10-0000000000000000",
+            "ffffffffffffffffff-00",
+        ] {
+            assert_eq!(n.check(bad, 1000, me), NonceCheck::Bad);
         }
     }
 

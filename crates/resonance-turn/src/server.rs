@@ -40,6 +40,9 @@ pub struct Config {
     pub max_lifetime_s: u32,
     pub permission_lifetime: Duration,
     pub channel_lifetime: Duration,
+    /// How long past its lifetime an allocation is kept: a refresh that's late by a lost packet
+    /// or two (Firefox refreshes only 10 s before the end) still finds it.
+    pub grace: Duration,
     /// Makes nonces; any random bytes, new at each start.
     pub nonce_key: [u8; 32],
 }
@@ -66,6 +69,7 @@ impl Config {
             max_lifetime_s: 3600,
             permission_lifetime: Duration::from_secs(300),
             channel_lifetime: Duration::from_secs(600),
+            grace: Duration::from_secs(60),
             nonce_key,
         }
     }
@@ -248,22 +252,29 @@ impl Server {
         let Some(msg) = Message::parse(packet) else {
             return;
         };
-        let allocated = self.live_alloc(from, now).is_some();
-        if msg.class == Class::Request
-            && !msg.has(attr::MESSAGE_INTEGRITY)
-            && !allocated
-            && !self.limiter.allow(from.ip(), now)
-        {
+        // A Binding answer goes to whatever source the request claims, so an unknown source's are
+        // budgeted (refusals are budgeted in `refuse`).
+        if msg.class == Class::Request && msg.method == method::BINDING && !self.budget(from, now) {
             return;
         }
         match (msg.class, msg.method) {
             (Class::Indication, method::SEND) => self.send_indication(now, from, &msg, out),
             (Class::Request, m) => {
-                if let Some(kind) = msg.unknown_required() {
+                if msg.unknown_required().next().is_some() {
+                    if msg.method != method::BINDING && !self.budget(from, now) {
+                        return;
+                    }
+                    // Every one of them, up to 16 (a request that big is junk anyway).
+                    let mut unknown = [0u8; 32];
+                    let mut n = 0;
+                    for kind in msg.unknown_required().take(16) {
+                        unknown[n..n + 2].copy_from_slice(&kind.to_be_bytes());
+                        n += 2;
+                    }
                     let start = out.start();
                     let mut w = Writer::new(&mut out.buf, m, Class::Error, msg.tx);
                     w.error(420, "Unknown Attribute")
-                        .attr(attr::UNKNOWN_ATTRIBUTES, &kind.to_be_bytes());
+                        .attr(attr::UNKNOWN_ATTRIBUTES, &unknown[..n]);
                     w.fingerprint();
                     out.push(from, start);
                     return;
@@ -295,12 +306,31 @@ impl Server {
         }
     }
 
-    fn refuse(&self, now: Instant, from: SocketAddr, msg: &Message, r: Refusal, out: &mut Output) {
+    /// May an unknown source get an unsigned answer? Every such answer (a Binding response, a
+    /// 401, a 438, a 400) goes to whatever source the request claims, a few times its size, so a
+    /// spoofed source could aim this relay at someone: 20 a second per IP (burst 64, a shared
+    /// address filling its allocation cap at once). A client with an allocation is known.
+    fn budget(&mut self, from: SocketAddr, now: Instant) -> bool {
+        self.live_alloc(from, now).is_some() || self.limiter.allow(from.ip(), now)
+    }
+
+    fn refuse(
+        &mut self,
+        now: Instant,
+        from: SocketAddr,
+        msg: &Message,
+        r: Refusal,
+        out: &mut Output,
+    ) {
+        // A signed refusal went to a client that proved its credentials.
+        if r.key.is_none() && !self.budget(from, now) {
+            return;
+        }
         let start = out.start();
         let mut w = Writer::new(&mut out.buf, msg.method, Class::Error, msg.tx);
         w.error(r.code, r.reason);
         if matches!(r.code, 401 | 438) {
-            let nonce = self.nonces.issue(self.unix(now));
+            let nonce = self.nonces.issue(self.unix(now), from);
             w.attr(attr::REALM, self.cfg.realm.as_bytes())
                 .attr(attr::NONCE, nonce.as_bytes());
         }
@@ -342,26 +372,38 @@ impl Server {
             reason: "Unauthorized",
             key: None,
         };
+        let bad = Refusal {
+            code: 400,
+            reason: "Bad Request",
+            key: None,
+        };
+        // No MESSAGE-INTEGRITY: the first request of every client, answered with a nonce.
+        // MESSAGE-INTEGRITY without the rest is malformed (RFC 8489 §9.2.4).
+        if !msg.has(attr::MESSAGE_INTEGRITY) {
+            return Err(unauthorized);
+        }
         let (Some(username), Some(realm), Some(nonce)) = (
             msg.str_attr(attr::USERNAME),
             msg.str_attr(attr::REALM),
             msg.str_attr(attr::NONCE),
         ) else {
-            return Err(unauthorized);
+            return Err(bad);
         };
-        if !msg.has(attr::MESSAGE_INTEGRITY) || realm != self.cfg.realm {
+        // USERNAME is under 513 bytes (RFC 8489 §14.3): nothing longer is hashed.
+        if username.len() > 512 {
+            return Err(bad);
+        }
+        if realm != self.cfg.realm {
             return Err(unauthorized);
         }
-        match self.nonces.check(nonce, self.unix(now)) {
-            NonceCheck::Ok => {}
-            NonceCheck::Stale => {
-                return Err(Refusal {
-                    code: 438,
-                    reason: "Stale Nonce",
-                    key: None,
-                });
-            }
-            NonceCheck::Bad => return Err(unauthorized),
+        // Stale, from before a restart, or another client's: 438 with a fresh one, which every
+        // browser retries (a 401 on a Refresh would end the allocation in Chrome).
+        if self.nonces.check(nonce, self.unix(now), from) != NonceCheck::Ok {
+            return Err(Refusal {
+                code: 438,
+                reason: "Stale Nonce",
+                key: None,
+            });
         }
         let Some(user) = auth::parse_username(username) else {
             return Err(unauthorized);
@@ -464,7 +506,7 @@ impl Server {
             user,
             username,
             key,
-            expires: now + Duration::from_secs(lifetime_s.into()),
+            expires: now + Duration::from_secs(lifetime_s.into()) + self.cfg.grace,
             lifetime_s,
             permission_expires: None,
             channels: Vec::new(),
@@ -612,23 +654,37 @@ impl Server {
             self.success(from, msg, &key, Some(0), out);
             return Ok(());
         }
-        let lifetime_s = self.lifetime(msg);
+        let (lifetime_s, grace) = (self.lifetime(msg), self.cfg.grace);
         let a = self.alloc_mut(i);
         a.lifetime_s = lifetime_s;
-        a.expires = now + Duration::from_secs(lifetime_s.into());
+        a.expires = now + Duration::from_secs(lifetime_s.into()) + grace;
         self.success(from, msg, &key, Some(lifetime_s), out);
         Ok(())
     }
 
-    /// Only this relay's own address: both players of a pair allocate here.
-    fn peer_allowed(&mut self, peer: SocketAddr) -> bool {
-        let ok = peer.ip().to_canonical() == self.cfg.public_ip;
-        if ok {
+    /// Only this relay's own address: both players of a pair allocate here. Another address
+    /// family is 443 (RFC 8656 §9.3), anything else of ours 403; both are signed, since a
+    /// Firefox that can't verify the answer retransmits until the whole allocation fails.
+    fn peer_refusal(&mut self, peer: SocketAddr, key: [u8; 16]) -> Option<Refusal> {
+        let ip = peer.ip().to_canonical();
+        if ip == self.cfg.public_ip {
             self.stats.permissions_allowed += 1;
-        } else {
-            self.stats.permissions_denied += 1;
+            return None;
         }
-        ok
+        self.stats.permissions_denied += 1;
+        Some(if ip.is_ipv4() != self.cfg.public_ip.is_ipv4() {
+            Refusal {
+                code: 443,
+                reason: "Peer Address Family Mismatch",
+                key: Some(key),
+            }
+        } else {
+            Refusal {
+                code: 403,
+                reason: "Forbidden",
+                key: Some(key),
+            }
+        })
     }
 
     fn create_permission(
@@ -654,12 +710,8 @@ impl Server {
                     key: Some(key),
                 });
             };
-            if !self.peer_allowed(peer) {
-                return Err(Refusal {
-                    code: 403,
-                    reason: "Forbidden",
-                    key: Some(key),
-                });
+            if let Some(r) = self.peer_refusal(peer, key) {
+                return Err(r);
             }
             peers += 1;
         }
@@ -699,12 +751,8 @@ impl Server {
         let Some(peer) = msg.xor_address(attr::XOR_PEER_ADDRESS) else {
             return Err(bad);
         };
-        if !self.peer_allowed(peer) {
-            return Err(Refusal {
-                code: 403,
-                reason: "Forbidden",
-                key: Some(key),
-            });
+        if let Some(r) = self.peer_refusal(peer, key) {
+            return Err(r);
         }
         let (channel_life, permission_life) =
             (self.cfg.channel_lifetime, self.cfg.permission_lifetime);

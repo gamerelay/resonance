@@ -28,7 +28,7 @@ Chrome relay through it. Joining the network by itself (registry, heartbeats) is
 |---|---|
 | [`resonance-turn`](crates/resonance-turn) | The TURN relay, sans-I/O: `handle(now, from, packet) → packets`. Every rule lives here, testable without sockets. Its own STUN codec: parsed in place, nothing allocated per packet. |
 | [`resonance-node`](crates/resonance-node) | The binary: the core on one UDP socket, plus config and logs. |
-| [`interop`](interop) | pion's TURN client against the built node, over real UDP. |
+| [`interop`](interop) | Other clients against the built node, over real UDP: pion's (`go test`), coturn's (`coturn.sh`), and Chromium, Firefox and WebKit's own (`browsers/relay.mjs`, every pairing). Also the benchmark (`cmd/bench`). |
 
 ## Running a node
 
@@ -47,7 +47,15 @@ It listens on UDP 3478 (`TURN_PORT`). Relay addresses use ports 49152–65535 (`
 cargo test --release                                     # the core, and a fuzz run
 FUZZ_ITERS=5000000 cargo test --release --test fuzz      # a longer fuzz run
 cd interop && go test ./...                              # pion's client against the node
+interop/coturn.sh                                        # coturn's client (needs coturn installed)
+# Chromium, Firefox and WebKit, every pairing (Linux: Firefox leaves loopback out of ICE):
+docker run --rm -v "$PWD":/w -w /w/interop/browsers mcr.microsoft.com/playwright:v1.63.0-noble \
+  sh -c 'npm i --no-save playwright@1.63.0 && NODE_BIN=/w/target/release/resonance-node node relay.mjs'
 ```
+
+`crates/resonance-turn/tests/conformance.rs` holds what other TURN servers and the browsers'
+clients check: RFC 5769's vectors, real Chrome and Firefox captures (`tests/testdata`, from pion),
+coturn's and eturnal's auth corner cases, and libwebrtc's and nICEr's behavior on the wire.
 
 The design is in GameRelay's repo:
 `docs/superpowers/specs/2026-09-29-resonance-v0-design.md`.

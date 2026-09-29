@@ -22,3 +22,17 @@ jobs:
           go-version-file: interop/go.mod
       - name: interop with pion's TURN client
         run: cd interop && go test -count=1 ./...
+      - name: interop with coturn's TURN client
+        run: sudo apt-get install -y -qq coturn && interop/coturn.sh
+
+  browsers:
+    # Chromium, Firefox and WebKit's own TURN clients through the node, every pairing, relay only.
+    runs-on: ubuntu-latest
+    container: mcr.microsoft.com/playwright:v1.63.0-noble
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release -p resonance-node
+      - name: every browser pairing through the node
+        working-directory: interop/browsers
+        run: npm i --no-save playwright@1.63.0 && NODE_BIN=$GITHUB_WORKSPACE/target/release/resonance-node node relay.mjs

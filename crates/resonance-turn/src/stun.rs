@@ -187,9 +187,31 @@ impl<'a> Message<'a> {
         self.get(kind).is_some()
     }
 
-    /// The first comprehension-required attribute this relay doesn't know, if any.
-    pub fn unknown_required(&self) -> Option<u16> {
-        self.attrs().map(|a| a.kind).find(|&k| !understood(k))
+    /// The comprehension-required attributes this relay doesn't know, before MESSAGE-INTEGRITY:
+    /// what follows it is unsigned and ignored (an RFC 8489 client puts
+    /// MESSAGE-INTEGRITY-SHA256 there, and must not get a 420 for it).
+    pub fn unknown_required(&self) -> impl Iterator<Item = u16> + 'a {
+        self.attrs()
+            .map(|a| a.kind)
+            .take_while(|&k| k != attr::MESSAGE_INTEGRITY)
+            .filter(|&k| !understood(k))
+    }
+
+    /// FINGERPRINT, if present, checks out: CRC-32 of the message up to it, XOR 0x5354554E, with
+    /// the length set as if it ended there (RFC 8489 §14.7). Absent is fine.
+    pub fn fingerprint_ok(&self) -> bool {
+        let Some(fp) = self.attrs().find(|a| a.kind == attr::FINGERPRINT) else {
+            return true;
+        };
+        if fp.value.len() != 4 || fp.offset + 8 != self.raw.len() {
+            return false;
+        }
+        let len = (fp.offset + 8 - HEADER) as u16;
+        let mut h = crc32fast::Hasher::new();
+        h.update(&self.raw[..2]);
+        h.update(&len.to_be_bytes());
+        h.update(&self.raw[4..fp.offset]);
+        (h.finalize() ^ 0x5354_554E).to_be_bytes() == fp.value
     }
 
     /// MESSAGE-INTEGRITY checks out against key: HMAC-SHA1 over the message up to the attribute,

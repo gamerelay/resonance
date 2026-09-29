@@ -1,304 +1,16 @@
-#![allow(clippy::too_many_arguments)] // test helpers: a request is many parts
-
 //! The Go relay's tests (gamerelay.io deploy/turn/*_test.go), ported to the sans-I/O core, plus the
 //! relay path itself. A few Go tests guard against pion creating and deleting allocations out of
 //! step with the relay's own bookkeeping (reservations, late deletions); here one state machine
 //! does both, so those cases become the invariants checked in `deleted_allocations_free_everything`.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use resonance_turn::auth::password;
-use resonance_turn::stun::{self, Class, Message, Writer, attr, method};
-use resonance_turn::{Config, Output, Server};
 
-const KEY: &str = "fiahLYMg85YkiFJQ0Xp3Bl0x3pXkUhI4nMU8jj6QRio";
-const UNIX: u64 = 1_790_000_000;
-const PUBLIC: &str = "192.0.2.1";
-
-fn public() -> IpAddr {
-    PUBLIC.parse().unwrap()
-}
-
-fn server(t: Instant) -> Server {
-    Server::with_clock(Config::new(KEY, public(), [7; 32]), t, UNIX)
-}
-
-fn server_with(t: Instant, f: impl FnOnce(&mut Config)) -> Server {
-    let mut cfg = Config::new(KEY, public(), [7; 32]);
-    f(&mut cfg);
-    Server::with_clock(cfg, t, UNIX)
-}
-
-fn user(room: &str, player: &str) -> String {
-    format!("{}:ins:{room}:{player}", UNIX + 3600)
-}
-
-fn addr(s: &str) -> SocketAddr {
-    s.parse().unwrap()
-}
-
-/// A TURN client over one 5-tuple: long-term credentials, fetching a nonce when it has none.
-struct Client {
-    from: SocketAddr,
-    nonce: Option<String>,
-    tx: u32,
-}
-
-/// An answer, owned.
-struct Reply(Vec<u8>);
-
-impl Reply {
-    fn msg(&self) -> Message<'_> {
-        Message::parse(&self.0).expect("a STUN answer")
-    }
-    /// The error code, 0 for success.
-    fn code(&self) -> u16 {
-        let m = self.msg();
-        match m.class {
-            Class::Success => 0,
-            Class::Error => {
-                let v = m.get(attr::ERROR_CODE).unwrap();
-                v[2] as u16 * 100 + v[3] as u16
-            }
-            c => panic!("{c:?}"),
-        }
-    }
-}
-
-type Attrs<'a> = &'a [(u16, Vec<u8>)];
-
-fn transport() -> (u16, Vec<u8>) {
-    (attr::REQUESTED_TRANSPORT, vec![17, 0, 0, 0])
-}
-
-fn lifetime(s: u32) -> (u16, Vec<u8>) {
-    (attr::LIFETIME, s.to_be_bytes().to_vec())
-}
-
-/// The form the relay answers to: an IPv4-mapped IPv6 address is the IPv4 one.
-fn canon(a: SocketAddr) -> SocketAddr {
-    SocketAddr::new(a.ip().to_canonical(), a.port())
-}
-
-impl Client {
-    fn new(from: &str) -> Self {
-        Client {
-            from: addr(from),
-            nonce: None,
-            tx: 0,
-        }
-    }
-
-    /// Unique across every client in the test binary.
-    fn next_tx(&mut self) -> [u8; 12] {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        self.tx += 1;
-        let mut tx = [0u8; 12];
-        tx[4..].copy_from_slice(
-            &NEXT
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                .to_be_bytes(),
-        );
-        tx
-    }
-
-    fn send(&self, s: &mut Server, now: Instant, packet: &[u8]) -> Vec<(SocketAddr, Vec<u8>)> {
-        let mut out = Output::default();
-        s.handle(now, self.from, packet, &mut out);
-        out.iter().map(|(to, b)| (to, b.to_vec())).collect()
-    }
-
-    /// Exactly one answer, to this client.
-    fn ask(&self, s: &mut Server, now: Instant, packet: &[u8]) -> Reply {
-        let mut got = self.send(s, now, packet);
-        assert_eq!(got.len(), 1, "one answer");
-        let (to, b) = got.pop().unwrap();
-        assert_eq!(to, canon(self.from));
-        Reply(b)
-    }
-
-    fn build(
-        &self,
-        m: u16,
-        tx: [u8; 12],
-        username: &str,
-        pass: &str,
-        realm: &str,
-        attrs: Attrs,
-        peer: Option<SocketAddr>,
-    ) -> Vec<u8> {
-        let mut buf = Vec::new();
-        let mut w = Writer::new(&mut buf, m, Class::Request, tx);
-        for (k, v) in attrs {
-            w.attr(*k, v);
-        }
-        if let Some(p) = peer {
-            w.xor_address(attr::XOR_PEER_ADDRESS, p);
-        }
-        w.attr(attr::USERNAME, username.as_bytes())
-            .attr(attr::REALM, realm.as_bytes())
-            .attr(attr::NONCE, self.nonce.as_deref().unwrap_or("").as_bytes())
-            .integrity(&resonance_turn::auth::long_term_key(username, realm, pass))
-            .fingerprint();
-        buf
-    }
-
-    /// An authenticated request as username, with its real password.
-    fn request(
-        &mut self,
-        s: &mut Server,
-        now: Instant,
-        m: u16,
-        username: &str,
-        attrs: Attrs,
-    ) -> Reply {
-        self.request_to(s, now, m, username, attrs, None)
-    }
-
-    fn request_to(
-        &mut self,
-        s: &mut Server,
-        now: Instant,
-        m: u16,
-        username: &str,
-        attrs: Attrs,
-        peer: Option<SocketAddr>,
-    ) -> Reply {
-        self.request_as(s, now, m, username, &password(KEY, username), attrs, peer)
-    }
-
-    fn request_as(
-        &mut self,
-        s: &mut Server,
-        now: Instant,
-        m: u16,
-        username: &str,
-        pass: &str,
-        attrs: Attrs,
-        peer: Option<SocketAddr>,
-    ) -> Reply {
-        if self.nonce.is_none() {
-            let mut buf = Vec::new();
-            let tx = self.next_tx();
-            let mut w = Writer::new(&mut buf, m, Class::Request, tx);
-            for (k, v) in attrs {
-                w.attr(*k, v);
-            }
-            let r = self.ask(s, now, &buf);
-            assert_eq!(r.code(), 401, "the first request gets a nonce");
-            assert_eq!(r.msg().str_attr(attr::REALM), Some("gamerelay"));
-            self.nonce = Some(r.msg().str_attr(attr::NONCE).unwrap().to_owned());
-        }
-        let tx = self.next_tx();
-        let r = self.ask(
-            s,
-            now,
-            &self.build(m, tx, username, pass, "gamerelay", attrs, peer),
-        );
-        if r.code() == 438 {
-            self.nonce = Some(r.msg().str_attr(attr::NONCE).unwrap().to_owned());
-            let tx = self.next_tx();
-            return self.ask(
-                s,
-                now,
-                &self.build(m, tx, username, pass, "gamerelay", attrs, peer),
-            );
-        }
-        r
-    }
-
-    /// Allocates as username; the relay address it got.
-    fn allocate(&mut self, s: &mut Server, now: Instant, username: &str) -> SocketAddr {
-        let r = self.request(s, now, method::ALLOCATE, username, &[transport()]);
-        assert_eq!(r.code(), 0, "allocate as {username}");
-        let m = r.msg();
-        assert!(m.integrity_ok(&resonance_turn::auth::long_term_key(
-            username,
-            "gamerelay",
-            &password(KEY, username)
-        )));
-        assert_eq!(
-            m.xor_address(attr::XOR_MAPPED_ADDRESS),
-            Some(canon(self.from))
-        );
-        m.xor_address(attr::XOR_RELAYED_ADDRESS).unwrap()
-    }
-
-    fn permit(&mut self, s: &mut Server, now: Instant, username: &str, peer: SocketAddr) -> u16 {
-        self.request_to(s, now, method::CREATE_PERMISSION, username, &[], Some(peer))
-            .code()
-    }
-
-    fn bind(
-        &mut self,
-        s: &mut Server,
-        now: Instant,
-        username: &str,
-        channel: u16,
-        peer: SocketAddr,
-    ) -> u16 {
-        let number = (
-            attr::CHANNEL_NUMBER,
-            [channel.to_be_bytes(), [0, 0]].concat(),
-        );
-        self.request_to(
-            s,
-            now,
-            method::CHANNEL_BIND,
-            username,
-            &[number],
-            Some(peer),
-        )
-        .code()
-    }
-
-    fn send_indication(
-        &mut self,
-        s: &mut Server,
-        now: Instant,
-        peer: SocketAddr,
-        data: &[u8],
-    ) -> Vec<(SocketAddr, Vec<u8>)> {
-        let mut buf = Vec::new();
-        let tx = self.next_tx();
-        Writer::new(&mut buf, method::SEND, Class::Indication, tx)
-            .xor_address(attr::XOR_PEER_ADDRESS, peer)
-            .attr(attr::DATA, data);
-        self.send(s, now, &buf)
-    }
-
-    fn channel_data(
-        &self,
-        s: &mut Server,
-        now: Instant,
-        channel: u16,
-        data: &[u8],
-    ) -> Vec<(SocketAddr, Vec<u8>)> {
-        let mut buf = Vec::new();
-        stun::write_channel_data(&mut buf, channel, data);
-        self.send(s, now, &buf)
-    }
-}
-
-fn binding(tx: u8) -> Vec<u8> {
-    let mut buf = Vec::new();
-    Writer::new(&mut buf, method::BINDING, Class::Request, [tx; 12]);
-    buf
-}
-
-/// Two players of one room, each allocated with a permission for this relay.
-fn pair(s: &mut Server, t: Instant, room_b: &str) -> (Client, SocketAddr, Client, SocketAddr) {
-    let (mut a, mut b) = (
-        Client::new("198.51.100.1:5000"),
-        Client::new("203.0.113.9:6000"),
-    );
-    let ra = a.allocate(s, t, &user("g1", "p_a"));
-    let rb = b.allocate(s, t, &user(room_b, "p_b"));
-    assert_eq!(a.permit(s, t, &user("g1", "p_a"), rb), 0);
-    assert_eq!(b.permit(s, t, &user(room_b, "p_b"), ra), 0);
-    (a, ra, b, rb)
-}
+mod common;
+use common::*;
+use resonance_turn::stun::{Class, Message, Writer, attr, method};
 
 #[test]
 fn binding_is_answered_with_the_senders_address() {
@@ -344,7 +56,13 @@ fn a_retransmitted_allocate_gets_the_same_answer_and_another_gets_437() {
     assert_eq!(again.code(), 437);
     // A fresh 5-tuple: its own retransmission is the same success.
     let mut d = Client::new("198.51.100.1:5001");
-    d.nonce = c.nonce.clone(); // nonces aren't tied to a client
+    // Its own nonce: c's is bound to c's address.
+    d.nonce = c.nonce.clone();
+    assert_eq!(
+        d.request(&mut s, t, method::REFRESH, &name, &[]).code(),
+        437,
+        "d's own nonce, after a 438"
+    );
     let tx = d.next_tx();
     let req = d.build(
         method::ALLOCATE,
@@ -618,14 +336,16 @@ fn lifetimes_are_clamped_and_a_zero_refresh_deletes() {
 }
 
 #[test]
-fn an_allocation_ends_with_its_lifetime() {
+fn an_allocation_ends_a_minute_after_its_lifetime() {
     let t = Instant::now();
     let mut s = server(t);
     let mut c = Client::new("198.51.100.1:5000");
     c.allocate(&mut s, t, &user("g1", "p_a"));
-    s.tick(t + Duration::from_secs(599));
+    // Granted 600 s; kept 60 more for a refresh late by a lost packet (Firefox refreshes 10 s
+    // before the end).
+    s.tick(t + Duration::from_secs(659));
     assert_eq!(s.allocations(), 1);
-    s.tick(t + Duration::from_secs(600));
+    s.tick(t + Duration::from_secs(660));
     assert_eq!(s.allocations(), 0);
 }
 
@@ -725,15 +445,29 @@ fn the_only_permitted_peer_is_this_relay() {
     let mut c = Client::new("198.51.100.1:5000");
     let name = user("g1", "p_a");
     c.allocate(&mut s, t, &name);
+    // restund's matrix too: never loopback, "any", broadcast or link-local, only the advertised IP.
     for peer in [
         "192.0.2.2:50000",
         "127.0.0.1:50000",
+        "127.0.0.2:50000",
         "10.0.0.1:50000",
-        "[2001:db8::1]:50000",
+        "0.0.0.0:50000",
+        "255.255.255.255:50000",
+        "169.254.0.1:50000",
         "203.0.113.9:6000",
     ] {
         assert_eq!(c.permit(&mut s, t, &name, addr(peer)), 403, "{peer}");
         assert_eq!(c.bind(&mut s, t, &name, 0x4000, addr(peer)), 403, "{peer}");
+    }
+    // Another address family: 443 (RFC 8656 §9.3).
+    for peer in [
+        "[2001:db8::1]:50000",
+        "[::1]:50000",
+        "[::]:50000",
+        "[fe80::1]:50000",
+    ] {
+        assert_eq!(c.permit(&mut s, t, &name, addr(peer)), 443, "{peer}");
+        assert_eq!(c.bind(&mut s, t, &name, 0x4000, addr(peer)), 443, "{peer}");
     }
     assert_eq!(c.permit(&mut s, t, &name, addr("192.0.2.1:50000")), 0);
     assert_eq!(
@@ -744,7 +478,7 @@ fn the_only_permitted_peer_is_this_relay() {
     let stats = s.stats();
     assert_eq!(
         (stats.permissions_allowed, stats.permissions_denied),
-        (2, 10)
+        (2, 24)
     );
 }
 
