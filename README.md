@@ -19,8 +19,13 @@ Chrome relay through it. Joining the network by itself (registry, heartbeats) is
 - **Credentials are its own.** A node's key is derived from the control plane's master key, and
   mints credentials for that node only. A leaked node can't forge access to any other.
 - **Limits:** 8 allocations per player, 64 per client IP, 4,096 per game, and 128 KB/s per
-  allocation (256 KB burst). Unauthenticated requests are capped at 20 a second per IP, since a
-  spoofed source could otherwise aim the relay's answers at someone.
+  allocation (256 KB burst). Unsigned answers to unknown clients are capped at 20 a second per IP
+  (burst: the per-IP cap), since a spoofed source could otherwise aim them at someone. All of
+  them are settings (`TURN_MAX_PER_PLAYER`, `TURN_MAX_PER_IP`, `TURN_MAX_PER_INSTANCE`,
+  `TURN_UNAUTH_RATE`, `TURN_UNAUTH_BURST`, `TURN_RATE_BYTES`, `TURN_BURST_BYTES`; see
+  `crates/resonance-node/src/main.rs`). Every player holds an allocation per other player even
+  when the LAN route wins, so a school or office behind one NAT may need a higher
+  `TURN_MAX_PER_IP`: 8 players in a room take 56.
 
 ## Layout
 

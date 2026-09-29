@@ -8,6 +8,17 @@
 //! addresses are names on TURN_PUBLIC_IP, ports TURN_MIN_PORT–TURN_MAX_PORT, but nothing listens
 //! on them: every relayed packet goes from one allocation to another in memory (the only
 //! permitted peer is this relay), so the relay port range needs no firewall opening.
+//!
+//! Limits (defaults are the Go relay's):
+//!
+//! - TURN_MAX_PER_PLAYER (8): allocations per player, one per other player in a full room.
+//! - TURN_MAX_PER_IP (64): per client IP. Every player takes one per other player even when the
+//!   LAN route wins (ICE gathers the relay before it knows), so a school or office behind one NAT
+//!   with a few full rooms needs more: 8 players × 7 others is 56.
+//! - TURN_MAX_PER_INSTANCE (4096): per game, so one game can't take the whole node.
+//! - TURN_UNAUTH_RATE (20/s) and TURN_UNAUTH_BURST (TURN_MAX_PER_IP): unsigned answers per
+//!   unknown client IP; the burst follows the per-IP cap, so a shared address can fill it at once.
+//! - TURN_RATE_BYTES (131072) and TURN_BURST_BYTES (twice that): per allocation.
 
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
@@ -29,6 +40,17 @@ fn port(key: &str, fallback: u16) -> u16 {
         Some(v) => v
             .parse()
             .unwrap_or_else(|_| fail(&format!("{key} must be a port, not {v:?}"))),
+    }
+}
+
+/// A positive number from key, or fallback.
+fn num<T: std::str::FromStr + PartialOrd + Default + Copy>(key: &str, fallback: T) -> T {
+    match env(key) {
+        None => fallback,
+        Some(v) => match v.parse::<T>() {
+            Ok(n) if n > T::default() => n,
+            _ => fail(&format!("{key} must be a positive number, not {v:?}")),
+        },
     }
 }
 
@@ -60,11 +82,28 @@ fn main() {
             cfg.min_port, cfg.max_port
         ));
     }
+    cfg.max_per_player = num("TURN_MAX_PER_PLAYER", cfg.max_per_player);
+    cfg.max_per_ip = num("TURN_MAX_PER_IP", cfg.max_per_ip);
+    cfg.max_per_instance = num("TURN_MAX_PER_INSTANCE", cfg.max_per_instance);
+    cfg.unauth_rate = num("TURN_UNAUTH_RATE", cfg.unauth_rate);
+    cfg.unauth_burst = num("TURN_UNAUTH_BURST", cfg.max_per_ip as f64);
+    cfg.rate_bytes = num("TURN_RATE_BYTES", cfg.rate_bytes);
+    cfg.burst_bytes = num("TURN_BURST_BYTES", cfg.rate_bytes * 2.0);
     let (min, max) = (cfg.min_port, cfg.max_port);
     let socket = bind(SocketAddr::new(IpAddr::from([0, 0, 0, 0]), listen));
     eprintln!(
         "resonance-node {} on udp :{listen}, relay addresses {public}:{min}-{max}",
         env!("CARGO_PKG_VERSION")
+    );
+    eprintln!(
+        "limits: {} allocations per player, {} per IP, {} per game; {} B/s per allocation (burst {}); unauthenticated answers {}/s per IP (burst {})",
+        cfg.max_per_player,
+        cfg.max_per_ip,
+        cfg.max_per_instance,
+        cfg.rate_bytes,
+        cfg.burst_bytes,
+        cfg.unauth_rate,
+        cfg.unauth_burst
     );
     run(socket, Server::new(cfg));
 }
