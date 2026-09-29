@@ -37,4 +37,7 @@ jobs:
       - run: cargo build --release -p resonance-node
       - name: every browser pairing through the node
         working-directory: interop/browsers
+        # Firefox won't start as root with another user's HOME (GitHub sets /github/home).
+        env:
+          HOME: /root
         run: npm i --no-save playwright@1.63.0 && NODE_BIN=$GITHUB_WORKSPACE/target/release/resonance-node node relay.mjs
