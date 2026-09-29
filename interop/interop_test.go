@@ -34,6 +34,10 @@ func startNode(t *testing.T) string {
 	t.Helper()
 	bin, _ := filepath.Abs("../target/release/resonance-node")
 	if _, err := os.Stat(bin); err != nil {
+		// Locally a reminder; in CI a failure, so a missing build can't pass as a skip.
+		if os.Getenv("CI") != "" {
+			t.Fatalf("no node at %s: cargo build --release", bin)
+		}
 		t.Skip("build it first: cargo build --release")
 	}
 	l, err := net.ListenPacket("udp4", "127.0.0.1:0")

@@ -17,6 +17,7 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --release
       - run: FUZZ_ITERS=2000000 cargo test --release --test fuzz
+      - run: cargo build --release -p resonance-node
       - uses: actions/setup-go@v5
         with:
           go-version-file: interop/go.mod
