@@ -42,9 +42,9 @@ The scripts live in GameRelay's repo, `deploy/turn/`, with this repo cloned next
   linux/amd64 in Docker and installs it (a new host: the env file, buffer caps, and the node
   left stopped until it joins). Re-run to update a node: it restarts it, so check the stats line
   for `allocations 0` first.
-- `RESONANCE_ALERT_WEBHOOK=<a Discord webhook>` in `/etc/gamerelay-turn.env` (a person copies
-  it): the node says there when it can't reach the control plane. Its own webhook, apart from
-  the control plane's `OPS_WEBHOOK_URL`, so it can be revoked on its own.
+- `RESONANCE_ALERT_WEBHOOK=<GameRelay's OPS_WEBHOOK_URL>` in `/etc/gamerelay-turn.env` (a person
+  copies it): the node says there, in the ops channel, when it can't reach the control plane.
+  The same webhook as the control plane's, so rotating it means updating every node too.
 - `bash deploy/turn/join-resonance.sh root@<host> rjt_…`: joins it with a token from Admin →
   Nodes (a person mints and pastes it).
 - `bash deploy/turn/tls-resonance.sh root@<host> <name>`: TLS on 443. It agrees to Let's
