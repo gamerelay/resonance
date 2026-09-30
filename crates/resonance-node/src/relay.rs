@@ -22,6 +22,7 @@ use resonance_turn::{Client, Output, Server};
 use rustls::{ServerConfig, ServerConnection};
 
 use crate::control::{Control, Snapshot};
+use crate::probe::Prober;
 use crate::tls::Certificate;
 
 const UDP: Token = Token(0);
@@ -285,6 +286,8 @@ pub struct Relay {
     next_conn: u32,
     limits: Limits,
     network: Option<Network>,
+    /// The other nodes, measured from the UDP socket.
+    prober: Prober,
     /// Sockets with more to read than their budget allowed: read again next turn. mio reports
     /// readiness once (edge-triggered), so these are remembered here.
     again: Vec<Token>,
@@ -352,6 +355,7 @@ impl Relay {
             next_conn: 1,
             limits,
             network,
+            prober: Prober::default(),
             again: Vec::new(),
             work: Vec::new(),
             last_tick: now,
@@ -413,6 +417,10 @@ impl Relay {
         for _ in 0..UDP_BUDGET {
             match self.links.udp.recv_from(&mut self.buf) {
                 Ok((n, from)) => {
+                    // The other nodes answering our probes: not for the core.
+                    if self.prober.answer(from, &self.buf[..n], now) {
+                        continue;
+                    }
                     self.links.bytes_in += n as u64;
                     self.out.clear();
                     self.server.handle(now, from, &self.buf[..n], &mut self.out);
@@ -632,15 +640,22 @@ impl Relay {
         let Some(n) = &self.network else {
             return true;
         };
+        let udp = &self.links.udp;
+        self.prober.due(Instant::now(), |to, m| {
+            // Lost like any datagram if the buffer's full.
+            let _ = udp.send_to(m, to);
+        });
         if let Ok(mut s) = n.snapshot.lock() {
             *s = Snapshot {
                 allocations: self.server.allocations() as u64,
                 bytes_in: self.links.bytes_in,
                 bytes_out: self.links.bytes_out,
+                peers: self.prober.report(now),
             };
         }
         while let Ok(c) = n.controls.try_recv() {
             match c {
+                Control::Peers(peers) => self.prober.set_peers(peers, now),
                 Control::Key(k) => self.server.set_node_key(k, now, self.limits.key_overlap),
                 Control::Accepting(yes) => self.server.set_accepting(yes),
                 Control::Exit => return false,

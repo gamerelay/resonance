@@ -6,6 +6,23 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
 
 ## 2026-09-30
 
+**Nodes measure each other, and watch the control plane.** Additions within API `2026-09-29`.
+
+- The heartbeat's answer names the other live nodes (`HeartbeatResponse.peers`: id and the
+  `ip:port` of its relay socket). Each gets a STUN Binding every 2 s from this node's relay
+  socket, so it takes players' path and firewalls; the answers are taken out before the core
+  sees them (`probe.rs`, sans-I/O). Each heartbeat reports the last 30 s per peer
+  (`Heartbeat.peers`: sent, answered, the median round trip). The control plane alerts on a
+  node nobody's probes reach, and draws the matrix in its network view.
+- `RESONANCE_ALERT_WEBHOOK` (a Discord or Slack incoming webhook): a node that can't reach the
+  control plane for `RESONANCE_ALERT_AFTER_S` (120) in a row says so there, once, and again when
+  it's back; the control plane can't say it's down itself. A refusal (a 4xx) is an answer, not
+  an outage; a 5xx is.
+- An old control plane sends no peers (nothing measured); an old node sends no reports.
+- Tests: the prober (timing, the window sliding, unanswered and late probes, only our answers
+  taken, peers changing), two nodes in-process measuring each other and one that's gone, the
+  watch (once after a while, its return, blips), the peers fixture shared with the control plane.
+
 **Small cleanups in the core.** No change in what it does.
 
 - `resonance_turn::counts::Counts`: a count per key that forgets the key at zero, for the

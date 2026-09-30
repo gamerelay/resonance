@@ -90,6 +90,28 @@ pub struct Heartbeat {
     /// without joining again. An addition within 2026-09-29 (servers that don't know it ignore it).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub urls: Vec<String>,
+    /// How the other nodes it was told about answer it: a STUN Binding every few seconds from
+    /// its relay socket, over the last 30 s. An addition within 2026-09-29.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<PeerReport>,
+}
+
+/// One peer's Bindings over the report's window.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PeerReport {
+    pub node: String,
+    /// Sent long enough ago to have been answered.
+    pub sent: u32,
+    pub answered: u32,
+    /// The median round trip of the answered ones, in ms; none if nothing was answered.
+    pub rtt_ms: Option<f64>,
+}
+
+/// Another node to measure: its id, and the address its relay socket answers on.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Peer {
+    pub node_id: String,
+    pub addr: String,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,6 +136,10 @@ pub struct HeartbeatResponse {
     pub key_version: u32,
     pub latest_version: String,
     pub min_version: String,
+    /// The other nodes to measure. An addition within 2026-09-29: a control plane that doesn't
+    /// send it means none.
+    #[serde(default)]
+    pub peers: Vec<Peer>,
 }
 
 /// An error answer: `{ error, message }`.
@@ -156,6 +182,42 @@ mod tests {
         assert_eq!(
             B64.encode(key.sign(s.as_bytes()).to_bytes()),
             "4ouzZqtxvtuhwCVpoFdbIPlXyqwSQibcBU0iJUVZIS9U6-454Juxtd9lAfd5pSrSVOwXx4N60C_qPwuzXlWNCA"
+        );
+    }
+
+    // The same JSON as gamerelay.io test/resonance.test.ts: what one side writes, the other reads.
+    #[test]
+    fn peers_fixture_shared_with_the_control_plane() {
+        let h = Heartbeat {
+            allocations: 1,
+            software: "resonance-node 0.1.0".into(),
+            peers: vec![
+                PeerReport {
+                    node: "rn_b".into(),
+                    sent: 14,
+                    answered: 13,
+                    rtt_ms: Some(62.5),
+                },
+                PeerReport {
+                    node: "rn_c".into(),
+                    sent: 14,
+                    answered: 0,
+                    rtt_ms: None,
+                },
+            ],
+            ..Heartbeat::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&h).unwrap(),
+            r#"{"allocations":1,"bytes_in":0,"bytes_out":0,"cpu":0.0,"uptime_s":0,"software":"resonance-node 0.1.0","peers":[{"node":"rn_b","sent":14,"answered":13,"rtt_ms":62.5},{"node":"rn_c","sent":14,"answered":0,"rtt_ms":null}]}"#
+        );
+        let r: HeartbeatResponse = serde_json::from_str(r#"{"status":"active","key_version":0,"latest_version":"2026-09-29","min_version":"2026-09-29","peers":[{"node_id":"rn_b","addr":"198.51.100.2:3478"}]}"#).unwrap();
+        assert_eq!(
+            r.peers,
+            vec![Peer {
+                node_id: "rn_b".into(),
+                addr: "198.51.100.2:3478".into()
+            }]
         );
     }
 

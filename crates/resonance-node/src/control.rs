@@ -7,9 +7,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
+use std::net::SocketAddr;
+
 use resonance_proto::{
     self as proto, ErrorResponse, Heartbeat, HeartbeatResponse, JoinRequest, JoinResponse,
-    KeyResponse, Status,
+    KeyResponse, Peer, PeerReport, Status,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -34,6 +36,17 @@ pub enum Error {
     },
     /// Couldn't reach it, or its answer made no sense.
     Transport(String),
+}
+
+impl Error {
+    /// The control plane is out of reach, as against saying no: a network error, or a 5xx from
+    /// whatever stands in front of it.
+    pub fn unreachable(&self) -> bool {
+        match self {
+            Error::Transport(_) => true,
+            Error::Refused { status, .. } => *status >= 500,
+        }
+    }
 }
 
 impl std::fmt::Display for Error {
@@ -125,6 +138,20 @@ impl Client {
     pub fn heartbeat(&self, h: &Heartbeat) -> Result<HeartbeatResponse, Error> {
         self.post("/nodes/heartbeat", h)
     }
+
+    /// One line to a Discord (`content`) or Slack (`text`) incoming webhook; each ignores the
+    /// other. Best effort: a webhook that's down loses the alert.
+    pub fn post_alert(&self, webhook: &str, text: &str) {
+        let body = serde_json::json!({ "content": text, "text": text }).to_string();
+        let sent = self
+            .agent
+            .post(webhook)
+            .header("content-type", "application/json")
+            .send(body.as_bytes());
+        if let Err(e) = sent {
+            eprintln!("alert webhook: {e}");
+        }
+    }
 }
 
 pub fn software() -> String {
@@ -138,6 +165,8 @@ pub enum Control {
     Key(String),
     /// Take new allocations (true), or stop (false: draining, or told to upgrade).
     Accepting(bool),
+    /// The other nodes to measure (`probe`).
+    Peers(Vec<(String, SocketAddr)>),
     /// Revoked: stop now.
     Exit,
 }
@@ -148,6 +177,7 @@ pub struct Snapshot {
     pub allocations: u64,
     pub bytes_in: u64,
     pub bytes_out: u64,
+    pub peers: Vec<PeerReport>,
 }
 
 /// This process's CPU seconds so far (user + system).
@@ -161,61 +191,87 @@ fn cpu_seconds() -> f64 {
     t(u.ru_utime) + t(u.ru_stime)
 }
 
-/// Every `every`, a heartbeat; its answer becomes `Control`s for the relay loop. A control plane
-/// that can't be reached changes nothing: the node keeps relaying what it has.
-pub fn heartbeats(
-    client: Client,
-    every: Duration,
-    snapshot: Arc<Mutex<Snapshot>>,
-    mut key_version: u32,
-    urls: Vec<String>,
-    tx: Sender<Control>,
-) {
-    let started = Instant::now();
-    let (mut last_cpu, mut last_at) = (cpu_seconds(), Instant::now());
-    let mut accepting = true;
-    let mut first = true;
-    loop {
-        // The first at once: a node is handed out to players from its first heartbeat.
-        if !first {
-            std::thread::sleep(every);
-        }
-        first = false;
-        let snap = snapshot.lock().map(|s| s.clone()).unwrap_or_default();
-        let (cpu, at) = (cpu_seconds(), Instant::now());
-        let h = Heartbeat {
-            allocations: snap.allocations,
-            bytes_in: snap.bytes_in,
-            bytes_out: snap.bytes_out,
-            cpu: (cpu - last_cpu) / at.duration_since(last_at).as_secs_f64().max(0.001),
-            uptime_s: started.elapsed().as_secs(),
-            software: software(),
-            urls: urls.clone(),
+/// The heartbeat thread's settings.
+pub struct Heartbeats {
+    pub client: Client,
+    pub every: Duration,
+    pub snapshot: Arc<Mutex<Snapshot>>,
+    pub key_version: u32,
+    pub urls: Vec<String>,
+    pub controls: Sender<Control>,
+    /// Where to say the control plane is out of reach (RESONANCE_ALERT_WEBHOOK), and who says it.
+    pub alert: Option<(String, Watch)>,
+}
+
+impl Heartbeats {
+    /// Every `every`, a heartbeat; its answer becomes `Control`s for the relay loop. A control
+    /// plane that can't be reached changes nothing: the node keeps relaying what it has.
+    pub fn run(mut self) {
+        let started = Instant::now();
+        let (mut last_cpu, mut last_at) = (cpu_seconds(), Instant::now());
+        let mut seen = Seen {
+            accepting: true,
+            key_version: self.key_version,
+            peers: Vec::new(),
         };
-        (last_cpu, last_at) = (cpu, at);
-        let reply = match client.heartbeat(&h) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("heartbeat: {e}");
-                continue;
+        let mut first = true;
+        loop {
+            // The first at once: a node is handed out to players from its first heartbeat.
+            if !first {
+                std::thread::sleep(self.every);
             }
-        };
-        for c in decide(&reply, &mut accepting, &mut key_version, || {
-            client.fetch_key()
-        }) {
-            let exit = c == Control::Exit;
-            if tx.send(c).is_err() || exit {
-                return;
+            first = false;
+            let snap = self.snapshot.lock().map(|s| s.clone()).unwrap_or_default();
+            let (cpu, at) = (cpu_seconds(), Instant::now());
+            let h = Heartbeat {
+                allocations: snap.allocations,
+                bytes_in: snap.bytes_in,
+                bytes_out: snap.bytes_out,
+                cpu: (cpu - last_cpu) / at.duration_since(last_at).as_secs_f64().max(0.001),
+                uptime_s: started.elapsed().as_secs(),
+                software: software(),
+                urls: self.urls.clone(),
+                peers: snap.peers,
+            };
+            (last_cpu, last_at) = (cpu, at);
+            let result = self.client.heartbeat(&h);
+            if let Some((webhook, watch)) = &mut self.alert {
+                let said = match &result {
+                    Err(e) if e.unreachable() => watch.failed(Instant::now(), &e.to_string()),
+                    _ => watch.ok(Instant::now()),
+                };
+                if let Some(text) = said {
+                    self.client.post_alert(webhook, &text);
+                }
+            }
+            let reply = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("heartbeat: {e}");
+                    continue;
+                }
+            };
+            for c in decide(&reply, &mut seen, || self.client.fetch_key()) {
+                let exit = c == Control::Exit;
+                if self.controls.send(c).is_err() || exit {
+                    return;
+                }
             }
         }
     }
 }
 
+/// What the relay loop was last told.
+struct Seen {
+    accepting: bool,
+    key_version: u32,
+    peers: Vec<Peer>,
+}
+
 /// What one heartbeat answer means for the relay loop.
 fn decide(
     reply: &HeartbeatResponse,
-    accepting: &mut bool,
-    key_version: &mut u32,
+    seen: &mut Seen,
     fetch_key: impl FnOnce() -> Result<KeyResponse, Error>,
 ) -> Vec<Control> {
     let mut out = Vec::new();
@@ -234,9 +290,9 @@ fn decide(
             );
             false
         }
-        Status::Unknown => *accepting,
+        Status::Unknown => seen.accepting,
     };
-    if want != *accepting {
+    if want != seen.accepting {
         eprintln!(
             "{}",
             if want {
@@ -245,20 +301,92 @@ fn decide(
                 "draining: no new allocations"
             }
         );
-        *accepting = want;
+        seen.accepting = want;
         out.push(Control::Accepting(want));
     }
-    if reply.key_version != *key_version {
+    if reply.key_version != seen.key_version {
         match fetch_key() {
             Ok(k) => {
                 eprintln!("node key rotated to version {}", k.key_version);
-                *key_version = k.key_version;
+                seen.key_version = k.key_version;
                 out.push(Control::Key(k.node_key));
             }
             Err(e) => eprintln!("fetching the rotated key: {e}"),
         }
     }
+    if reply.peers != seen.peers {
+        seen.peers = reply.peers.clone();
+        let peers = reply
+            .peers
+            .iter()
+            .filter_map(|p| Some((p.node_id.clone(), p.addr.parse().ok()?)))
+            .collect::<Vec<_>>();
+        eprintln!(
+            "measuring {} other node{}",
+            peers.len(),
+            if peers.len() == 1 { "" } else { "s" }
+        );
+        out.push(Control::Peers(peers));
+    }
     out
+}
+
+/// Watching the control plane from this node: out of reach for `after` in a row, it's said once,
+/// and again when it's back.
+pub struct Watch {
+    /// Who's saying it: this node's region and id, and the control plane's URL.
+    who: String,
+    control: String,
+    after: Duration,
+    down_since: Option<Instant>,
+    said: bool,
+}
+
+impl Watch {
+    pub fn new(who: String, control: String, after: Duration) -> Self {
+        Watch {
+            who,
+            control,
+            after,
+            down_since: None,
+            said: false,
+        }
+    }
+
+    /// A heartbeat that couldn't reach it: what to say, if it's time.
+    pub fn failed(&mut self, now: Instant, why: &str) -> Option<String> {
+        let since = *self.down_since.get_or_insert(now);
+        if self.said || now - since < self.after {
+            return None;
+        }
+        self.said = true;
+        Some(format!(
+            "🔴 {} can't reach the control plane {} (for {}): {why}",
+            self.who,
+            self.control,
+            minutes(now - since)
+        ))
+    }
+
+    /// A heartbeat that got through: what to say, if it had said it was down.
+    pub fn ok(&mut self, now: Instant) -> Option<String> {
+        let since = self.down_since.take()?;
+        std::mem::take(&mut self.said).then(|| {
+            format!(
+                "🟢 {} reaches the control plane {} again (out of reach for {})",
+                self.who,
+                self.control,
+                minutes(now - since)
+            )
+        })
+    }
+}
+
+fn minutes(d: Duration) -> String {
+    match d.as_secs() {
+        s if s < 90 => format!("{s} s"),
+        s => format!("{} min", (s + 30) / 60),
+    }
 }
 
 #[cfg(test)]
@@ -271,6 +399,14 @@ mod tests {
             key_version,
             latest_version: "2026-09-29".into(),
             min_version: "2026-09-29".into(),
+            peers: Vec::new(),
+        }
+    }
+    fn seen() -> Seen {
+        Seen {
+            accepting: true,
+            key_version: 0,
+            peers: Vec::new(),
         }
     }
     fn no_key() -> Result<KeyResponse, Error> {
@@ -279,56 +415,117 @@ mod tests {
 
     #[test]
     fn heartbeat_answers_become_controls() {
-        let (mut accepting, mut kv) = (true, 0);
-        assert!(decide(&reply(Status::Active, 0), &mut accepting, &mut kv, no_key).is_empty());
+        let mut s = seen();
+        assert!(decide(&reply(Status::Active, 0), &mut s, no_key).is_empty());
         assert_eq!(
-            decide(&reply(Status::Draining, 0), &mut accepting, &mut kv, no_key),
+            decide(&reply(Status::Draining, 0), &mut s, no_key),
             vec![Control::Accepting(false)]
         );
         assert!(
-            decide(&reply(Status::Draining, 0), &mut accepting, &mut kv, no_key).is_empty(),
+            decide(&reply(Status::Draining, 0), &mut s, no_key).is_empty(),
             "only changes are sent"
         );
         assert!(
-            decide(&reply(Status::Unknown, 0), &mut accepting, &mut kv, no_key).is_empty(),
+            decide(&reply(Status::Unknown, 0), &mut s, no_key).is_empty(),
             "unknown: as before"
         );
         assert_eq!(
-            decide(&reply(Status::Active, 0), &mut accepting, &mut kv, no_key),
+            decide(&reply(Status::Active, 0), &mut s, no_key),
             vec![Control::Accepting(true)]
         );
         assert_eq!(
-            decide(
-                &reply(Status::UpgradeRequired, 0),
-                &mut accepting,
-                &mut kv,
-                no_key
-            ),
+            decide(&reply(Status::UpgradeRequired, 0), &mut s, no_key),
             vec![Control::Accepting(false)]
         );
         assert_eq!(
-            decide(&reply(Status::Revoked, 0), &mut accepting, &mut kv, no_key),
+            decide(&reply(Status::Revoked, 0), &mut s, no_key),
             vec![Control::Exit]
         );
     }
 
     #[test]
     fn a_new_key_version_fetches_the_key_once() {
-        let (mut accepting, mut kv) = (true, 0);
-        let got = decide(&reply(Status::Active, 1), &mut accepting, &mut kv, || {
+        let mut s = seen();
+        let got = decide(&reply(Status::Active, 1), &mut s, || {
             Ok(KeyResponse {
                 node_key: "k1".into(),
                 key_version: 1,
             })
         });
         assert_eq!(got, vec![Control::Key("k1".into())]);
-        assert_eq!(kv, 1);
-        assert!(decide(&reply(Status::Active, 1), &mut accepting, &mut kv, no_key).is_empty());
+        assert_eq!(s.key_version, 1);
+        assert!(decide(&reply(Status::Active, 1), &mut s, no_key).is_empty());
         // A failed fetch is tried again at the next heartbeat.
-        let got = decide(&reply(Status::Active, 2), &mut accepting, &mut kv, || {
+        let got = decide(&reply(Status::Active, 2), &mut s, || {
             Err(Error::Transport("down".into()))
         });
         assert!(got.is_empty());
-        assert_eq!(kv, 1);
+        assert_eq!(s.key_version, 1);
+    }
+
+    #[test]
+    fn new_peers_are_passed_on_once() {
+        let mut s = seen();
+        let mut r = reply(Status::Active, 0);
+        r.peers = vec![
+            Peer {
+                node_id: "rn_b".into(),
+                addr: "198.51.100.2:3478".into(),
+            },
+            Peer {
+                node_id: "rn_x".into(),
+                addr: "not an address".into(),
+            },
+        ];
+        assert_eq!(
+            decide(&r, &mut s, no_key),
+            vec![Control::Peers(vec![(
+                "rn_b".into(),
+                "198.51.100.2:3478".parse().unwrap()
+            )])]
+        );
+        assert!(decide(&r, &mut s, no_key).is_empty(), "the same again");
+        r.peers.clear();
+        assert_eq!(decide(&r, &mut s, no_key), vec![Control::Peers(vec![])]);
+    }
+
+    #[test]
+    fn the_control_plane_out_of_reach_is_said_once_after_a_while_and_its_return() {
+        let t = Instant::now();
+        let mut w = Watch::new(
+            "nyc-1 (rn_a)".into(),
+            "https://gamerelay.io".into(),
+            Duration::from_secs(120),
+        );
+        assert_eq!(w.ok(t), None, "fine all along");
+        assert_eq!(w.failed(t, "timeout"), None);
+        assert_eq!(w.failed(t + Duration::from_secs(60), "timeout"), None);
+        let said = w.failed(t + Duration::from_secs(120), "timeout").unwrap();
+        assert!(
+            said.contains("nyc-1 (rn_a) can't reach") && said.contains("for 2 min"),
+            "{said}"
+        );
+        assert_eq!(
+            w.failed(t + Duration::from_secs(180), "timeout"),
+            None,
+            "once"
+        );
+        let back = w.ok(t + Duration::from_secs(300)).unwrap();
+        assert!(back.contains("again") && back.contains("5 min"), "{back}");
+        // A blip shorter than `after` says nothing either way.
+        assert_eq!(w.failed(t + Duration::from_secs(400), "reset"), None);
+        assert_eq!(w.ok(t + Duration::from_secs(415)), None);
+    }
+
+    #[test]
+    fn only_a_control_plane_out_of_reach_counts() {
+        assert!(Error::Transport("timeout".into()).unreachable());
+        let refused = |status| Error::Refused {
+            status,
+            error: "x".into(),
+            message: String::new(),
+        };
+        assert!(refused(502).unreachable());
+        assert!(!refused(401).unreachable(), "it answered");
     }
 }

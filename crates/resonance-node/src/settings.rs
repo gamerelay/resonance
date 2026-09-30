@@ -30,6 +30,10 @@ pub struct Settings {
     /// The key to run by hand with (not joined): RESONANCE_NODE_KEY, or TURN_SECRET as the Go
     /// relay called it.
     pub node_key: Option<String>,
+    /// A Discord or Slack incoming webhook this node says the control plane is out of reach on
+    /// (RESONANCE_ALERT_WEBHOOK), after `alert_after` in a row.
+    pub alert_webhook: Option<String>,
+    pub alert_after: Duration,
     /// Settings that mean nothing any more and are set, to say so at startup.
     pub ignored: Vec<&'static str>,
 }
@@ -140,6 +144,8 @@ impl Settings {
             node_key: env
                 .get("RESONANCE_NODE_KEY")
                 .or_else(|| env.get("TURN_SECRET")),
+            alert_webhook: env.get("RESONANCE_ALERT_WEBHOOK"),
+            alert_after: Duration::from_secs(env.num("RESONANCE_ALERT_AFTER_S", 120)?),
             ignored: ["TURN_PEER_IPS"]
                 .into_iter()
                 .filter(|k| env.get(k).is_some())
@@ -203,6 +209,8 @@ mod tests {
         assert_eq!(s.heartbeat, HEARTBEAT);
         assert_eq!(s.control, "https://gamerelay.io");
         assert!(s.node_key.is_none() && s.ignored.is_empty());
+        assert!(s.alert_webhook.is_none());
+        assert_eq!(s.alert_after, Duration::from_secs(120));
     }
 
     #[test]

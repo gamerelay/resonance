@@ -7,6 +7,10 @@
 //!   heartbeat every 15 s; the control plane hands it out to players while it's active, and can
 //!   drain or revoke it. State lives in RESONANCE_STATE_DIR (default /var/lib/resonance);
 //!   RESONANCE_CONTROL is the control plane (default https://gamerelay.io).
+//!   A joined node measures the other nodes the control plane names (a STUN Binding every 2 s from
+//!   its relay socket, reported with each heartbeat), and with RESONANCE_ALERT_WEBHOOK (a Discord
+//!   or Slack incoming webhook) says there when the control plane has been out of reach for
+//!   RESONANCE_ALERT_AFTER_S (120) in a row, and when it's back.
 //! - **By hand**, like the Go relay it replaces, from the same /etc/gamerelay-turn.env:
 //!   `TURN_SECRET=<this node's key> TURN_PUBLIC_IP=192.0.2.1 resonance-node` (RESONANCE_NODE_KEY
 //!   is the same as TURN_SECRET), and the control plane lists it in RESONANCE_NODES.
@@ -138,10 +142,24 @@ fn run_node(s: Settings) {
             eprintln!("joined {} as {} in {}", j.control, j.node_id, j.region);
             let snapshot = Arc::new(Mutex::new(Snapshot::default()));
             let (tx, rx) = mpsc::channel();
-            let (snap, kv, every, urls) = (snapshot.clone(), k.key_version, s.heartbeat, s.urls());
+            let beats = control::Heartbeats {
+                client,
+                every: s.heartbeat,
+                snapshot: snapshot.clone(),
+                key_version: k.key_version,
+                urls: s.urls(),
+                controls: tx,
+                alert: s.alert_webhook.clone().map(|w| {
+                    let who = format!("{} ({})", j.region, j.node_id);
+                    (
+                        w,
+                        control::Watch::new(who, j.control.clone(), s.alert_after),
+                    )
+                }),
+            };
             std::thread::Builder::new()
                 .name("heartbeat".into())
-                .spawn(move || control::heartbeats(client, every, snap, kv, urls, tx))
+                .spawn(move || beats.run())
                 .expect("a thread");
             (
                 k.node_key,

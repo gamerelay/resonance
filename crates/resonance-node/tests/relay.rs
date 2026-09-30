@@ -153,3 +153,47 @@ fn a_revoked_node_stops_relaying_and_returns() {
     // Its numbers reached the heartbeat on the way.
     assert!(snapshot.lock().unwrap().bytes_in >= BINDING.len() as u64);
 }
+
+#[test]
+fn a_node_measures_the_peers_its_told_about_from_its_relay_socket() {
+    let network = || {
+        let (tx, rx) = mpsc::channel();
+        let snapshot = Arc::new(Mutex::new(Snapshot::default()));
+        (
+            tx,
+            snapshot.clone(),
+            Network {
+                controls: rx,
+                snapshot,
+            },
+        )
+    };
+    let (tx_a, snap_a, net_a) = network();
+    let (_tx_b, _snap_b, net_b) = network();
+    let _a = start(Some(net_a), |_| {});
+    let b = start(Some(net_b), |_| {});
+    // And one nobody answers at.
+    let gone = UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    tx_a.send(Control::Peers(vec![
+        ("rn_b".into(), b.udp),
+        ("rn_gone".into(), gone),
+    ]))
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let peers = snap_a.lock().unwrap().peers.clone();
+        let of = |n: &str| peers.iter().find(|p| p.node == n).cloned();
+        if let (Some(b), Some(g)) = (of("rn_b"), of("rn_gone")) {
+            if b.answered > 0 && g.sent > 0 {
+                assert!(b.rtt_ms.is_some_and(|ms| ms < 100.0), "{b:?}");
+                assert_eq!((g.answered, g.rtt_ms), (0, None));
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "no measurements: {peers:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
