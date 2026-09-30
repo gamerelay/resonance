@@ -3,6 +3,7 @@
 //! the sockets.
 
 pub mod auth;
+pub mod counts;
 pub mod limiter;
 pub mod server;
 pub mod stream;

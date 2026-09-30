@@ -11,6 +11,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::auth::{self, NonceCheck, Nonces, User};
+use crate::counts::Counts;
 use crate::limiter::{Bucket, Reflection};
 use crate::stun::{self, Class, Message, Writer, attr, method};
 
@@ -108,13 +109,6 @@ impl Output {
         self.sends.clear();
     }
 
-    /// Each send's address and bytes.
-    pub fn iter(&self) -> impl Iterator<Item = (SocketAddr, &[u8])> {
-        self.sends
-            .iter()
-            .map(|&(to, a, b)| (to.addr, &self.buf[a..b]))
-    }
-
     /// Each send's client (its address and connection) and bytes.
     pub fn sends(&self) -> impl Iterator<Item = (Client, &[u8])> {
         self.sends.iter().map(|&(to, a, b)| (to, &self.buf[a..b]))
@@ -188,9 +182,9 @@ pub struct Server {
     next_port: usize,
     rooms: HashMap<String, (u32, u32)>,
     next_room: u32,
-    per_player: HashMap<String, u32>,
-    per_ip: HashMap<IpAddr, u32>,
-    per_instance: HashMap<String, u32>,
+    per_player: Counts<String>,
+    per_ip: Counts<IpAddr>,
+    per_instance: Counts<String>,
     stats: Stats,
     clock: (Instant, u64),
     /// The key before the last rotation, and until when it's still accepted.
@@ -202,8 +196,22 @@ pub struct Server {
 /// Why a request was refused, and whether the answer can carry MESSAGE-INTEGRITY.
 struct Refusal {
     code: u16,
-    reason: &'static str,
     key: Option<[u8; 16]>,
+}
+
+impl Refusal {
+    /// To a client that hasn't proved its credentials.
+    fn unsigned(code: u16) -> Self {
+        Refusal { code, key: None }
+    }
+
+    /// Signed with the key it proved.
+    fn signed(code: u16, key: [u8; 16]) -> Self {
+        Refusal {
+            code,
+            key: Some(key),
+        }
+    }
 }
 
 impl Server {
@@ -229,9 +237,9 @@ impl Server {
             next_port: 0,
             rooms: HashMap::new(),
             next_room: 0,
-            per_player: HashMap::new(),
-            per_ip: HashMap::new(),
-            per_instance: HashMap::new(),
+            per_player: Counts::default(),
+            per_ip: Counts::default(),
+            per_instance: Counts::default(),
             stats: Stats::default(),
             clock: (base, unix),
             previous_key: None,
@@ -334,7 +342,7 @@ impl Server {
                     }
                     let start = out.start();
                     let mut w = Writer::new(&mut out.buf, m, Class::Error, msg.tx);
-                    w.error(420, "Unknown Attribute")
+                    w.error(420, stun::reason(420))
                         .attr(attr::UNKNOWN_ATTRIBUTES, &unknown[..n]);
                     w.fingerprint();
                     out.push(from, start);
@@ -353,11 +361,7 @@ impl Server {
                     method::REFRESH => self.refresh(now, from, &msg, out),
                     method::CREATE_PERMISSION => self.create_permission(now, from, &msg, out),
                     method::CHANNEL_BIND => self.channel_bind(now, from, &msg, out),
-                    _ => Err(Refusal {
-                        code: 400,
-                        reason: "Bad Request",
-                        key: None,
-                    }),
+                    _ => Err(Refusal::unsigned(400)),
                 };
                 if let Err(r) = result {
                     self.refuse(now, from, &msg, r, out);
@@ -386,7 +390,7 @@ impl Server {
         }
         let start = out.start();
         let mut w = Writer::new(&mut out.buf, msg.method, Class::Error, msg.tx);
-        w.error(r.code, r.reason);
+        w.error(r.code, stun::reason(r.code));
         if matches!(r.code, 401 | 438) {
             let nonce = self.nonces.issue(self.unix(now), from.addr);
             w.attr(attr::REALM, self.cfg.realm.as_bytes())
@@ -425,51 +429,37 @@ impl Server {
         from: Client,
         msg: &Message,
     ) -> Result<(User, String, [u8; 16]), Refusal> {
-        let unauthorized = Refusal {
-            code: 401,
-            reason: "Unauthorized",
-            key: None,
-        };
-        let bad = Refusal {
-            code: 400,
-            reason: "Bad Request",
-            key: None,
-        };
         // No MESSAGE-INTEGRITY: the first request of every client, answered with a nonce.
         // MESSAGE-INTEGRITY without the rest is malformed (RFC 8489 §9.2.4).
         if !msg.has(attr::MESSAGE_INTEGRITY) {
-            return Err(unauthorized);
+            return Err(Refusal::unsigned(401));
         }
         let (Some(username), Some(realm), Some(nonce)) = (
             msg.str_attr(attr::USERNAME),
             msg.str_attr(attr::REALM),
             msg.str_attr(attr::NONCE),
         ) else {
-            return Err(bad);
+            return Err(Refusal::unsigned(400));
         };
         // USERNAME is under 513 bytes (RFC 8489 §14.3): nothing longer is hashed.
         if username.len() > 512 {
-            return Err(bad);
+            return Err(Refusal::unsigned(400));
         }
         if realm != self.cfg.realm {
-            return Err(unauthorized);
+            return Err(Refusal::unsigned(401));
         }
         // Stale, from before a restart, or another client's: 438 with a fresh one, which every
         // browser retries (a 401 on a Refresh would end the allocation in Chrome).
         if self.nonces.check(nonce, self.unix(now), from.addr) != NonceCheck::Ok {
-            return Err(Refusal {
-                code: 438,
-                reason: "Stale Nonce",
-                key: None,
-            });
+            return Err(Refusal::unsigned(438));
         }
         let Some(user) = auth::parse_username(username) else {
-            return Err(unauthorized);
+            return Err(Refusal::unsigned(401));
         };
         // No request succeeds past the credential's expiry, so an allocation outlives it by at
         // most one lifetime.
         if user.expiry <= self.unix(now) {
-            return Err(unauthorized);
+            return Err(Refusal::unsigned(401));
         }
         let existing = self.live_alloc(from, now);
         let cached = existing
@@ -499,16 +489,12 @@ impl Server {
         .flatten()
         .find(|k| msg.integrity_ok(k));
         let Some(key) = key else {
-            return Err(unauthorized);
+            return Err(Refusal::unsigned(401));
         };
         if let Some(i) = existing {
             let a = self.alloc(i);
             if a.user.room != user.room || a.user.player != user.player {
-                return Err(Refusal {
-                    code: 441,
-                    reason: "Wrong Credentials",
-                    key: Some(key),
-                });
+                return Err(Refusal::signed(441, key));
             }
         }
         Ok((user, username.to_owned(), key))
@@ -529,27 +515,23 @@ impl Server {
         out: &mut Output,
     ) -> Result<(), Refusal> {
         let (user, username, key) = self.authenticate(now, from, msg)?;
-        let refuse = |code, reason| Refusal {
-            code,
-            reason,
-            key: Some(key),
-        };
+        let refuse = |code| Refusal::signed(code, key);
         if let Some(i) = self.live_alloc(from, now) {
             let a = self.alloc(i);
             if a.allocate_tx != msg.tx {
-                return Err(refuse(437, "Allocation Mismatch"));
+                return Err(refuse(437));
             }
             let (port, lifetime) = (a.port, a.lifetime_s);
             self.allocate_success(from, msg, port, lifetime, &key, out);
             return Ok(());
         }
         if !self.accepting {
-            return Err(refuse(508, "Insufficient Capacity"));
+            return Err(refuse(508));
         }
         match msg.get(attr::REQUESTED_TRANSPORT) {
             Some(v) if v.len() == 4 && v[0] == 17 => {}
-            Some(_) => return Err(refuse(442, "Unsupported Transport Protocol")),
-            None => return Err(refuse(400, "Bad Request")),
+            Some(_) => return Err(refuse(442)),
+            None => return Err(refuse(400)),
         }
         if let Some(v) = msg.get(attr::REQUESTED_ADDRESS_FAMILY) {
             let ours = if self.cfg.public_ip.is_ipv4() {
@@ -558,26 +540,25 @@ impl Server {
                 0x02
             };
             if v.len() != 4 || v[0] != ours {
-                return Err(refuse(440, "Address Family not Supported"));
+                return Err(refuse(440));
             }
         }
         let ip = from.addr.ip();
-        if self.per_player.get(&user.player).copied().unwrap_or(0) >= self.cfg.max_per_player
-            || self.per_ip.get(&ip).copied().unwrap_or(0) >= self.cfg.max_per_ip
-            || self.per_instance.get(&user.instance).copied().unwrap_or(0)
-                >= self.cfg.max_per_instance
+        if self.per_player.get(&user.player) >= self.cfg.max_per_player
+            || self.per_ip.get(&ip) >= self.cfg.max_per_ip
+            || self.per_instance.get(&user.instance) >= self.cfg.max_per_instance
         {
-            return Err(refuse(486, "Allocation Quota Reached"));
+            return Err(refuse(486));
         }
         let Some(slot) = self.free_port() else {
-            return Err(refuse(508, "Insufficient Capacity"));
+            return Err(refuse(508));
         };
         let port = self.cfg.min_port + slot as u16;
         let lifetime_s = self.lifetime(msg);
         let room = self.intern_room(&user.room);
-        *self.per_player.entry(user.player.clone()).or_default() += 1;
-        *self.per_ip.entry(ip).or_default() += 1;
-        *self.per_instance.entry(user.instance.clone()).or_default() += 1;
+        self.per_player.add(user.player.clone());
+        self.per_ip.add(ip);
+        self.per_instance.add(user.instance.clone());
         let a = Allocation {
             client: from,
             port,
@@ -667,17 +648,9 @@ impl Server {
                 self.rooms.remove(&a.user.room);
             }
         }
-        fn release<K: std::hash::Hash + Eq>(m: &mut HashMap<K, u32>, k: &K) {
-            if let Some(n) = m.get_mut(k) {
-                *n -= 1;
-                if *n == 0 {
-                    m.remove(k);
-                }
-            }
-        }
-        release(&mut self.per_player, &a.user.player);
-        release(&mut self.per_ip, &a.client.addr.ip());
-        release(&mut self.per_instance, &a.user.instance);
+        self.per_player.release(&a.user.player);
+        self.per_ip.release(&a.client.addr.ip());
+        self.per_instance.release(&a.user.instance);
     }
 
     /// The allocation this request is for, after authenticating it; remembers a fresher username.
@@ -689,11 +662,7 @@ impl Server {
     ) -> Result<(u32, [u8; 16]), Refusal> {
         let (_, username, key) = self.authenticate(now, from, msg)?;
         let Some(i) = self.live_alloc(from, now) else {
-            return Err(Refusal {
-                code: 437,
-                reason: "Allocation Mismatch",
-                key: Some(key),
-            });
+            return Err(Refusal::signed(437, key));
         };
         let a = self.alloc_mut(i);
         if a.username != username {
@@ -751,19 +720,12 @@ impl Server {
             return None;
         }
         self.stats.permissions_denied += 1;
-        Some(if ip.is_ipv4() != self.cfg.public_ip.is_ipv4() {
-            Refusal {
-                code: 443,
-                reason: "Peer Address Family Mismatch",
-                key: Some(key),
-            }
+        let code = if ip.is_ipv4() != self.cfg.public_ip.is_ipv4() {
+            443
         } else {
-            Refusal {
-                code: 403,
-                reason: "Forbidden",
-                key: Some(key),
-            }
-        })
+            403
+        };
+        Some(Refusal::signed(code, key))
     }
 
     fn create_permission(
@@ -783,11 +745,7 @@ impl Server {
                 continue;
             }
             let Some(peer) = stun::decode_xor_address(a.value, &msg.tx) else {
-                return Err(Refusal {
-                    code: 400,
-                    reason: "Bad Request",
-                    key: Some(key),
-                });
+                return Err(Refusal::signed(400, key));
             };
             if let Some(r) = self.peer_refusal(peer, key) {
                 return Err(r);
@@ -795,11 +753,7 @@ impl Server {
             peers += 1;
         }
         if peers == 0 {
-            return Err(Refusal {
-                code: 400,
-                reason: "Bad Request",
-                key: Some(key),
-            });
+            return Err(Refusal::signed(400, key));
         }
         let lifetime = self.cfg.permission_lifetime;
         self.alloc_mut(i).permission_expires = Some(now + lifetime);
@@ -815,20 +769,16 @@ impl Server {
         out: &mut Output,
     ) -> Result<(), Refusal> {
         let (i, key) = self.authenticated_alloc(now, from, msg)?;
-        let bad = Refusal {
-            code: 400,
-            reason: "Bad Request",
-            key: Some(key),
-        };
+        let bad = || Refusal::signed(400, key);
         let number = match msg.get(attr::CHANNEL_NUMBER) {
             Some(v) if v.len() == 4 => u16::from_be_bytes([v[0], v[1]]),
-            _ => return Err(bad),
+            _ => return Err(bad()),
         };
         if !(0x4000..=0x7FFF).contains(&number) {
-            return Err(bad);
+            return Err(bad());
         }
         let Some(peer) = msg.xor_address(attr::XOR_PEER_ADDRESS) else {
-            return Err(bad);
+            return Err(bad());
         };
         if let Some(r) = self.peer_refusal(peer, key) {
             return Err(r);
@@ -842,7 +792,7 @@ impl Server {
             .iter()
             .any(|c| (c.number == number) != (c.peer_port == peer.port()));
         if clash {
-            return Err(bad);
+            return Err(bad());
         }
         match a.channels.iter_mut().find(|c| c.number == number) {
             Some(c) => c.expires = now + channel_life,

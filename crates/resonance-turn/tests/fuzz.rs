@@ -80,7 +80,7 @@ fn nothing_panics_and_nothing_goes_astray() {
             [0x80 + i as u8; 12],
         );
         s.handle(t, c, &first, &mut out);
-        let nonce = Message::parse(out.iter().next().unwrap().1)
+        let nonce = Message::parse(out.sends().next().unwrap().1)
             .unwrap()
             .str_attr(attr::NONCE)
             .unwrap()
@@ -90,7 +90,7 @@ fn nothing_panics_and_nothing_goes_astray() {
             w.attr(attr::REQUESTED_TRANSPORT, &[17, 0, 0, 0]);
         });
         s.handle(t, c, &req, &mut out);
-        let m = Message::parse(out.iter().next().unwrap().1).unwrap();
+        let m = Message::parse(out.sends().next().unwrap().1).unwrap();
         relayed.push(m.xor_address(attr::XOR_RELAYED_ADDRESS).expect("allocated"));
         nonces.push(nonce);
     }
@@ -190,7 +190,8 @@ fn nothing_panics_and_nothing_goes_astray() {
         }
         out.clear();
         s.handle(now, from, &p, &mut out);
-        for (to, _) in out.iter() {
+        for (to, _) in out.sends() {
+            let to = to.addr;
             assert!(
                 to == from || known.contains(&to),
                 "sent to {to} (from {from})"

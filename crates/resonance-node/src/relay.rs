@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use mio::net::{TcpListener, TcpStream, UdpSocket};
 use mio::{Events, Interest, Poll, Registry, Token};
+use resonance_turn::counts::Counts;
 use resonance_turn::stream::{Frame, Framer, padding};
 use resonance_turn::{Client, Output, Server};
 use rustls::{ServerConfig, ServerConnection};
@@ -280,7 +281,7 @@ pub struct Relay {
     links: Links,
     tcp: Option<TcpListener>,
     tls: Option<(TcpListener, Arc<Certificate>, Arc<ServerConfig>)>,
-    per_ip: HashMap<IpAddr, usize>,
+    per_ip: Counts<IpAddr>,
     next_conn: u32,
     limits: Limits,
     network: Option<Network>,
@@ -347,7 +348,7 @@ impl Relay {
             },
             tcp,
             tls,
-            per_ip: HashMap::new(),
+            per_ip: Counts::default(),
             next_conn: 1,
             limits,
             network,
@@ -457,7 +458,7 @@ impl Relay {
     fn open(&mut self, socket: TcpStream, addr: SocketAddr, tls: bool, now: Instant) {
         let ip = addr.ip().to_canonical();
         if self.links.streams.len() >= self.limits.max_streams
-            || self.per_ip.get(&ip).copied().unwrap_or(0) >= self.limits.max_streams_per_ip
+            || self.per_ip.get(&ip) as usize >= self.limits.max_streams_per_ip
         {
             return;
         }
@@ -499,7 +500,7 @@ impl Relay {
                 if tls { "tls" } else { "tcp" }
             );
         }
-        *self.per_ip.entry(ip).or_default() += 1;
+        self.per_ip.add(ip);
         self.links.streams.insert(conn, s);
     }
 
@@ -601,13 +602,7 @@ impl Relay {
         }
         let _ = self.poll.registry().deregister(&mut s.socket);
         self.server.closed(s.client);
-        let ip = s.client.addr.ip();
-        if let Some(n) = self.per_ip.get_mut(&ip) {
-            *n -= 1;
-            if *n == 0 {
-                self.per_ip.remove(&ip);
-            }
-        }
+        self.per_ip.release(&s.client.addr.ip());
     }
 
     /// The core's expiries, streams past their deadlines, and the heartbeat thread's news. False

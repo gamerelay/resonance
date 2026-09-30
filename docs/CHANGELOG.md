@@ -6,7 +6,16 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
 
 ## 2026-09-30
 
-**Settings, read once.** No change in what they mean.
+**Small cleanups in the core.** No change in what it does.
+
+- `resonance_turn::counts::Counts`: a count per key that forgets the key at zero, for the
+  allocations per player, IP and game, and the node's streams per IP. The same few lines were
+  written out four times.
+- A refusal is `Refusal::unsigned(code)` or `Refusal::signed(code, key)`, its reason phrase from
+  `stun::reason(code)`: 13 hand-built structs, each repeating its phrase.
+- `Output::iter` is gone: `sends()` gives the address and the connection.
+
+**Settings, read once.** No change in what they mean. `7870302`
 
 - `resonance_node::settings::Settings` reads every setting at startup, from any lookup
   (`from_lookup`), and returns what's wrong instead of exiting: main.rs is the wiring. Before,

@@ -56,6 +56,25 @@ pub mod attr {
     pub const FINGERPRINT: u16 = 0x8028;
 }
 
+/// An error code's reason phrase (RFC 8489 §14.8, RFC 8656 §19).
+pub fn reason(code: u16) -> &'static str {
+    match code {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        420 => "Unknown Attribute",
+        437 => "Allocation Mismatch",
+        438 => "Stale Nonce",
+        440 => "Address Family not Supported",
+        441 => "Wrong Credentials",
+        442 => "Unsupported Transport Protocol",
+        443 => "Peer Address Family Mismatch",
+        486 => "Allocation Quota Reached",
+        508 => "Insufficient Capacity",
+        _ => "",
+    }
+}
+
 /// Comprehension-required attributes (0x0000–0x7FFF) this relay knows. Any other one in a request
 /// gets a 420 (RFC 8489 §14); the ones it knows but doesn't act on are harmless to ignore
 /// (EVEN-PORT: ports here are only names; USE-CANDIDATE and PRIORITY: ICE's, sent to a peer).
