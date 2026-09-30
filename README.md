@@ -6,9 +6,10 @@ first customer.
 This repo is the **node**: a room-scoped TURN relay in Rust. It replaces GameRelay's Go relay,
 rule for rule, and is the base for the network's later roles.
 
-**Status: v0, in progress.** The TURN core and the node work: pion's and coturn's TURN clients
-and Chromium, Firefox and WebKit relay through it, and it joins the network by itself (registry,
-heartbeats, drain, revoke, key rotation). Next: replacing the Go relay on GameRelay's first host.
+**Status: v0, in production.** GameRelay's relays (San Francisco and New York) run it, joined
+to GameRelay's registry (heartbeats, drain, revoke, key rotation). pion's and coturn's TURN
+clients and Chromium, Firefox and WebKit relay through it, over UDP, TCP and TLS. What changed:
+[docs/CHANGELOG.md](docs/CHANGELOG.md). Picking up work: [docs/HANDOFF.md](docs/HANDOFF.md).
 
 ## What it relays, and to whom
 
@@ -32,10 +33,10 @@ heartbeats, drain, revoke, key rotation). Next: replacing the Go relay on GameRe
 
 | Crate | What it does |
 |---|---|
-| [`resonance-turn`](crates/resonance-turn) | The TURN relay, sans-I/O: `handle(now, from, packet) → packets`. Every rule lives here, testable without sockets. Its own STUN codec: parsed in place, nothing allocated per packet. |
+| [`resonance-turn`](crates/resonance-turn) | The TURN relay, sans-I/O: `handle(now, from, packet) → packets`. Every rule lives here, testable without sockets. Its own STUN codec: parsed in place, nothing allocated per packet. Stream framing for TCP and TLS. |
 | [`resonance-proto`](crates/resonance-proto) | The control plane's wire types: node ids, signed requests, join, key, heartbeat. Fixtures shared with the control plane. |
-| [`resonance-node`](crates/resonance-node) | The binary: the core on one UDP socket; joining, the key, heartbeats; config and logs. |
-| [`interop`](interop) | Other clients against the built node, over real UDP: pion's (`go test`), coturn's (`coturn.sh`), and Chromium, Firefox and WebKit's own (`browsers/relay.mjs`, every pairing). Also the benchmark (`cmd/bench`). |
+| [`resonance-node`](crates/resonance-node) | The binary: the core on one event loop (the UDP socket, and TCP and TLS listeners); joining, the key, heartbeats; config and logs. |
+| [`interop`](interop) | Other clients against the built node: pion's over UDP, TCP and TLS (`go test`), coturn's (`coturn.sh`), and Chromium, Firefox and WebKit's own (`browsers/relay.mjs`, every pairing, `TRANSPORT=udp\|tcp\|tls`). Also the benchmark (`cmd/bench`). |
 
 ## Running a node
 
@@ -67,6 +68,18 @@ which lists the node in `RESONANCE_NODES`.
 Either way it listens on UDP 3478 (`TURN_PORT`). Relay addresses use ports 49152–65535
 (`TURN_MIN_PORT`, `TURN_MAX_PORT`), but nothing listens on them, so they need no firewall opening.
 
+**TCP and TLS**, for networks that block UDP. Players on streams and on UDP relay to each other.
+
+```sh
+TURN_TLS_CERT=/path/fullchain.pem TURN_TLS_KEY=/path/privkey.pem \
+TURN_TLS_PORT=443 TURN_TLS_HOST=turn.example.com ./target/release/resonance-node   # turns:
+TURN_TCP=1 ./target/release/resonance-node                                          # turn:…?transport=tcp
+```
+
+The certificate files are read again when they change (a renewal needs no restart). Use an RSA
+certificate from a public CA: WebKit's TURN client trusts only roots built into it. The node's
+URLs go with its join and every heartbeat, so the control plane hands out the new ones.
+
 ## Tests
 
 ```sh
@@ -74,7 +87,9 @@ cargo test --release                                     # the core, and a fuzz 
 FUZZ_ITERS=5000000 cargo test --release --test fuzz      # a longer fuzz run
 cd interop && go test ./...                              # pion's client against the node
 interop/coturn.sh                                        # coturn's client (needs coturn installed)
-# Chromium, Firefox and WebKit, every pairing (Linux: Firefox leaves loopback out of ICE):
+# Chromium, Firefox and WebKit, every pairing (Linux: Firefox leaves loopback out of ICE), with
+# the node built for Linux; TRANSPORT=tcp, or TRANSPORT=tls BROWSERS=chromium,firefox (needs
+# libnss3-tools in the container):
 docker run --rm -v "$PWD":/w -w /w/interop/browsers mcr.microsoft.com/playwright:v1.63.0-noble \
   sh -c 'npm i --no-save playwright@1.63.0 && NODE_BIN=/w/target/release/resonance-node node relay.mjs'
 ```
