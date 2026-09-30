@@ -1,1 +1,5 @@
 /target
+# Made by the browser test's npm install.
+interop/browsers/node_modules/
+interop/browsers/package.json
+interop/browsers/package-lock.json
