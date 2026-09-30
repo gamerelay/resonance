@@ -52,7 +52,9 @@ The scripts live in GameRelay's repo, `deploy/turn/`, with this repo cloned next
 
 The README's "Tests" has the commands. Locally on a Mac:
 
-- `cargo test --release`, then `cargo build --release && (cd interop && go test ./...)`.
+- `cargo test --release` (the core, the settings, and the relay loop in-process on loopback:
+  `crates/resonance-node/tests/relay.rs`), then
+  `cargo build --release && (cd interop && go test ./...)`.
 - The browser test runs in the Playwright container (Linux), with the node built for Linux in
   Docker too. `TRANSPORT=tcp` or `tls`; TLS needs `libnss3-tools` in the container
   (`apt-get install -y libnss3-tools`) and `BROWSERS=chromium,firefox`.
@@ -79,6 +81,10 @@ The README's "Tests" has the commands. Locally on a Mac:
 
 ## Next
 
+- **Deploy `main` to NYC** (`install-resonance.sh`, at `allocations 0`): it still runs `9350911`,
+  without the fix for stalled TLS clients (CHANGELOG, 2026-09-30). SF is UDP only, so it can wait.
+- **The UDP benchmark on a Linux host** for the new loop: in Docker on a Mac, 1,000 pairs were
+  even and 200 pairs a little behind in most rounds, within that run's drift (CHANGELOG).
 - **Safari over TLS:** check it against NYC. If it refuses Let's Encrypt too, Safari players on
   networks that block UDP just play through the game server (nothing breaks); a certificate
   from a CA in libwebrtc's list would be the fix.
