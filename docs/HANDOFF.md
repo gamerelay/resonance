@@ -25,7 +25,7 @@ control-plane side.
 | Host | `asleepace.com`, `192.241.216.26`, shared with other services (Ubuntu 23.10, 2 vCPU) | `gamerelay-turn-nyc3-1`, `167.172.234.10`, its own $6 droplet (Debian 13, 1 vCPU) |
 | Node id | `rn_mxuujbghsqg4bnt5n2lae3w54a` | `rn_hanrbqr7ezoznqcas43pibjmwu` |
 | Serves | UDP 3478 | UDP 3478, TLS 443 (`turns:turn-nyc.gamerelay.io:443?transport=tcp`) |
-| Firewall | ufw (UDP 3478; the old Go relay's 49152–65535 still open) | **none yet** (checked 2026-09-30): SSH and systemd-resolved's LLMNR (5355) are open to anyone. Wanted: a cloud firewall with UDP 3478, TCP 443 and 80 (certbot), SSH from one IP |
+| Firewall | ufw (UDP 3478; the old Go relay's 49152–65535 still open) | DigitalOcean cloud firewall `gamerelay-turn` (2026-09-30): UDP 3478, TCP 443 and 80 (certbot), SSH (key only; open to all by choice) |
 | Certificate | none (443 is nginx's) | Let's Encrypt, RSA, certbot's timer renews it |
 
 Both run as the systemd unit `gamerelay-turn` (a dynamic user, `StateDirectory=resonance`,
@@ -79,8 +79,6 @@ The README's "Tests" has the commands. Locally on a Mac:
 
 ## Next
 
-- **A firewall for NYC** (👤, DigitalOcean): UDP 3478, TCP 443 and 80, SSH from your IP only.
-  Nothing else there needs to be reachable.
 - **Safari over TLS:** check it against NYC. If it refuses Let's Encrypt too, Safari players on
   networks that block UDP just play through the game server (nothing breaks); a certificate
   from a CA in libwebrtc's list would be the fix.
