@@ -10,6 +10,7 @@ repository = "https://github.com/gamerelay/resonance"
 rust-version = "1.85"
 
 [workspace.dependencies]
+resonance-proto = { path = "crates/resonance-proto" }
 resonance-turn = { path = "crates/resonance-turn" }
 
 [profile.release]

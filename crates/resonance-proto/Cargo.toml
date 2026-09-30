@@ -1,0 +1,17 @@
+[package]
+name = "resonance-proto"
+description = "Resonance's wire types: node ids, signed control-plane requests, join, key, heartbeat."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+base64 = "0.22"
+ed25519-dalek = "2"
+serde_json = "1"

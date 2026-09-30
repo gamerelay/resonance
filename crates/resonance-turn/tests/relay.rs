@@ -794,3 +794,84 @@ fn junk_is_dropped_silently() {
         assert!(c.send(&mut s, t, junk).is_empty(), "{junk:?}");
     }
 }
+
+#[test]
+fn a_rotated_key_takes_over_and_the_old_one_lasts_its_overlap() {
+    let t = Instant::now();
+    let mut s = server(t);
+    let name = user("g1", "p_a");
+    let new_key = "the-rotated-node-key-0123456789abcdef";
+    s.set_node_key(new_key.into(), t, Duration::from_secs(3600));
+    // Credentials minted with the old key still work for the overlap…
+    let mut old = Client::new("198.51.100.1:5000");
+    old.allocate(&mut s, t, &name);
+    // …and with the new one.
+    let mut fresh = Client::new("198.51.100.2:5000");
+    fresh.request(&mut s, t, method::REFRESH, &name, &[]);
+    let r = fresh.request_as(
+        &mut s,
+        t,
+        method::ALLOCATE,
+        &name,
+        &password(new_key, &name),
+        &[transport()],
+        None,
+    );
+    assert_eq!(r.code(), 0);
+    // After it, only the new key.
+    let later = t + Duration::from_secs(3601);
+    let mut late = Client::new("198.51.100.3:5000");
+    let other = format!("{}:ins:g1:p_b", UNIX + 7200);
+    assert_eq!(
+        late.request(&mut s, later, method::ALLOCATE, &other, &[transport()])
+            .code(),
+        401
+    );
+    assert_eq!(
+        late.request_as(
+            &mut s,
+            later,
+            method::ALLOCATE,
+            &other,
+            &password(new_key, &other),
+            &[transport()],
+            None
+        )
+        .code(),
+        0
+    );
+}
+
+#[test]
+fn a_draining_node_refuses_new_allocations_and_keeps_the_old_ones() {
+    let t = Instant::now();
+    let mut s = server(t);
+    let (mut a, _, _, rb) = pair(&mut s, t, "g1");
+    s.set_accepting(false);
+    let mut c = Client::new("192.0.2.9:1");
+    assert_eq!(
+        c.request(
+            &mut s,
+            t,
+            method::ALLOCATE,
+            &user("g1", "p_c"),
+            &[transport()]
+        )
+        .code(),
+        508
+    );
+    assert_eq!(a.send_indication(&mut s, t, rb, b"still here").len(), 1);
+    assert_eq!(
+        a.request(
+            &mut s,
+            t,
+            method::REFRESH,
+            &user("g1", "p_a"),
+            &[lifetime(600)]
+        )
+        .code(),
+        0
+    );
+    s.set_accepting(true);
+    c.allocate(&mut s, t, &user("g1", "p_c"));
+}

@@ -6,8 +6,9 @@ first customer.
 This repo is the **node**: a room-scoped TURN relay in Rust. It replaces GameRelay's Go relay,
 rule for rule, and is the base for the network's later roles.
 
-**Status: v0, in progress.** The TURN core and the node binary work: pion's TURN client and real
-Chrome relay through it. Joining the network by itself (registry, heartbeats) is next.
+**Status: v0, in progress.** The TURN core and the node work: pion's and coturn's TURN clients
+and Chromium, Firefox and WebKit relay through it, and it joins the network by itself (registry,
+heartbeats, drain, revoke, key rotation). Next: replacing the Go relay on GameRelay's first host.
 
 ## What it relays, and to whom
 
@@ -32,19 +33,39 @@ Chrome relay through it. Joining the network by itself (registry, heartbeats) is
 | Crate | What it does |
 |---|---|
 | [`resonance-turn`](crates/resonance-turn) | The TURN relay, sans-I/O: `handle(now, from, packet) → packets`. Every rule lives here, testable without sockets. Its own STUN codec: parsed in place, nothing allocated per packet. |
-| [`resonance-node`](crates/resonance-node) | The binary: the core on one UDP socket, plus config and logs. |
+| [`resonance-proto`](crates/resonance-proto) | The control plane's wire types: node ids, signed requests, join, key, heartbeat. Fixtures shared with the control plane. |
+| [`resonance-node`](crates/resonance-node) | The binary: the core on one UDP socket; joining, the key, heartbeats; config and logs. |
 | [`interop`](interop) | Other clients against the built node, over real UDP: pion's (`go test`), coturn's (`coturn.sh`), and Chromium, Firefox and WebKit's own (`browsers/relay.mjs`, every pairing). Also the benchmark (`cmd/bench`). |
 
 ## Running a node
 
+**Joined to the network** (a token from the control plane's admin, valid an hour, used once):
+
 ```sh
 cargo build --release
+export TURN_PUBLIC_IP=<its public IP>        # where players reach it
+./target/release/resonance-node join <token> # once: makes its key, registers it
+./target/release/resonance-node run          # fetches its own key; a heartbeat every 15 s
+./target/release/resonance-node status
+```
+
+The node's ed25519 key and registration stay in `RESONANCE_STATE_DIR` (default
+`/var/lib/resonance`); the key never leaves the box. `RESONANCE_CONTROL` is the control plane
+(default `https://gamerelay.io`). While it's active and heard from, the control plane hands it out
+to players; draining it stops new allocations, and revoking it stops the node. A rotated key
+takes over at the next heartbeat, with the old one still accepted for an hour.
+
+**By hand**, like the Go relay it replaces:
+
+```sh
 TURN_SECRET=<this node's key> TURN_PUBLIC_IP=<its public IP> ./target/release/resonance-node
 ```
 
-The node key comes from the control plane (in GameRelay, `bun apps/server/src/turn.ts key <id>`).
-It listens on UDP 3478 (`TURN_PORT`). Relay addresses use ports 49152–65535 (`TURN_MIN_PORT`,
-`TURN_MAX_PORT`), but nothing listens on them, so they need no firewall opening.
+The key comes from the control plane (in GameRelay, `bun apps/server/src/turn.ts key <id>`),
+which lists the node in `RESONANCE_NODES`.
+
+Either way it listens on UDP 3478 (`TURN_PORT`). Relay addresses use ports 49152–65535
+(`TURN_MIN_PORT`, `TURN_MAX_PORT`), but nothing listens on them, so they need no firewall opening.
 
 ## Tests
 

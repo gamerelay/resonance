@@ -165,6 +165,10 @@ pub struct Server {
     per_instance: HashMap<String, u32>,
     stats: Stats,
     clock: (Instant, u64),
+    /// The key before the last rotation, and until when it's still accepted.
+    previous_key: Option<(String, Instant)>,
+    /// False while draining: no new allocations, existing ones carry on.
+    accepting: bool,
 }
 
 /// Why a request was refused, and whether the answer can carry MESSAGE-INTEGRITY.
@@ -202,6 +206,8 @@ impl Server {
             per_instance: HashMap::new(),
             stats: Stats::default(),
             clock: (base, unix),
+            previous_key: None,
+            accepting: true,
             cfg,
         }
     }
@@ -211,6 +217,21 @@ impl Server {
             unauthenticated_dropped: self.limiter.dropped,
             ..self.stats.clone()
         }
+    }
+
+    /// A rotated node key (Resonance v0 §3): the old one is still accepted for `overlap`, as long
+    /// as credentials minted with it last.
+    pub fn set_node_key(&mut self, key: String, now: Instant, overlap: Duration) {
+        if key == self.cfg.node_key {
+            return;
+        }
+        let old = std::mem::replace(&mut self.cfg.node_key, key);
+        self.previous_key = Some((old, now + overlap));
+    }
+
+    /// While false (draining, or told to upgrade), new allocations get 508; existing ones carry on.
+    pub fn set_accepting(&mut self, accepting: bool) {
+        self.accepting = accepting;
     }
 
     pub fn allocations(&self) -> usize {
@@ -414,17 +435,35 @@ impl Server {
             return Err(unauthorized);
         }
         let existing = self.live_alloc(from, now);
-        let key = match existing.map(|i| self.alloc(i)) {
-            Some(a) if a.username == username => a.key,
-            _ => auth::long_term_key(
+        let cached = existing
+            .map(|i| self.alloc(i))
+            .filter(|a| a.username == username)
+            .map(|a| a.key);
+        // The current node key, else (for an hour after a rotation) the previous one, since
+        // credentials minted just before it still arrive.
+        let derive = |node_key: &str| {
+            auth::long_term_key(
                 username,
                 &self.cfg.realm,
-                &auth::password(&self.cfg.node_key, username),
-            ),
+                &auth::password(node_key, username),
+            )
         };
-        if !msg.integrity_ok(&key) {
+        let previous = self
+            .previous_key
+            .as_ref()
+            .filter(|(_, until)| *until > now)
+            .map(|(k, _)| k.as_str());
+        let key = [
+            cached,
+            Some(derive(&self.cfg.node_key)),
+            previous.map(derive),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|k| msg.integrity_ok(k));
+        let Some(key) = key else {
             return Err(unauthorized);
-        }
+        };
         if let Some(i) = existing {
             let a = self.alloc(i);
             if a.user.room != user.room || a.user.player != user.player {
@@ -466,6 +505,9 @@ impl Server {
             let (port, lifetime) = (a.port, a.lifetime_s);
             self.allocate_success(from, msg, port, lifetime, &key, out);
             return Ok(());
+        }
+        if !self.accepting {
+            return Err(refuse(508, "Insufficient Capacity"));
         }
         match msg.get(attr::REQUESTED_TRANSPORT) {
             Some(v) if v.len() == 4 && v[0] == 17 => {}

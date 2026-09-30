@@ -1,10 +1,17 @@
 //! A Resonance relay node (v0 §4): the room-scoped TURN core on one UDP socket.
 //!
-//! Configured like the Go relay it replaces, from the same /etc/gamerelay-turn.env:
+//! Two ways to run it:
 //!
-//!     TURN_SECRET=<this node's key> TURN_PUBLIC_IP=192.0.2.1 resonance-node
+//! - **Joined** (the network): `resonance-node join <token>` once, with a token from the control
+//!   plane's admin, then `resonance-node run`. It fetches its own key at startup and sends a
+//!   heartbeat every 15 s; the control plane hands it out to players while it's active, and can
+//!   drain or revoke it. State lives in RESONANCE_STATE_DIR (default /var/lib/resonance);
+//!   RESONANCE_CONTROL is the control plane (default https://gamerelay.io).
+//! - **By hand**, like the Go relay it replaces, from the same /etc/gamerelay-turn.env:
+//!   `TURN_SECRET=<this node's key> TURN_PUBLIC_IP=192.0.2.1 resonance-node` (RESONANCE_NODE_KEY
+//!   is the same as TURN_SECRET), and the control plane lists it in RESONANCE_NODES.
 //!
-//! (RESONANCE_NODE_KEY is the same as TURN_SECRET.) One socket, UDP 3478 by default. Relay
+//! TURN_PUBLIC_IP is always needed: where players reach it. One socket, UDP 3478 by default. Relay
 //! addresses are names on TURN_PUBLIC_IP, ports TURN_MIN_PORT–TURN_MAX_PORT, but nothing listens
 //! on them: every relayed packet goes from one allocation to another in memory (the only
 //! permitted peer is this relay), so the relay port range needs no firewall opening.
@@ -20,11 +27,23 @@
 //!   unknown client IP; the burst follows the per-IP cap, so a shared address can fill it at once.
 //! - TURN_RATE_BYTES (131072) and TURN_BURST_BYTES (twice that): per allocation.
 
+mod control;
+mod state;
+
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use control::{Client, Control, Snapshot};
 use resonance_turn::{Config, Output, Server};
 use socket2::{Domain, Protocol, Socket, Type};
+use state::{Joined, State};
+
+/// How often the control plane hears from a joined node (it stops handing out one silent for 45 s).
+const HEARTBEAT: Duration = Duration::from_secs(15);
+/// How long a rotated-out node key is still accepted: credentials last an hour.
+const KEY_OVERLAP: Duration = Duration::from_secs(3600);
 
 /// The listener carries every client's traffic; the kernel's default buffer (about 200 KB) drops
 /// packets in a burst long before the relay is busy. 4 MB is about 2,800 full-size packets.
@@ -59,13 +78,113 @@ fn fail(msg: &str) -> ! {
     std::process::exit(1)
 }
 
+fn usage() -> ! {
+    fail("usage: resonance-node [run] | join <token> | status | version")
+}
+
 fn main() {
-    let key = env("RESONANCE_NODE_KEY")
-        .or_else(|| env("TURN_SECRET"))
-        .unwrap_or_default();
-    let public: Option<IpAddr> = env("TURN_PUBLIC_IP").and_then(|v| v.parse().ok());
-    let (Some(public), true) = (public, key.len() >= 32) else {
-        fail("TURN_SECRET (this node's key, 32+ chars) and TURN_PUBLIC_IP are required")
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        [] | ["run"] => run_node(),
+        ["join", token] => join(token),
+        ["status"] => status(),
+        ["version" | "--version"] => println!("{}", control::software()),
+        _ => usage(),
+    }
+}
+
+fn public_ip() -> IpAddr {
+    env("TURN_PUBLIC_IP")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| fail("TURN_PUBLIC_IP (where players reach this node) is required"))
+}
+
+fn control_url() -> String {
+    env("RESONANCE_CONTROL").unwrap_or_else(|| "https://gamerelay.io".into())
+}
+
+/// `join <token>`: this node's key (made now if new), registered with the control plane.
+fn join(token: &str) {
+    let state = State::from_env();
+    let key = state
+        .key()
+        .unwrap_or_else(|e| fail(&format!("key in {}: {e}", state.dir().display())));
+    let url = match public_ip() {
+        IpAddr::V4(ip) => format!("turn:{ip}:{}", port("TURN_PORT", 3478)),
+        IpAddr::V6(ip) => format!("turn:[{ip}]:{}", port("TURN_PORT", 3478)),
+    };
+    let control = control_url();
+    let client = Client::new(&control, key, None, resonance_proto::VERSION);
+    let joined = client
+        .join(token, vec![url.clone()])
+        .unwrap_or_else(|e| fail(&format!("join: {e}")));
+    let j = Joined {
+        node_id: joined.node_id,
+        region: joined.region,
+        control,
+        api_version: resonance_proto::VERSION.into(),
+    };
+    state
+        .save_joined(&j)
+        .unwrap_or_else(|e| fail(&format!("saving {}: {e}", state.dir().display())));
+    println!(
+        "joined {} as {} in {}, reachable at {url}",
+        j.control, j.node_id, j.region
+    );
+}
+
+fn status() {
+    let state = State::from_env();
+    match state.joined() {
+        Ok(Some(j)) => println!(
+            "{} in {} (control plane {}, API {})",
+            j.node_id, j.region, j.control, j.api_version
+        ),
+        Ok(None) => println!(
+            "not joined (state in {}): run by hand with TURN_SECRET, or join <token>",
+            state.dir().display()
+        ),
+        Err(e) => fail(&format!("state in {}: {e}", state.dir().display())),
+    }
+}
+
+/// `run`: joined if there's a node.json, else by hand with TURN_SECRET.
+fn run_node() {
+    let public = public_ip();
+    let state = State::from_env();
+    let joined = state
+        .joined()
+        .unwrap_or_else(|e| fail(&format!("state in {}: {e}", state.dir().display())));
+    let (key, network) = match joined {
+        Some(j) => {
+            let signing = state
+                .key()
+                .unwrap_or_else(|e| fail(&format!("key in {}: {e}", state.dir().display())));
+            let client = Client::new(&j.control, signing, Some(j.node_id.clone()), &j.api_version);
+            let k = fetch_key_patiently(&client);
+            eprintln!("joined {} as {} in {}", j.control, j.node_id, j.region);
+            let snapshot = Arc::new(Mutex::new(Snapshot::default()));
+            let (tx, rx) = mpsc::channel();
+            let (snap, kv) = (snapshot.clone(), k.key_version);
+            // RESONANCE_HEARTBEAT_S: for tests; the control plane expects 15.
+            let every = Duration::from_secs(num("RESONANCE_HEARTBEAT_S", HEARTBEAT.as_secs()));
+            std::thread::Builder::new()
+                .name("heartbeat".into())
+                .spawn(move || control::heartbeats(client, every, snap, kv, tx))
+                .expect("a thread");
+            (k.node_key, Some((rx, snapshot)))
+        }
+        None => {
+            let key = env("RESONANCE_NODE_KEY")
+                .or_else(|| env("TURN_SECRET"))
+                .unwrap_or_default();
+            if key.len() < 32 {
+                fail(
+                    "not joined (resonance-node join <token>), and no TURN_SECRET (this node's key, 32+ chars) to run by hand",
+                );
+            }
+            (key, None)
+        }
     };
     if env("TURN_PEER_IPS").is_some() {
         eprintln!("TURN_PEER_IPS is ignored: pairs of players share one relay");
@@ -92,8 +211,8 @@ fn main() {
     let (min, max) = (cfg.min_port, cfg.max_port);
     let socket = bind(SocketAddr::new(IpAddr::from([0, 0, 0, 0]), listen));
     eprintln!(
-        "resonance-node {} on udp :{listen}, relay addresses {public}:{min}-{max}",
-        env!("CARGO_PKG_VERSION")
+        "{} on udp :{listen}, relay addresses {public}:{min}-{max}",
+        control::software()
     );
     eprintln!(
         "limits: {} allocations per player, {} per IP, {} per game; {} B/s per allocation (burst {}); unauthenticated answers {}/s per IP (burst {})",
@@ -105,7 +224,29 @@ fn main() {
         cfg.unauth_rate,
         cfg.unauth_burst
     );
-    run(socket, Server::new(cfg));
+    run(socket, Server::new(cfg), network);
+}
+
+/// The key, retried until the control plane answers: a node that can't get its key can't relay.
+/// A refusal (revoked, unknown) is final.
+fn fetch_key_patiently(client: &Client) -> resonance_proto::KeyResponse {
+    let mut wait = Duration::from_secs(1);
+    loop {
+        match client.fetch_key() {
+            Ok(k) => return k,
+            Err(e @ control::Error::Refused { .. }) => {
+                fail(&format!("the control plane refused this node its key: {e}"))
+            }
+            Err(e) => {
+                eprintln!(
+                    "fetching this node's key: {e}; again in {}s",
+                    wait.as_secs()
+                );
+                std::thread::sleep(wait);
+                wait = (wait * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
 }
 
 fn bind(addr: SocketAddr) -> UdpSocket {
@@ -139,7 +280,12 @@ fn bind(addr: SocketAddr) -> UdpSocket {
     s.into()
 }
 
-fn run(socket: UdpSocket, mut server: Server) -> ! {
+/// The relay loop. `network`: the heartbeat thread's controls, and the numbers it reports.
+fn run(
+    socket: UdpSocket,
+    mut server: Server,
+    network: Option<(Receiver<Control>, Arc<Mutex<Snapshot>>)>,
+) -> ! {
     socket
         .set_read_timeout(Some(Duration::from_millis(250)))
         .expect("a nonzero timeout");
@@ -147,15 +293,19 @@ fn run(socket: UdpSocket, mut server: Server) -> ! {
     let mut out = Output::default();
     let mut last_tick = Instant::now();
     let mut last_log = last_tick;
+    let (mut bytes_in, mut bytes_out) = (0u64, 0u64);
     loop {
         match socket.recv_from(&mut buf) {
             Ok((n, from)) => {
                 let now = Instant::now();
+                bytes_in += n as u64;
                 out.clear();
                 server.handle(now, from, &buf[..n], &mut out);
                 for (to, packet) in out.iter() {
                     // A full send buffer or an unreachable client is a lost packet, as UDP allows.
-                    let _ = socket.send_to(packet, to);
+                    if socket.send_to(packet, to).is_ok() {
+                        bytes_out += packet.len() as u64;
+                    }
                 }
             }
             Err(e)
@@ -171,6 +321,22 @@ fn run(socket: UdpSocket, mut server: Server) -> ! {
         if now - last_tick >= Duration::from_secs(1) {
             server.tick(now);
             last_tick = now;
+            if let Some((rx, snapshot)) = &network {
+                while let Ok(c) = rx.try_recv() {
+                    match c {
+                        Control::Key(k) => server.set_node_key(k, now, KEY_OVERLAP),
+                        Control::Accepting(yes) => server.set_accepting(yes),
+                        Control::Exit => std::process::exit(0),
+                    }
+                }
+                if let Ok(mut s) = snapshot.lock() {
+                    *s = Snapshot {
+                        allocations: server.allocations() as u64,
+                        bytes_in,
+                        bytes_out,
+                    };
+                }
+            }
         }
         if now - last_log >= Duration::from_secs(60) {
             let s = server.stats();
