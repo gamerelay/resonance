@@ -186,14 +186,14 @@ func main() {
 						return
 					default:
 					}
+					// Counted by the flag it was sent with, so packets still in flight when the
+					// window closes land in the drain below instead of counting as lost.
 					if err != nil || n < 9 || buf[8] != 1 {
 						continue
 					}
-					if measuring.Load() {
-						d := time.Since(start) - time.Duration(binary.BigEndian.Uint64(buf))
-						local = append(local, d)
-						recv.Add(1)
-					}
+					d := time.Since(start) - time.Duration(binary.BigEndian.Uint64(buf))
+					local = append(local, d)
+					recv.Add(1)
 				}
 			}()
 			// Sender: at rate, with a random phase so the pairs don't send in lockstep.
