@@ -286,13 +286,10 @@ func (s *stalling) Read(b []byte) (int, error) {
 func TestAStalledTLSClientKeepsItsConnection(t *testing.T) {
 	// No rate limit, so the stalled client's queue fills in a moment.
 	server, tlsServer, roots := startStreamNode(t, "TURN_RATE_BYTES=1000000000")
-	raw, err := net.Dial("tcp4", tlsServer)
+	// (Its own buffers as they come: a tiny receive buffer makes Linux trickle the backlog out,
+	// ACK by delayed ACK, for over a minute.)
+	conn, err := tls.Dial("tcp4", tlsServer, &tls.Config{RootCAs: roots, ServerName: "turn.test"})
 	if err != nil {
-		t.Fatal(err)
-	}
-	_ = raw.(*net.TCPConn).SetReadBuffer(4096)
-	conn := tls.Client(raw, &tls.Config{RootCAs: roots, ServerName: "turn.test"})
-	if err := conn.Handshake(); err != nil {
 		t.Fatal(err)
 	}
 	stall := &stalling{Conn: conn}

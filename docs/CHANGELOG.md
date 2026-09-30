@@ -35,7 +35,9 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
   is written, the rest waits for the next turn. Plain TCP was right already.
 - `TURN_DEBUG_STREAMS=1` also says why a stream closed on a write, not only on a read.
 - Tests: `TestAStalledTLSClientKeepsItsConnection` (a client that stops reading while 20 MB is
-  sent its way, then carries on). The interop tests wait for the node to answer instead of
+  sent its way, then carries on; it fails on the old build on Linux and macOS). It first shrank
+  the client's receive buffer to 4 KB, which on Linux trickles the backlog out for over a minute
+  and made it flaky in CI (it failed on `8a0fa0b`): now the buffers are the system's. The interop tests wait for the node to answer instead of
   sleeping 200 ms, which lost the race now and then.
 
 **TURN over TCP and TLS** (RFC 8656 §12.5), for networks that block UDP. `26d3138`, `9350911`
