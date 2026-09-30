@@ -16,6 +16,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -93,6 +94,12 @@ func streamClient(t *testing.T, how, server string, roots *x509.CertPool, room, 
 	if err != nil {
 		t.Fatalf("%s to %s: %v", how, server, err)
 	}
+	return streamClientOn(t, conn, server, room, player)
+}
+
+// streamClientOn: the same over a connection already made.
+func streamClientOn(t *testing.T, conn net.Conn, server, room, player string) (*turn.Client, net.PacketConn, net.Conn) {
+	t.Helper()
 	user, pass := credentials(room, player)
 	c, err := turn.NewClient(&turn.ClientConfig{
 		STUNServerAddr: server, TURNServerAddr: server, Conn: turn.NewSTUNConn(conn),
@@ -106,7 +113,7 @@ func streamClient(t *testing.T, how, server string, roots *x509.CertPool, room, 
 	}
 	relayConn, err := c.Allocate()
 	if err != nil {
-		t.Fatalf("allocate over %s as %s: %v", how, player, err)
+		t.Fatalf("allocate over %s as %s: %v", conn.RemoteAddr(), player, err)
 	}
 	t.Cleanup(func() { _ = relayConn.Close(); c.Close(); _ = conn.Close() })
 	return c, relayConn, conn
@@ -258,5 +265,59 @@ func TestAFloodingStreamDoesntStallOthers(t *testing.T) {
 	}
 	if got := burst(t, a, b, 50); got < 50 {
 		t.Fatalf("during the flood: %d of 50 arrived", got)
+	}
+}
+
+// A connection that stops reading while paused, as a client on a network that stalls.
+type stalling struct {
+	net.Conn
+	paused atomic.Bool
+}
+
+func (s *stalling) Read(b []byte) (int, error) {
+	for s.paused.Load() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	return s.Conn.Read(b)
+}
+
+// A TLS client that stops reading for a while keeps its connection: what doesn't fit in its
+// queue is dropped, whole messages at a time, and it carries on once it reads again.
+func TestAStalledTLSClientKeepsItsConnection(t *testing.T) {
+	// No rate limit, so the stalled client's queue fills in a moment.
+	server, tlsServer, roots := startStreamNode(t, "TURN_RATE_BYTES=1000000000")
+	raw, err := net.Dial("tcp4", tlsServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = raw.(*net.TCPConn).SetReadBuffer(4096)
+	conn := tls.Client(raw, &tls.Config{RootCAs: roots, ServerName: "turn.test"})
+	if err := conn.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	stall := &stalling{Conn: conn}
+	_, b, _ := streamClientOn(t, stall, tlsServer, "g1", "p_tls")
+	_, a := client(t, server, "g1", "p_udp")
+	if aGot, bGot := exchange(a, b, 3*time.Second); !aGot || !bGot {
+		t.Fatalf("a got %v, b got %v", aGot, bGot)
+	}
+	// Far more than the kernel's buffers and the node's queue hold, while b reads nothing.
+	stall.paused.Store(true)
+	packet := make([]byte, 1000)
+	for range 20000 {
+		_, _ = a.WriteTo(packet, b.LocalAddr())
+	}
+	time.Sleep(500 * time.Millisecond)
+	stall.paused.Store(false)
+	// Whatever was queued arrives; then b still hears from a.
+	buf := make([]byte, 1500)
+	for {
+		_ = b.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		if _, _, err := b.ReadFrom(buf); err != nil {
+			break
+		}
+	}
+	if aGot, bGot := exchange(a, b, 3*time.Second); !aGot || !bGot {
+		t.Fatalf("after the stall: a got %v, b got %v", aGot, bGot)
 	}
 }

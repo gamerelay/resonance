@@ -6,6 +6,17 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
 
 ## 2026-09-30
 
+**A stalled TLS client keeps its connection.**
+
+- Fixed: a TLS stream with more than 64 KB queued (a client whose network stalled for a few
+  seconds) was closed instead of dropping messages. rustls takes at most its own buffer's limit
+  at a time, and the rest was handed over whole (`write_all`), which failed. Now what it takes
+  is written, the rest waits for the next turn. Plain TCP was right already.
+- `TURN_DEBUG_STREAMS=1` also says why a stream closed on a write, not only on a read.
+- Tests: `TestAStalledTLSClientKeepsItsConnection` (a client that stops reading while 20 MB is
+  sent its way, then carries on). The interop tests wait for the node to answer instead of
+  sleeping 200 ms, which lost the race now and then.
+
 **TURN over TCP and TLS** (RFC 8656 §12.5), for networks that block UDP. `26d3138`, `9350911`
 
 - **TLS listener** when `TURN_TLS_CERT` and `TURN_TLS_KEY` name PEM files (certbot's

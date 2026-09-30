@@ -102,9 +102,10 @@ impl Stream {
             return Ok(());
         };
         loop {
+            // rustls takes up to its own buffer's limit (64 KB) at a time, the rest next time round.
             if !tls.wants_write() && !self.queue.is_empty() && !tls.is_handshaking() {
-                tls.writer().write_all(&self.queue)?;
-                self.queue.clear();
+                let n = tls.writer().write(&self.queue)?;
+                self.queue.drain(..n);
             }
             if !tls.wants_write() {
                 return Ok(());
@@ -489,8 +490,13 @@ pub fn run(l: Listeners, mut server: Server, network: Option<Network>, limits: L
                             }
                         }
                     }
-                    if alive && settle(&mut s, &registry).is_err() {
-                        alive = false;
+                    if alive {
+                        if let Err(e) = settle(&mut s, &registry) {
+                            if debug {
+                                eprintln!("stream {conn}: {e}");
+                            }
+                            alive = false;
+                        }
                     }
                     if alive {
                         streams.insert(conn, s);
@@ -504,7 +510,10 @@ pub fn run(l: Listeners, mut server: Server, network: Option<Network>, limits: L
             touched.dedup();
             for conn in touched.drain(..) {
                 if let Some(s) = streams.get_mut(&conn) {
-                    if settle(s, &registry).is_err() {
+                    if let Err(e) = settle(s, &registry) {
+                        if debug {
+                            eprintln!("stream {conn}: {e}");
+                        }
                         if let Some(s) = streams.remove(&conn) {
                             close(s, &mut server, &mut per_ip, &registry);
                         }

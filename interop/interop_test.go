@@ -59,8 +59,31 @@ func startNodeWith(t *testing.T, env ...string) string {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
-	time.Sleep(200 * time.Millisecond)
-	return fmt.Sprintf("127.0.0.1:%d", port)
+	server := fmt.Sprintf("127.0.0.1:%d", port)
+	waitForNode(t, server, env)
+	return server
+}
+
+// waitForNode: until the node answers a Binding over UDP, and its TCP listeners (if any) take
+// connections. Listeners are bound before the loop starts, so the Binding answer comes last.
+func waitForNode(t *testing.T, server string, env []string) {
+	t.Helper()
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	to, _ := net.ResolveUDPAddr("udp4", server)
+	req := []byte{0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+	buf := make([]byte, 1500)
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		_, _ = conn.WriteTo(req, to)
+		_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		if _, _, err := conn.ReadFrom(buf); err == nil {
+			return
+		}
+	}
+	t.Fatalf("the node at %s never answered (settings %v)", server, env)
 }
 
 func client(t *testing.T, server, room, player string) (*turn.Client, net.PacketConn) {
