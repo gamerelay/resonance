@@ -32,7 +32,7 @@ let firefoxProfile = null;
 const ip = Object.values(networkInterfaces()).flat().find((a) => a && a.family === 'IPv4' && !a.internal)?.address;
 if (!ip) throw new Error('no non-loopback IPv4 address');
 
-const env = { TURN_SECRET: KEY, TURN_PUBLIC_IP: ip, TURN_PORT: String(PORT), TURN_DEBUG_STREAMS: process.env.TURN_DEBUG_STREAMS ?? '' };
+const env = { TURN_SECRET: KEY, TURN_PUBLIC_IP: ip, TURN_PORT: String(PORT), TURN_TCP: '1', TURN_DEBUG_STREAMS: process.env.TURN_DEBUG_STREAMS ?? '' };
 if (TRANSPORT === 'tls') {
   // A CA, and a certificate for HOST signed by it, as certbot's fullchain.pem and privkey.pem.
   const dir = mkdtempSync(join(tmpdir(), 'turn-tls-'));

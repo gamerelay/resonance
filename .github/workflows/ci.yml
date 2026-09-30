@@ -24,7 +24,7 @@ jobs:
       - name: interop with pion's TURN client
         run: cd interop && go test -count=1 ./...
       - name: interop with coturn's TURN client
-        run: sudo apt-get install -y -qq coturn && interop/coturn.sh
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq coturn && interop/coturn.sh
 
   browsers:
     # Chromium, Firefox and WebKit's own TURN clients through the node, every pairing, relay only:

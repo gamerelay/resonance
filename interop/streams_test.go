@@ -73,7 +73,7 @@ func startStreamNode(t *testing.T, env ...string) (string, string, *x509.CertPoo
 	certFile, keyFile, roots := testCert(t)
 	tlsPort := freeTCPPort(t)
 	server := startNodeWith(t, append([]string{
-		"TURN_TLS_CERT=" + certFile, "TURN_TLS_KEY=" + keyFile,
+		"TURN_TCP=1", "TURN_TLS_CERT=" + certFile, "TURN_TLS_KEY=" + keyFile,
 		fmt.Sprintf("TURN_TLS_PORT=%d", tlsPort), "TURN_TLS_HOST=turn.test",
 	}, env...)...)
 	return server, fmt.Sprintf("127.0.0.1:%d", tlsPort), roots

@@ -18,7 +18,8 @@
 //!
 //! Streams (RFC 8656 §12.5), for networks that block UDP:
 //!
-//! - TCP on TURN_PORT too, unless TURN_TCP=0.
+//! - TCP on TURN_PORT too with TURN_TCP=1 (off by default: it needs its own firewall opening,
+//!   and a URL players can't reach only costs them a try).
 //! - TLS when TURN_TLS_CERT and TURN_TLS_KEY name PEM files (certbot's fullchain.pem and
 //!   privkey.pem, read again when they change), on TURN_TLS_PORT (5349; 443 gets through the most
 //!   firewalls), for TURN_TLS_HOST, the name on the certificate that players connect to.
@@ -296,7 +297,7 @@ struct TlsSettings {
 
 impl Streams {
     fn from_env() -> Self {
-        let tcp = env("TURN_TCP").is_none_or(|v| v != "0");
+        let tcp = env("TURN_TCP").is_some_and(|v| v == "1");
         let tls = match (env("TURN_TLS_CERT"), env("TURN_TLS_KEY")) {
             (Some(cert), Some(key)) => Some(TlsSettings {
                 cert: cert.into(),
