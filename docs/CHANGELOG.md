@@ -45,6 +45,12 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
 - **Benchmark:** UDP unchanged by the new loop (200 and 1,000 pairs, old and new alternating).
 - CI refreshes apt before installing coturn (a stale index failed the job).
 
+**Docs.** `d318209`, `671367f`
+
+- `docs/CHANGELOG.md` (this) and `docs/HANDOFF.md` (where things stand, the deployed nodes,
+  deploying, testing, what bites, what's next). The README says v0 is in production and covers
+  TCP and TLS.
+
 ## 2026-09-29
 
 **The node joins the network.** `5dd2f6f`
