@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod limiter;
 pub mod server;
+pub mod stream;
 pub mod stun;
 
-pub use server::{Config, Output, Server, Stats};
+pub use server::{Client, Config, Output, Server, Stats};

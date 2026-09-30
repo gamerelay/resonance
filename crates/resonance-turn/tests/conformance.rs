@@ -528,6 +528,24 @@ fn every_unsigned_answer_to_an_unknown_source_is_budgeted() {
     }
 }
 
+#[test]
+fn a_stream_isnt_budgeted_and_doesnt_spend_its_ips_udp_budget() {
+    // A TCP or TLS client's handshake proved its address: nothing it's sent can be aimed at
+    // anyone else. A busy one mustn't lock out UDP players behind the same NAT either.
+    let t = Instant::now();
+    let mut s = server(t);
+    let stream = Client::on("198.51.100.7:1", 5);
+    let answered = (0u8..200)
+        .filter(|&i| !stream.send(&mut s, t, &binding(i)).is_empty())
+        .count();
+    assert_eq!(answered, 200);
+    let udp = Client::new("198.51.100.7:2");
+    let answered = (0u8..100)
+        .filter(|&i| !udp.send(&mut s, t, &binding(i)).is_empty())
+        .count();
+    assert_eq!(answered, 64, "the UDP budget at that IP is untouched");
+}
+
 // ---------------------------------------------------------------------------------------------
 // How Chrome (libwebrtc turn_port.cc) and Firefox (nICEr turn_client_ctx.c) behave.
 

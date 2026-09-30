@@ -86,6 +86,10 @@ pub struct Heartbeat {
     pub cpu: f64,
     pub uptime_s: u64,
     pub software: String,
+    /// Where players reach it, as at join: so a node that starts serving TCP or TLS says so
+    /// without joining again. An addition within 2026-09-29 (servers that don't know it ignore it).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub urls: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

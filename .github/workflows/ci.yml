@@ -27,12 +27,13 @@ jobs:
         run: sudo apt-get install -y -qq coturn && interop/coturn.sh
 
   browsers:
-    # Chromium, Firefox and WebKit's own TURN clients through the node, every pairing, relay only.
+    # Chromium, Firefox and WebKit's own TURN clients through the node, every pairing, relay only:
+    # over UDP, TCP and TLS.
     runs-on: ubuntu-latest
     container: mcr.microsoft.com/playwright:v1.63.0-noble
     steps:
       - uses: actions/checkout@v4
-      - run: apt-get update -qq && apt-get install -y -qq build-essential
+      - run: apt-get update -qq && apt-get install -y -qq build-essential libnss3-tools
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release -p resonance-node
       - name: every browser pairing through the node
@@ -40,4 +41,15 @@ jobs:
         # Firefox won't start as root with another user's HOME (GitHub sets /github/home).
         env:
           HOME: /root
-        run: npm i --no-save playwright@1.63.0 && NODE_BIN=$GITHUB_WORKSPACE/target/release/resonance-node node relay.mjs
+        run: |
+          npm i --no-save playwright@1.63.0
+          export NODE_BIN=$GITHUB_WORKSPACE/target/release/resonance-node
+          node relay.mjs
+          TRANSPORT=tcp node relay.mjs
+          # WebKit's TURN client trusts only its built-in roots, so no test CA: checked against a
+          # real certificate instead.
+          TRANSPORT=tls BROWSERS=chromium,firefox node relay.mjs
+          # And nobody accepts a certificate they don't trust.
+          if TRANSPORT=tls TLS_TRUST=none BROWSERS=chromium,firefox node relay.mjs; then
+            echo "an untrusted certificate was accepted"; exit 1
+          fi

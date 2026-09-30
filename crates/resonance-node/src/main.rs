@@ -16,6 +16,16 @@
 //! on them: every relayed packet goes from one allocation to another in memory (the only
 //! permitted peer is this relay), so the relay port range needs no firewall opening.
 //!
+//! Streams (RFC 8656 §12.5), for networks that block UDP:
+//!
+//! - TCP on TURN_PORT too, unless TURN_TCP=0.
+//! - TLS when TURN_TLS_CERT and TURN_TLS_KEY name PEM files (certbot's fullchain.pem and
+//!   privkey.pem, read again when they change), on TURN_TLS_PORT (5349; 443 gets through the most
+//!   firewalls), for TURN_TLS_HOST, the name on the certificate that players connect to.
+//! - TURN_MAX_STREAMS (4096): open TCP and TLS connections, all together; per IP, TURN_MAX_PER_IP.
+//!
+//! Its URLs, sent when it joins and with every heartbeat, follow from these.
+//!
 //! Limits (defaults are the Go relay's):
 //!
 //! - TURN_MAX_PER_PLAYER (8): allocations per player, one per other player in a full room.
@@ -28,15 +38,18 @@
 //! - TURN_RATE_BYTES (131072) and TURN_BURST_BYTES (twice that): per allocation.
 
 mod control;
+mod relay;
 mod state;
+mod tls;
 
-use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::mpsc::{self, Receiver};
+use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
+use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use control::{Client, Control, Snapshot};
-use resonance_turn::{Config, Output, Server};
+use control::{Client, Snapshot};
+use resonance_turn::{Config, Server};
 use socket2::{Domain, Protocol, Socket, Type};
 use state::{Joined, State};
 
@@ -73,7 +86,7 @@ fn num<T: std::str::FromStr + PartialOrd + Default + Copy>(key: &str, fallback: 
     }
 }
 
-fn fail(msg: &str) -> ! {
+pub(crate) fn fail(msg: &str) -> ! {
     eprintln!("{msg}");
     std::process::exit(1)
 }
@@ -109,14 +122,11 @@ fn join(token: &str) {
     let key = state
         .key()
         .unwrap_or_else(|e| fail(&format!("key in {}: {e}", state.dir().display())));
-    let url = match public_ip() {
-        IpAddr::V4(ip) => format!("turn:{ip}:{}", port("TURN_PORT", 3478)),
-        IpAddr::V6(ip) => format!("turn:[{ip}]:{}", port("TURN_PORT", 3478)),
-    };
+    let urls = Streams::from_env().urls(public_ip(), port("TURN_PORT", 3478));
     let control = control_url();
     let client = Client::new(&control, key, None, resonance_proto::VERSION);
     let joined = client
-        .join(token, vec![url.clone()])
+        .join(token, urls.clone())
         .unwrap_or_else(|e| fail(&format!("join: {e}")));
     let j = Joined {
         node_id: joined.node_id,
@@ -128,8 +138,11 @@ fn join(token: &str) {
         .save_joined(&j)
         .unwrap_or_else(|e| fail(&format!("saving {}: {e}", state.dir().display())));
     println!(
-        "joined {} as {} in {}, reachable at {url}",
-        j.control, j.node_id, j.region
+        "joined {} as {} in {}, reachable at {}",
+        j.control,
+        j.node_id,
+        j.region,
+        urls.join(" ")
     );
 }
 
@@ -168,11 +181,18 @@ fn run_node() {
             let (snap, kv) = (snapshot.clone(), k.key_version);
             // RESONANCE_HEARTBEAT_S: for tests; the control plane expects 15.
             let every = Duration::from_secs(num("RESONANCE_HEARTBEAT_S", HEARTBEAT.as_secs()));
+            let urls = Streams::from_env().urls(public, port("TURN_PORT", 3478));
             std::thread::Builder::new()
                 .name("heartbeat".into())
-                .spawn(move || control::heartbeats(client, every, snap, kv, tx))
+                .spawn(move || control::heartbeats(client, every, snap, kv, urls, tx))
                 .expect("a thread");
-            (k.node_key, Some((rx, snapshot)))
+            (
+                k.node_key,
+                Some(relay::Network {
+                    controls: rx,
+                    snapshot,
+                }),
+            )
         }
         None => {
             let key = env("RESONANCE_NODE_KEY")
@@ -209,10 +229,30 @@ fn run_node() {
     cfg.rate_bytes = num("TURN_RATE_BYTES", cfg.rate_bytes);
     cfg.burst_bytes = num("TURN_BURST_BYTES", cfg.rate_bytes * 2.0);
     let (min, max) = (cfg.min_port, cfg.max_port);
-    let socket = bind(SocketAddr::new(IpAddr::from([0, 0, 0, 0]), listen));
+    let any = IpAddr::from([0, 0, 0, 0]);
+    let socket = bind(SocketAddr::new(any, listen));
+    let streams = Streams::from_env();
+    let tcp = streams
+        .tcp
+        .then(|| listen_tcp(SocketAddr::new(any, listen)));
+    let tls = streams.tls.as_ref().map(|t| {
+        let cert = tls::Certificate::open(t.cert.clone(), t.key.clone())
+            .unwrap_or_else(|e| fail(&format!("TURN_TLS_CERT/TURN_TLS_KEY: {e}")));
+        (listen_tcp(SocketAddr::new(any, t.port)), cert)
+    });
     eprintln!(
-        "{} on udp :{listen}, relay addresses {public}:{min}-{max}",
-        control::software()
+        "{} on udp :{listen}{}{}, relay addresses {public}:{min}-{max}",
+        control::software(),
+        if tcp.is_some() {
+            format!(", tcp :{listen}")
+        } else {
+            String::new()
+        },
+        streams
+            .tls
+            .as_ref()
+            .map(|t| format!(", tls :{} as {}", t.port, t.host))
+            .unwrap_or_default()
     );
     eprintln!(
         "limits: {} allocations per player, {} per IP, {} per game; {} B/s per allocation (burst {}); unauthenticated answers {}/s per IP (burst {})",
@@ -224,7 +264,82 @@ fn run_node() {
         cfg.unauth_rate,
         cfg.unauth_burst
     );
-    run(socket, Server::new(cfg), network);
+    let limits = relay::Limits {
+        max_streams: num("TURN_MAX_STREAMS", 4096),
+        max_streams_per_ip: cfg.max_per_ip as usize,
+        key_overlap: KEY_OVERLAP,
+    };
+    relay::run(
+        relay::Listeners {
+            udp: socket,
+            tcp,
+            tls,
+        },
+        Server::new(cfg),
+        network,
+        limits,
+    );
+}
+
+/// TCP and TLS, as configured (the module doc).
+struct Streams {
+    tcp: bool,
+    tls: Option<TlsSettings>,
+}
+
+struct TlsSettings {
+    cert: PathBuf,
+    key: PathBuf,
+    port: u16,
+    host: String,
+}
+
+impl Streams {
+    fn from_env() -> Self {
+        let tcp = env("TURN_TCP").is_none_or(|v| v != "0");
+        let tls = match (env("TURN_TLS_CERT"), env("TURN_TLS_KEY")) {
+            (Some(cert), Some(key)) => Some(TlsSettings {
+                cert: cert.into(),
+                key: key.into(),
+                port: port("TURN_TLS_PORT", 5349),
+                host: env("TURN_TLS_HOST").unwrap_or_else(|| {
+                    fail("TURN_TLS_HOST (the name on the certificate players connect to) is required with TURN_TLS_CERT")
+                }),
+            }),
+            (None, None) => None,
+            _ => fail("TURN_TLS_CERT and TURN_TLS_KEY go together"),
+        };
+        Streams { tcp, tls }
+    }
+
+    /// What players are told: UDP first (the SDK times a relay by it and names it by its first
+    /// URL), then TCP, then TLS by its certificate's name.
+    fn urls(&self, public: IpAddr, port: u16) -> Vec<String> {
+        let host = match public {
+            IpAddr::V4(ip) => ip.to_string(),
+            IpAddr::V6(ip) => format!("[{ip}]"),
+        };
+        let mut urls = vec![format!("turn:{host}:{port}")];
+        if self.tcp {
+            urls.push(format!("turn:{host}:{port}?transport=tcp"));
+        }
+        if let Some(t) = &self.tls {
+            urls.push(format!("turns:{}:{}?transport=tcp", t.host, t.port));
+        }
+        urls
+    }
+}
+
+fn listen_tcp(addr: SocketAddr) -> TcpListener {
+    let s = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
+        .unwrap_or_else(|e| fail(&format!("socket: {e}")));
+    // A restart shouldn't wait out the last run's connections in TIME_WAIT.
+    let _ = s.set_reuse_address(true);
+    s.bind(&addr.into())
+        .unwrap_or_else(|e| fail(&format!("listen on tcp {addr}: {e}")));
+    s.listen(1024)
+        .unwrap_or_else(|e| fail(&format!("listen on tcp {addr}: {e}")));
+    s.into()
 }
 
 /// The key, retried until the control plane answers: a node that can't get its key can't relay.
@@ -278,80 +393,4 @@ fn bind(addr: SocketAddr) -> UdpSocket {
     s.bind(&addr.into())
         .unwrap_or_else(|e| fail(&format!("listen on {addr}: {e}")));
     s.into()
-}
-
-/// The relay loop. `network`: the heartbeat thread's controls, and the numbers it reports.
-fn run(
-    socket: UdpSocket,
-    mut server: Server,
-    network: Option<(Receiver<Control>, Arc<Mutex<Snapshot>>)>,
-) -> ! {
-    socket
-        .set_read_timeout(Some(Duration::from_millis(250)))
-        .expect("a nonzero timeout");
-    let mut buf = vec![0u8; 65536];
-    let mut out = Output::default();
-    let mut last_tick = Instant::now();
-    let mut last_log = last_tick;
-    let (mut bytes_in, mut bytes_out) = (0u64, 0u64);
-    loop {
-        match socket.recv_from(&mut buf) {
-            Ok((n, from)) => {
-                let now = Instant::now();
-                bytes_in += n as u64;
-                out.clear();
-                server.handle(now, from, &buf[..n], &mut out);
-                for (to, packet) in out.iter() {
-                    // A full send buffer or an unreachable client is a lost packet, as UDP allows.
-                    if socket.send_to(packet, to).is_ok() {
-                        bytes_out += packet.len() as u64;
-                    }
-                }
-            }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            // A client's ICMP unreachable can surface here on some systems; it isn't ours to fix.
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-            Err(e) => eprintln!("recv: {e}"),
-        }
-        let now = Instant::now();
-        if now - last_tick >= Duration::from_secs(1) {
-            server.tick(now);
-            last_tick = now;
-            if let Some((rx, snapshot)) = &network {
-                while let Ok(c) = rx.try_recv() {
-                    match c {
-                        Control::Key(k) => server.set_node_key(k, now, KEY_OVERLAP),
-                        Control::Accepting(yes) => server.set_accepting(yes),
-                        Control::Exit => std::process::exit(0),
-                    }
-                }
-                if let Ok(mut s) = snapshot.lock() {
-                    *s = Snapshot {
-                        allocations: server.allocations() as u64,
-                        bytes_in,
-                        bytes_out,
-                    };
-                }
-            }
-        }
-        if now - last_log >= Duration::from_secs(60) {
-            let s = server.stats();
-            eprintln!(
-                "allocations {}, permissions allowed {} denied {}, unauthenticated requests dropped {}, relayed {} packets {} bytes, dropped over rate {} unroutable {}",
-                server.allocations(),
-                s.permissions_allowed,
-                s.permissions_denied,
-                s.unauthenticated_dropped,
-                s.relayed_packets,
-                s.relayed_bytes,
-                s.dropped_rate,
-                s.dropped_route
-            );
-            last_log = now;
-        }
-    }
 }

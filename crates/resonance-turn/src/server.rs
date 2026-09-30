@@ -75,11 +75,31 @@ impl Config {
     }
 }
 
+/// Who a packet is from or for: an address, and the connection it came on. `conn` 0 is the UDP
+/// socket; each TCP or TLS connection has its own number, so it is its own 5-tuple (RFC 8656
+/// §2.2) even at an ip:port a UDP client also uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Client {
+    pub addr: SocketAddr,
+    pub conn: u32,
+}
+
+impl Client {
+    pub const UDP: u32 = 0;
+
+    pub fn udp(addr: SocketAddr) -> Self {
+        Client {
+            addr,
+            conn: Self::UDP,
+        }
+    }
+}
+
 /// What to send, in one reused buffer.
 #[derive(Default)]
 pub struct Output {
     buf: Vec<u8>,
-    sends: Vec<(SocketAddr, usize, usize)>,
+    sends: Vec<(Client, usize, usize)>,
 }
 
 impl Output {
@@ -88,7 +108,15 @@ impl Output {
         self.sends.clear();
     }
 
+    /// Each send's address and bytes.
     pub fn iter(&self) -> impl Iterator<Item = (SocketAddr, &[u8])> {
+        self.sends
+            .iter()
+            .map(|&(to, a, b)| (to.addr, &self.buf[a..b]))
+    }
+
+    /// Each send's client (its address and connection) and bytes.
+    pub fn sends(&self) -> impl Iterator<Item = (Client, &[u8])> {
         self.sends.iter().map(|&(to, a, b)| (to, &self.buf[a..b]))
     }
 
@@ -104,7 +132,7 @@ impl Output {
         self.buf.len()
     }
 
-    fn push(&mut self, to: SocketAddr, start: usize) {
+    fn push(&mut self, to: Client, start: usize) {
         self.sends.push((to, start, self.buf.len()));
     }
 }
@@ -129,7 +157,7 @@ struct Channel {
 }
 
 struct Allocation {
-    client: SocketAddr,
+    client: Client,
     port: u16,
     room: u32,
     user: User,
@@ -154,7 +182,7 @@ pub struct Server {
     limiter: Reflection,
     allocs: Vec<Option<Allocation>>,
     free: Vec<u32>,
-    by_client: HashMap<SocketAddr, u32>,
+    by_client: HashMap<Client, u32>,
     /// Relay port − min_port → allocation.
     by_port: Vec<u32>,
     next_port: usize,
@@ -238,6 +266,13 @@ impl Server {
         self.by_client.len()
     }
 
+    /// A TCP or TLS connection closed: its allocation ends with it (RFC 8656 §2.2).
+    pub fn closed(&mut self, client: Client) {
+        if let Some(&i) = self.by_client.get(&canonical(client)) {
+            self.delete(i);
+        }
+    }
+
     fn unix(&self, now: Instant) -> u64 {
         self.clock.1 + now.saturating_duration_since(self.clock.0).as_secs()
     }
@@ -261,9 +296,14 @@ impl Server {
         }
     }
 
-    /// One packet from a client. What to send goes into `out` (not cleared first).
+    /// One datagram on the UDP socket. What to send goes into `out` (not cleared first).
     pub fn handle(&mut self, now: Instant, from: SocketAddr, packet: &[u8], out: &mut Output) {
-        let from = SocketAddr::new(from.ip().to_canonical(), from.port());
+        self.handle_from(now, Client::udp(from), packet, out);
+    }
+
+    /// One message from a client on any connection (a TCP or TLS stream's, already framed).
+    pub fn handle_from(&mut self, now: Instant, from: Client, packet: &[u8], out: &mut Output) {
+        let from = canonical(from);
         if stun::is_channel_data(packet) {
             if let Some((channel, data)) = stun::parse_channel_data(packet) {
                 self.channel_data(now, from, channel, data, out);
@@ -304,7 +344,7 @@ impl Server {
                     method::BINDING => {
                         let start = out.start();
                         Writer::new(&mut out.buf, m, Class::Success, msg.tx)
-                            .xor_address(attr::XOR_MAPPED_ADDRESS, from)
+                            .xor_address(attr::XOR_MAPPED_ADDRESS, from.addr)
                             .fingerprint();
                         out.push(from, start);
                         Ok(())
@@ -331,18 +371,15 @@ impl Server {
     /// 401, a 438, a 400) goes to whatever source the request claims, a few times its size, so a
     /// spoofed source could aim this relay at someone: 20 a second per IP (burst 64, a shared
     /// address filling its allocation cap at once). A client with an allocation is known.
-    fn budget(&mut self, from: SocketAddr, now: Instant) -> bool {
-        self.live_alloc(from, now).is_some() || self.limiter.allow(from.ip(), now)
+    /// A stream's source can't be spoofed (its handshake answered it), so it can't aim anything
+    /// at anyone: it isn't budgeted, and doesn't spend a UDP client's budget at its IP.
+    fn budget(&mut self, from: Client, now: Instant) -> bool {
+        from.conn != Client::UDP
+            || self.live_alloc(from, now).is_some()
+            || self.limiter.allow(from.addr.ip(), now)
     }
 
-    fn refuse(
-        &mut self,
-        now: Instant,
-        from: SocketAddr,
-        msg: &Message,
-        r: Refusal,
-        out: &mut Output,
-    ) {
+    fn refuse(&mut self, now: Instant, from: Client, msg: &Message, r: Refusal, out: &mut Output) {
         // A signed refusal went to a client that proved its credentials.
         if r.key.is_none() && !self.budget(from, now) {
             return;
@@ -351,7 +388,7 @@ impl Server {
         let mut w = Writer::new(&mut out.buf, msg.method, Class::Error, msg.tx);
         w.error(r.code, r.reason);
         if matches!(r.code, 401 | 438) {
-            let nonce = self.nonces.issue(self.unix(now), from);
+            let nonce = self.nonces.issue(self.unix(now), from.addr);
             w.attr(attr::REALM, self.cfg.realm.as_bytes())
                 .attr(attr::NONCE, nonce.as_bytes());
         }
@@ -362,7 +399,7 @@ impl Server {
         out.push(from, start);
     }
 
-    fn live_alloc(&mut self, from: SocketAddr, now: Instant) -> Option<u32> {
+    fn live_alloc(&mut self, from: Client, now: Instant) -> Option<u32> {
         let &i = self.by_client.get(&from)?;
         if self.alloc(i).expires <= now {
             self.delete(i);
@@ -385,7 +422,7 @@ impl Server {
     fn authenticate(
         &mut self,
         now: Instant,
-        from: SocketAddr,
+        from: Client,
         msg: &Message,
     ) -> Result<(User, String, [u8; 16]), Refusal> {
         let unauthorized = Refusal {
@@ -419,7 +456,7 @@ impl Server {
         }
         // Stale, from before a restart, or another client's: 438 with a fresh one, which every
         // browser retries (a 401 on a Refresh would end the allocation in Chrome).
-        if self.nonces.check(nonce, self.unix(now), from) != NonceCheck::Ok {
+        if self.nonces.check(nonce, self.unix(now), from.addr) != NonceCheck::Ok {
             return Err(Refusal {
                 code: 438,
                 reason: "Stale Nonce",
@@ -487,7 +524,7 @@ impl Server {
     fn allocate(
         &mut self,
         now: Instant,
-        from: SocketAddr,
+        from: Client,
         msg: &Message,
         out: &mut Output,
     ) -> Result<(), Refusal> {
@@ -524,7 +561,7 @@ impl Server {
                 return Err(refuse(440, "Address Family not Supported"));
             }
         }
-        let ip = from.ip();
+        let ip = from.addr.ip();
         if self.per_player.get(&user.player).copied().unwrap_or(0) >= self.cfg.max_per_player
             || self.per_ip.get(&ip).copied().unwrap_or(0) >= self.cfg.max_per_ip
             || self.per_instance.get(&user.instance).copied().unwrap_or(0)
@@ -573,7 +610,7 @@ impl Server {
 
     fn allocate_success(
         &self,
-        from: SocketAddr,
+        from: Client,
         msg: &Message,
         port: u16,
         lifetime_s: u32,
@@ -586,7 +623,7 @@ impl Server {
                 attr::XOR_RELAYED_ADDRESS,
                 SocketAddr::new(self.cfg.public_ip, port),
             )
-            .xor_address(attr::XOR_MAPPED_ADDRESS, from)
+            .xor_address(attr::XOR_MAPPED_ADDRESS, from.addr)
             .u32(attr::LIFETIME, lifetime_s)
             .integrity(key)
             .fingerprint();
@@ -639,7 +676,7 @@ impl Server {
             }
         }
         release(&mut self.per_player, &a.user.player);
-        release(&mut self.per_ip, &a.client.ip());
+        release(&mut self.per_ip, &a.client.addr.ip());
         release(&mut self.per_instance, &a.user.instance);
     }
 
@@ -647,7 +684,7 @@ impl Server {
     fn authenticated_alloc(
         &mut self,
         now: Instant,
-        from: SocketAddr,
+        from: Client,
         msg: &Message,
     ) -> Result<(u32, [u8; 16]), Refusal> {
         let (_, username, key) = self.authenticate(now, from, msg)?;
@@ -668,7 +705,7 @@ impl Server {
 
     fn success(
         &self,
-        from: SocketAddr,
+        from: Client,
         msg: &Message,
         key: &[u8; 16],
         lifetime: Option<u32>,
@@ -686,7 +723,7 @@ impl Server {
     fn refresh(
         &mut self,
         now: Instant,
-        from: SocketAddr,
+        from: Client,
         msg: &Message,
         out: &mut Output,
     ) -> Result<(), Refusal> {
@@ -732,7 +769,7 @@ impl Server {
     fn create_permission(
         &mut self,
         now: Instant,
-        from: SocketAddr,
+        from: Client,
         msg: &Message,
         out: &mut Output,
     ) -> Result<(), Refusal> {
@@ -773,7 +810,7 @@ impl Server {
     fn channel_bind(
         &mut self,
         now: Instant,
-        from: SocketAddr,
+        from: Client,
         msg: &Message,
         out: &mut Output,
     ) -> Result<(), Refusal> {
@@ -820,7 +857,7 @@ impl Server {
         Ok(())
     }
 
-    fn send_indication(&mut self, now: Instant, from: SocketAddr, msg: &Message, out: &mut Output) {
+    fn send_indication(&mut self, now: Instant, from: Client, msg: &Message, out: &mut Output) {
         let Some(i) = self.live_alloc(from, now) else {
             return;
         };
@@ -839,7 +876,7 @@ impl Server {
     fn channel_data(
         &mut self,
         now: Instant,
-        from: SocketAddr,
+        from: Client,
         channel: u16,
         data: &[u8],
         out: &mut Output,
@@ -917,6 +954,14 @@ impl Server {
         out.push(d.client, start);
         self.stats.relayed_packets += 1;
         self.stats.relayed_bytes += data.len() as u64;
+    }
+}
+
+/// An IPv4 client on a dual-stack socket arrives as ::ffff:a.b.c.d; it's the same client.
+fn canonical(c: Client) -> Client {
+    Client {
+        addr: SocketAddr::new(c.addr.ip().to_canonical(), c.addr.port()),
+        ..c
     }
 }
 

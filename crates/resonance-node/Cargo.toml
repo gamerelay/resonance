@@ -12,8 +12,12 @@ base64 = "0.22"
 ed25519-dalek = "2"
 getrandom = "0.3"
 libc = "0.2"
+mio = { version = "1", features = ["os-poll", "net"] }
 resonance-proto.workspace = true
 resonance-turn.workspace = true
+# The TLS listener; the same rustls and ring that ureq already brings.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 socket2 = "0.6"

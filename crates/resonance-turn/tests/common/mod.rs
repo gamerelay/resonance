@@ -37,6 +37,8 @@ pub fn addr(s: &str) -> SocketAddr {
 /// A TURN client over one 5-tuple: long-term credentials, fetching a nonce when it has none.
 pub struct Client {
     pub from: SocketAddr,
+    /// Its connection: 0 the UDP socket, else a TCP or TLS stream's number.
+    pub conn: u32,
     pub nonce: Option<String>,
     pub tx: u32,
 }
@@ -79,11 +81,36 @@ pub fn canon(a: SocketAddr) -> SocketAddr {
 
 impl Client {
     pub fn new(from: &str) -> Self {
+        Self::on(from, resonance_turn::Client::UDP)
+    }
+
+    /// A client on connection `conn` (a TCP or TLS stream).
+    pub fn on(from: &str, conn: u32) -> Self {
         Client {
             from: addr(from),
+            conn,
             nonce: None,
             tx: 0,
         }
+    }
+
+    pub fn core(&self) -> resonance_turn::Client {
+        resonance_turn::Client {
+            addr: self.from,
+            conn: self.conn,
+        }
+    }
+
+    /// What the relay sends, with the connection each goes on.
+    pub fn send_on(
+        &self,
+        s: &mut Server,
+        now: Instant,
+        packet: &[u8],
+    ) -> Vec<(resonance_turn::Client, Vec<u8>)> {
+        let mut out = Output::default();
+        s.handle_from(now, self.core(), packet, &mut out);
+        out.sends().map(|(to, b)| (to, b.to_vec())).collect()
     }
 
     /// Unique across every client in the test binary.
@@ -100,17 +127,19 @@ impl Client {
     }
 
     pub fn send(&self, s: &mut Server, now: Instant, packet: &[u8]) -> Vec<(SocketAddr, Vec<u8>)> {
-        let mut out = Output::default();
-        s.handle(now, self.from, packet, &mut out);
-        out.iter().map(|(to, b)| (to, b.to_vec())).collect()
+        self.send_on(s, now, packet)
+            .into_iter()
+            .map(|(to, b)| (to.addr, b))
+            .collect()
     }
 
     /// Exactly one answer, to this client.
     pub fn ask(&self, s: &mut Server, now: Instant, packet: &[u8]) -> Reply {
-        let mut got = self.send(s, now, packet);
+        let mut got = self.send_on(s, now, packet);
         assert_eq!(got.len(), 1, "one answer");
         let (to, b) = got.pop().unwrap();
-        assert_eq!(to, canon(self.from));
+        assert_eq!(to.addr, canon(self.from));
+        assert_eq!(to.conn, self.conn, "answers go on the connection asked on");
         Reply(b)
     }
 

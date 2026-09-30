@@ -875,3 +875,86 @@ fn a_draining_node_refuses_new_allocations_and_keeps_the_old_ones() {
     s.set_accepting(true);
     c.allocate(&mut s, t, &user("g1", "p_c"));
 }
+
+#[test]
+fn a_stream_and_a_datagram_client_at_one_address_are_two_clients() {
+    let t = Instant::now();
+    let mut s = server(t);
+    // One host's UDP socket and TCP connection can share a port number: two 5-tuples.
+    let mut udp = Client::new("198.51.100.1:5000");
+    let mut tcp = Client::on("198.51.100.1:5000", 7);
+    let ru = udp.allocate(&mut s, t, &user("g1", "p_a"));
+    let rt = tcp.allocate(&mut s, t, &user("g1", "p_b"));
+    assert_ne!(ru, rt);
+    assert_eq!(s.allocations(), 2);
+    // Each one's requests reach its own allocation (a Refresh on the other would be 437).
+    assert_eq!(
+        udp.request(
+            &mut s,
+            t,
+            method::REFRESH,
+            &user("g1", "p_a"),
+            &[lifetime(600)]
+        )
+        .code(),
+        0
+    );
+    assert_eq!(
+        tcp.request(
+            &mut s,
+            t,
+            method::REFRESH,
+            &user("g1", "p_b"),
+            &[lifetime(600)]
+        )
+        .code(),
+        0
+    );
+}
+
+#[test]
+fn a_stream_client_relays_with_a_datagram_client() {
+    let t = Instant::now();
+    let mut s = server(t);
+    let mut a = Client::on("198.51.100.1:5000", 3);
+    let mut b = Client::new("203.0.113.9:6000");
+    let ra = a.allocate(&mut s, t, &user("g1", "p_a"));
+    let rb = b.allocate(&mut s, t, &user("g1", "p_b"));
+    assert_eq!(a.permit(&mut s, t, &user("g1", "p_a"), rb), 0);
+    assert_eq!(b.permit(&mut s, t, &user("g1", "p_b"), ra), 0);
+    let mut buf = Vec::new();
+    let tx = a.next_tx();
+    Writer::new(&mut buf, method::SEND, Class::Indication, tx)
+        .xor_address(attr::XOR_PEER_ADDRESS, rb)
+        .attr(attr::DATA, b"over tls");
+    let got = a.send_on(&mut s, t, &buf);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].0, b.core(), "to b, on the UDP socket");
+    // And back, onto a's stream.
+    let mut buf = Vec::new();
+    let tx = b.next_tx();
+    Writer::new(&mut buf, method::SEND, Class::Indication, tx)
+        .xor_address(attr::XOR_PEER_ADDRESS, ra)
+        .attr(attr::DATA, b"over udp");
+    let got = b.send_on(&mut s, t, &buf);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].0, a.core(), "to a, on its stream");
+}
+
+#[test]
+fn a_closed_stream_ends_its_allocation() {
+    let t = Instant::now();
+    let mut s = server_with(t, |c| c.max_per_ip = 1);
+    let mut a = Client::on("198.51.100.1:5000", 3);
+    a.allocate(&mut s, t, &user("g1", "p_a"));
+    assert_eq!(s.allocations(), 1);
+    // The UDP client at the same address closing nothing: only that stream's.
+    s.closed(resonance_turn::Client::udp(addr("198.51.100.1:5000")));
+    assert_eq!(s.allocations(), 1);
+    s.closed(a.core());
+    assert_eq!(s.allocations(), 0);
+    // Its per-IP quota is free again, on a new connection.
+    let mut again = Client::on("198.51.100.1:5001", 4);
+    again.allocate(&mut s, t, &user("g1", "p_a"));
+    assert_eq!(s.allocations(), 1);
+}

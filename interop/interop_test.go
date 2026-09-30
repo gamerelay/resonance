@@ -32,6 +32,12 @@ func credentials(room, player string) (string, string) {
 
 func startNode(t *testing.T) string {
 	t.Helper()
+	return startNodeWith(t)
+}
+
+// startNodeWith: a node with more of its settings (KEY=value); its UDP and TCP address.
+func startNodeWith(t *testing.T, env ...string) string {
+	t.Helper()
 	bin, _ := filepath.Abs("../target/release/resonance-node")
 	if _, err := os.Stat(bin); err != nil {
 		// Locally a reminder; in CI a failure, so a missing build can't pass as a skip.
@@ -47,7 +53,7 @@ func startNode(t *testing.T) string {
 	port := l.LocalAddr().(*net.UDPAddr).Port
 	_ = l.Close()
 	cmd := exec.Command(bin)
-	cmd.Env = []string{"TURN_SECRET=" + nodeKey, "TURN_PUBLIC_IP=127.0.0.1", fmt.Sprintf("TURN_PORT=%d", port)}
+	cmd.Env = append([]string{"TURN_SECRET=" + nodeKey, "TURN_PUBLIC_IP=127.0.0.1", fmt.Sprintf("TURN_PORT=%d", port)}, env...)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)

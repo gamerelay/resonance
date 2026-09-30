@@ -168,6 +168,7 @@ pub fn heartbeats(
     every: Duration,
     snapshot: Arc<Mutex<Snapshot>>,
     mut key_version: u32,
+    urls: Vec<String>,
     tx: Sender<Control>,
 ) {
     let started = Instant::now();
@@ -189,6 +190,7 @@ pub fn heartbeats(
             cpu: (cpu - last_cpu) / at.duration_since(last_at).as_secs_f64().max(0.001),
             uptime_s: started.elapsed().as_secs(),
             software: software(),
+            urls: urls.clone(),
         };
         (last_cpu, last_at) = (cpu, at);
         let reply = match client.heartbeat(&h) {
