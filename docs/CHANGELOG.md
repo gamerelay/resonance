@@ -6,6 +6,27 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
 
 ## 2026-09-30
 
+**The relay loop, taken apart.** No change in what it does.
+
+- `resonance-node` is a library and a thin binary. The loop (`relay::Relay`) is a struct with a
+  method per job (UDP, accepting, a stream's turn, closing, the once-a-second and once-a-minute
+  work) where it was one 320-line function; a stream's outgoing queue is its own type (`Outbox`),
+  so its answers no longer need a copy of the queueing code.
+- `relay::run` returns when the node is revoked (the binary then exits 0), and returns errors
+  instead of exiting, so tests can run the loop in a thread.
+- `Limits` carries the stream deadlines (10 s first message, 15 min idle) and
+  `TURN_DEBUG_STREAMS`, which now gives every close's reason (not TURN, closed by the client, no
+  message in time, idle, or the error).
+- The heartbeat's numbers are updated before a revoke is acted on, so the last ones are sent.
+- Connection numbers skip ones still open when they wrap (after 2^32 connections).
+- Tests (`crates/resonance-node/tests/relay.rs`, on loopback): a stream that sends nothing is
+  closed at its deadline, a silent one once idle, streams per IP are capped and a closed one's
+  place freed, and a revoke stops the loop.
+- Benchmark (old and new alternating, Docker on a Mac): 1,000 pairs even (p50 141–153 µs against
+  126–154). 200 pairs: the new median higher in 6 of 8 rounds (median of medians 296 µs against
+  279), within the run's drift (both went from about 210 to 360 µs); CPU the same. To check on a
+  Linux host.
+
 **A stalled TLS client keeps its connection.**
 
 - Fixed: a TLS stream with more than 64 KB queued (a client whose network stalled for a few

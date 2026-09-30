@@ -7,6 +7,7 @@
 //! drops what doesn't fit in its queue, whole messages at a time, as UDP would.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::mpsc::Receiver;
@@ -14,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mio::net::{TcpListener, TcpStream, UdpSocket};
-use mio::{Events, Interest, Poll, Token};
+use mio::{Events, Interest, Poll, Registry, Token};
 use resonance_turn::stream::{Frame, Framer, padding};
 use resonance_turn::{Client, Output, Server};
 use rustls::{ServerConfig, ServerConnection};
@@ -34,10 +35,6 @@ const QUEUE_CAP: usize = 256 * 1024;
 /// rest waits for the next turn, so one busy client can't hold up everyone else.
 const STREAM_BUDGET: usize = 256 * 1024;
 const UDP_BUDGET: usize = 1024;
-/// A stream that hasn't sent a whole message by then (its TLS handshake included) is closed.
-const FIRST_MESSAGE: Duration = Duration::from_secs(10);
-/// Silence after which a stream is closed: longer than any client leaves between refreshes.
-const IDLE: Duration = Duration::from_secs(15 * 60);
 
 /// The sockets, bound and ready.
 pub struct Listeners {
@@ -57,7 +54,48 @@ pub struct Limits {
     pub max_streams: usize,
     /// Open streams from one IP (the core's per-IP allocation cap).
     pub max_streams_per_ip: usize,
+    /// How long a rotated-out node key is still accepted.
     pub key_overlap: Duration,
+    /// A stream that hasn't sent a whole message by then (its TLS handshake included) is closed.
+    pub first_message: Duration,
+    /// Silence after which a stream is closed: longer than any client leaves between refreshes.
+    pub idle: Duration,
+    /// Log each stream's opening and why it closed (TURN_DEBUG_STREAMS=1).
+    pub debug_streams: bool,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            max_streams: 4096,
+            max_streams_per_ip: 64,
+            key_overlap: Duration::from_secs(3600),
+            first_message: Duration::from_secs(10),
+            idle: Duration::from_secs(15 * 60),
+            debug_streams: false,
+        }
+    }
+}
+
+/// What a stream has waiting to go out: whole messages, each padded as a stream needs.
+#[derive(Default)]
+struct Outbox {
+    /// Plaintext not yet taken: by the socket (TCP), or by rustls (TLS, which takes more only once
+    /// it has written what it has, so the two together stay near QUEUE_CAP).
+    bytes: Vec<u8>,
+}
+
+impl Outbox {
+    /// One message, or false if it didn't fit (dropped whole, as UDP would).
+    fn push(&mut self, packet: &[u8]) -> bool {
+        let pad = padding(packet);
+        if self.bytes.len() + packet.len() + pad.len() > QUEUE_CAP {
+            return false;
+        }
+        self.bytes.extend_from_slice(packet);
+        self.bytes.extend_from_slice(pad);
+        true
+    }
 }
 
 struct Stream {
@@ -65,9 +103,7 @@ struct Stream {
     client: Client,
     tls: Option<ServerConnection>,
     framer: Framer,
-    /// Plaintext not yet taken: by the socket (TCP), or by rustls (TLS, which takes more only once
-    /// it has written what it has, so the two together stay near QUEUE_CAP).
-    queue: Vec<u8>,
+    queue: Outbox,
     opened: Instant,
     heard: Instant,
     spoke: bool,
@@ -76,24 +112,18 @@ struct Stream {
 }
 
 impl Stream {
-    /// One message for this client, or false if it didn't fit.
-    fn enqueue(&mut self, packet: &[u8]) -> bool {
-        let pad = padding(packet);
-        if self.queue.len() + packet.len() + pad.len() > QUEUE_CAP {
-            return false;
-        }
-        self.queue.extend_from_slice(packet);
-        self.queue.extend_from_slice(pad);
-        true
+    fn token(&self) -> Token {
+        Token(self.client.conn as usize + STREAMS)
     }
 
     /// Writes what it can without blocking. Err: the stream is broken.
     fn flush(&mut self) -> io::Result<()> {
+        let queue = &mut self.queue.bytes;
         let Some(tls) = &mut self.tls else {
-            while !self.queue.is_empty() {
-                match self.socket.write(&self.queue) {
+            while !queue.is_empty() {
+                match self.socket.write(queue) {
                     Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                    Ok(n) => drop(self.queue.drain(..n)),
+                    Ok(n) => drop(queue.drain(..n)),
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                     Err(e) => return Err(e),
@@ -103,9 +133,9 @@ impl Stream {
         };
         loop {
             // rustls takes up to its own buffer's limit (64 KB) at a time, the rest next time round.
-            if !tls.wants_write() && !self.queue.is_empty() && !tls.is_handshaking() {
-                let n = tls.writer().write(&self.queue)?;
-                self.queue.drain(..n);
+            if !tls.wants_write() && !queue.is_empty() && !tls.is_handshaking() {
+                let n = tls.writer().write(queue)?;
+                queue.drain(..n);
             }
             if !tls.wants_write() {
                 return Ok(());
@@ -120,8 +150,22 @@ impl Stream {
         }
     }
 
-    fn pending(&self) -> bool {
-        !self.queue.is_empty() || self.tls.as_ref().is_some_and(|t| t.wants_write())
+    /// Flushes, then asks for WRITABLE while something still waits, READABLE alone otherwise.
+    fn settle(&mut self, registry: &Registry) -> io::Result<()> {
+        self.flush()?;
+        let want =
+            !self.queue.bytes.is_empty() || self.tls.as_ref().is_some_and(|t| t.wants_write());
+        if want != self.waiting {
+            let interest = if want {
+                Interest::READABLE | Interest::WRITABLE
+            } else {
+                Interest::READABLE
+            };
+            let token = self.token();
+            registry.reregister(&mut self.socket, token, interest)?;
+            self.waiting = want;
+        }
+        Ok(())
     }
 
     /// One read into the framer: a chunk (its size), nothing more for now, or the end.
@@ -167,44 +211,6 @@ impl Stream {
             };
         }
     }
-
-    /// Hands each whole message to the core and routes its answers. False: junk, close it.
-    fn take_messages(
-        &mut self,
-        server: &mut Server,
-        now: Instant,
-        out: &mut Output,
-        route: &mut Route,
-    ) -> bool {
-        while let Some(frame) = self.framer.next() {
-            let Frame::Message(m) = frame else {
-                return false;
-            };
-            *route.bytes_in += m.len() as u64;
-            out.clear();
-            server.handle_from(now, self.client, m, out);
-            for (to, packet) in out.sends() {
-                // `m` borrows the framer; answers to this stream only touch its queue.
-                let sent = if to.conn == self.client.conn {
-                    let pad = padding(packet);
-                    let fits = self.queue.len() + packet.len() + pad.len() <= QUEUE_CAP;
-                    if fits {
-                        self.queue.extend_from_slice(packet);
-                        self.queue.extend_from_slice(pad);
-                    }
-                    fits
-                } else {
-                    route.one(to, packet)
-                };
-                if sent {
-                    *route.bytes_out += packet.len() as u64;
-                }
-            }
-            self.spoke = true;
-            self.heard = now;
-        }
-        true
-    }
 }
 
 enum Fill {
@@ -213,135 +219,167 @@ enum Fill {
     Closed,
 }
 
-/// Where the core's answers go: the UDP socket, the stream being read, or another stream.
-struct Route<'a> {
-    udp: &'a UdpSocket,
-    streams: &'a mut HashMap<u32, Stream>,
-    touched: &'a mut Vec<u32>,
-    bytes_in: &'a mut u64,
-    bytes_out: &'a mut u64,
+/// Why a stream was closed.
+enum Why {
+    Junk,
+    Hangup,
+    /// No whole message by `first_message`.
+    Silent,
+    Idle,
+    Error(io::Error),
 }
 
-impl Route<'_> {
-    /// Everything in `out`, from a UDP datagram.
-    fn send(&mut self, out: &Output) {
-        for (to, packet) in out.sends() {
-            if self.one(to, packet) {
-                *self.bytes_out += packet.len() as u64;
-            }
+impl fmt::Display for Why {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Why::Junk => write!(f, "not TURN"),
+            Why::Hangup => write!(f, "closed by the client"),
+            Why::Silent => write!(f, "no message in time"),
+            Why::Idle => write!(f, "idle"),
+            Why::Error(e) => write!(f, "{e}"),
         }
     }
+}
 
-    fn one(&mut self, to: Client, packet: &[u8]) -> bool {
-        if to.conn == Client::UDP {
+/// Where the core's answers go: the UDP socket, or a stream's queue.
+struct Links {
+    udp: UdpSocket,
+    streams: HashMap<u32, Stream>,
+    /// Streams something was just queued on, written after each piece of work.
+    touched: Vec<u32>,
+    bytes_in: u64,
+    bytes_out: u64,
+}
+
+impl Links {
+    fn send(&mut self, to: Client, packet: &[u8]) {
+        let sent = if to.conn == Client::UDP {
             // A full send buffer or an unreachable client is a lost packet, as UDP allows.
-            return self.udp.send_to(packet, to.addr).is_ok();
-        }
-        let Some(s) = self.streams.get_mut(&to.conn) else {
-            return false;
+            self.udp.send_to(packet, to.addr).is_ok()
+        } else if let Some(s) = self.streams.get_mut(&to.conn) {
+            let ok = s.queue.push(packet);
+            if ok {
+                self.touched.push(to.conn);
+            }
+            ok
+        } else {
+            false
         };
-        let ok = s.enqueue(packet);
-        if ok {
-            self.touched.push(to.conn);
+        if sent {
+            self.bytes_out += packet.len() as u64;
         }
-        ok
     }
 }
 
-pub fn run(l: Listeners, mut server: Server, network: Option<Network>, limits: Limits) -> ! {
-    let mut poll = Poll::new().unwrap_or_else(|e| crate::fail(&format!("poll: {e}")));
-    let registry = poll.registry().try_clone().expect("a registry");
-    l.udp.set_nonblocking(true).expect("nonblocking");
-    let mut udp = UdpSocket::from_std(l.udp);
-    registry
-        .register(&mut udp, UDP, Interest::READABLE)
-        .expect("register udp");
-    let mut tcp = l.tcp.map(|t| {
-        t.set_nonblocking(true).expect("nonblocking");
-        let mut t = TcpListener::from_std(t);
-        registry
-            .register(&mut t, TCP, Interest::READABLE)
-            .expect("register tcp");
-        t
-    });
-    let (mut tls, cert, tls_config): (Option<TcpListener>, _, Option<Arc<ServerConfig>>) =
-        match l.tls {
+pub struct Relay {
+    poll: Poll,
+    events: Events,
+    server: Server,
+    out: Output,
+    buf: Vec<u8>,
+    links: Links,
+    tcp: Option<TcpListener>,
+    tls: Option<(TcpListener, Arc<Certificate>, Arc<ServerConfig>)>,
+    per_ip: HashMap<IpAddr, usize>,
+    next_conn: u32,
+    limits: Limits,
+    network: Option<Network>,
+    /// Sockets with more to read than their budget allowed: read again next turn. mio reports
+    /// readiness once (edge-triggered), so these are remembered here.
+    again: Vec<Token>,
+    /// This turn's sockets to see to, and whether each may be read.
+    work: Vec<(Token, bool)>,
+    last_tick: Instant,
+    last_log: Instant,
+}
+
+/// Relays until the control plane revokes this node.
+pub fn run(
+    l: Listeners,
+    server: Server,
+    network: Option<Network>,
+    limits: Limits,
+) -> io::Result<()> {
+    Relay::new(l, server, network, limits)?.run();
+    Ok(())
+}
+
+fn listen(registry: &Registry, l: std::net::TcpListener, token: Token) -> io::Result<TcpListener> {
+    l.set_nonblocking(true)?;
+    let mut l = TcpListener::from_std(l);
+    registry.register(&mut l, token, Interest::READABLE)?;
+    Ok(l)
+}
+
+impl Relay {
+    pub fn new(
+        l: Listeners,
+        server: Server,
+        network: Option<Network>,
+        limits: Limits,
+    ) -> io::Result<Self> {
+        let poll = Poll::new()?;
+        l.udp.set_nonblocking(true)?;
+        let mut udp = UdpSocket::from_std(l.udp);
+        poll.registry()
+            .register(&mut udp, UDP, Interest::READABLE)?;
+        let tcp = l.tcp.map(|t| listen(poll.registry(), t, TCP)).transpose()?;
+        let tls = match l.tls {
             Some((t, cert)) => {
-                t.set_nonblocking(true).expect("nonblocking");
-                let mut t = TcpListener::from_std(t);
-                registry
-                    .register(&mut t, TLS, Interest::READABLE)
-                    .expect("register tls");
                 let config = cert.server_config();
-                (Some(t), Some(cert), Some(config))
+                Some((listen(poll.registry(), t, TLS)?, cert, config))
             }
-            None => (None, None, None),
+            None => None,
         };
+        let now = Instant::now();
+        Ok(Relay {
+            poll,
+            events: Events::with_capacity(1024),
+            server,
+            out: Output::default(),
+            buf: vec![0u8; 65536],
+            links: Links {
+                udp,
+                streams: HashMap::new(),
+                touched: Vec::new(),
+                bytes_in: 0,
+                bytes_out: 0,
+            },
+            tcp,
+            tls,
+            per_ip: HashMap::new(),
+            next_conn: 1,
+            limits,
+            network,
+            again: Vec::new(),
+            work: Vec::new(),
+            last_tick: now,
+            last_log: now,
+        })
+    }
 
-    // TURN_DEBUG_STREAMS=1: each stream's opening and why it closed.
-    let debug = std::env::var("TURN_DEBUG_STREAMS").is_ok_and(|v| v == "1");
-    let mut events = Events::with_capacity(1024);
-    let mut buf = vec![0u8; 65536];
-    let mut out = Output::default();
-    let mut streams: HashMap<u32, Stream> = HashMap::new();
-    let mut per_ip: HashMap<IpAddr, usize> = HashMap::new();
-    let mut touched: Vec<u32> = Vec::new();
-    let mut next_conn: u32 = 1;
-    let mut last_tick = Instant::now();
-    let mut last_log = last_tick;
-    let (mut bytes_in, mut bytes_out) = (0u64, 0u64);
+    pub fn run(mut self) {
+        while self.turn() {}
+    }
 
-    let close = |s: Stream,
-                 server: &mut Server,
-                 per_ip: &mut HashMap<IpAddr, usize>,
-                 registry: &mio::Registry| {
-        let mut s = s;
-        let _ = registry.deregister(&mut s.socket);
-        server.closed(s.client);
-        let ip = s.client.addr.ip();
-        if let Some(n) = per_ip.get_mut(&ip) {
-            *n -= 1;
-            if *n == 0 {
-                per_ip.remove(&ip);
-            }
-        }
-    };
-    // After writing: WRITABLE interest while something waits, READABLE alone otherwise.
-    let settle = |s: &mut Stream, registry: &mio::Registry| -> io::Result<()> {
-        s.flush()?;
-        let want = s.pending();
-        if want != s.waiting {
-            let token = Token(s.client.conn as usize + STREAMS);
-            let interest = if want {
-                Interest::READABLE | Interest::WRITABLE
-            } else {
-                Interest::READABLE
-            };
-            registry.reregister(&mut s.socket, token, interest)?;
-            s.waiting = want;
-        }
-        Ok(())
-    };
-
-    // Sockets with more to read than their budget allowed: read again next turn. mio reports
-    // readiness once (edge-triggered), so these are remembered here.
-    let mut again: Vec<Token> = Vec::new();
-    let mut work: Vec<(Token, bool)> = Vec::new();
-    loop {
-        let wait = if again.is_empty() {
+    /// One turn of the loop: what's ready, then the once-a-second and once-a-minute work.
+    /// False once revoked.
+    fn turn(&mut self) -> bool {
+        let wait = if self.again.is_empty() {
             Duration::from_millis(250)
         } else {
             Duration::ZERO
         };
-        if let Err(e) = poll.poll(&mut events, Some(wait)) {
+        if let Err(e) = self.poll.poll(&mut self.events, Some(wait)) {
             if e.kind() != io::ErrorKind::Interrupted {
                 eprintln!("poll: {e}");
             }
         }
         let now = Instant::now();
+        let mut work = std::mem::take(&mut self.work);
         work.clear();
-        work.extend(again.drain(..).map(|t| (t, true)));
-        work.extend(events.iter().map(|e| {
+        work.extend(self.again.drain(..).map(|t| (t, true)));
+        work.extend(self.events.iter().map(|e| {
             (
                 e.token(),
                 e.is_readable() || e.is_read_closed() || e.is_error(),
@@ -349,229 +387,290 @@ pub fn run(l: Listeners, mut server: Server, network: Option<Network>, limits: L
         }));
         for &(token, readable) in &work {
             match token {
-                UDP => {
-                    for n in 0.. {
-                        if n == UDP_BUDGET {
-                            again.push(UDP);
-                            break;
-                        }
-                        match udp.recv_from(&mut buf) {
-                            Ok((n, from)) => {
-                                bytes_in += n as u64;
-                                out.clear();
-                                server.handle(now, from, &buf[..n], &mut out);
-                                Route {
-                                    udp: &udp,
-                                    streams: &mut streams,
-                                    touched: &mut touched,
-                                    bytes_in: &mut bytes_in,
-                                    bytes_out: &mut bytes_out,
-                                }
-                                .send(&out);
-                            }
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                            // A client's ICMP unreachable can surface here on some systems.
-                            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
-                            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                            Err(e) => {
-                                eprintln!("recv: {e}");
-                                break;
-                            }
-                        }
-                    }
-                }
-                t @ (TCP | TLS) => {
-                    let listener = if t == TCP { tcp.as_mut() } else { tls.as_mut() };
-                    let Some(listener) = listener else { continue };
-                    loop {
-                        let (mut socket, addr): (TcpStream, SocketAddr) = match listener.accept() {
-                            Ok(a) => a,
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                            // Out of file descriptors, or a connection reset before we took it.
-                            Err(e) => {
-                                eprintln!("accept: {e}");
-                                break;
-                            }
-                        };
-                        let ip = addr.ip().to_canonical();
-                        let from_ip = per_ip.get(&ip).copied().unwrap_or(0);
-                        if streams.len() >= limits.max_streams
-                            || from_ip >= limits.max_streams_per_ip
-                        {
-                            continue; // dropped: closes it
-                        }
-                        let _ = socket.set_nodelay(true);
-                        let conn = next_conn;
-                        next_conn = next_conn.checked_add(1).unwrap_or(1);
-                        let token = Token(conn as usize + STREAMS);
-                        if registry
-                            .register(&mut socket, token, Interest::READABLE)
-                            .is_err()
-                        {
-                            continue;
-                        }
-                        let tls_conn = match (t, &tls_config) {
-                            (TLS, Some(c)) => match ServerConnection::new(c.clone()) {
-                                Ok(c) => Some(c),
-                                Err(_) => continue,
-                            },
-                            _ => None,
-                        };
-                        if debug {
-                            eprintln!(
-                                "stream {conn}: opened from {addr} ({})",
-                                if t == TLS { "tls" } else { "tcp" }
-                            );
-                        }
-                        *per_ip.entry(ip).or_default() += 1;
-                        streams.insert(
-                            conn,
-                            Stream {
-                                socket,
-                                client: Client {
-                                    addr: SocketAddr::new(ip, addr.port()),
-                                    conn,
-                                },
-                                tls: tls_conn,
-                                framer: Framer::default(),
-                                queue: Vec::new(),
-                                opened: now,
-                                heard: now,
-                                spoke: false,
-                                waiting: false,
-                            },
-                        );
-                    }
-                }
-                Token(t) => {
-                    let conn = (t - STREAMS) as u32;
-                    let token = Token(t);
-                    // Out of the map while it's read, so the core's answers to other streams can
-                    // be queued on them.
-                    let Some(mut s) = streams.remove(&conn) else {
-                        continue;
-                    };
-                    let mut alive = true;
-                    let mut budget = STREAM_BUDGET;
-                    while readable && alive {
-                        let fill = s.fill_some(&mut buf);
-                        let mut route = Route {
-                            udp: &udp,
-                            streams: &mut streams,
-                            touched: &mut touched,
-                            bytes_in: &mut bytes_in,
-                            bytes_out: &mut bytes_out,
-                        };
-                        // What arrived before an end or an error still counts (a last Refresh).
-                        if !s.take_messages(&mut server, now, &mut out, &mut route) {
-                            alive = false;
-                            break;
-                        }
-                        match fill {
-                            Ok(Fill::Read(n)) => {
-                                budget = budget.saturating_sub(n);
-                                if budget == 0 {
-                                    again.push(token);
-                                    break;
-                                }
-                            }
-                            Ok(Fill::Drained) => break,
-                            Ok(Fill::Closed) => {
-                                alive = false;
-                                break;
-                            }
-                            Err(e) => {
-                                if debug {
-                                    eprintln!("stream {conn}: {e}");
-                                }
-                                alive = false;
-                                break;
-                            }
-                        }
-                    }
-                    if alive {
-                        if let Err(e) = settle(&mut s, &registry) {
-                            if debug {
-                                eprintln!("stream {conn}: {e}");
-                            }
-                            alive = false;
-                        }
-                    }
-                    if alive {
-                        streams.insert(conn, s);
-                    } else {
-                        close(s, &mut server, &mut per_ip, &registry);
-                    }
-                }
+                UDP => self.read_udp(now),
+                TCP | TLS => self.accept(token == TLS, now),
+                t => self.serve(t, readable, now),
             }
-            // Streams the core just queued something on (from UDP or another stream).
-            touched.sort_unstable();
-            touched.dedup();
-            for conn in touched.drain(..) {
-                if let Some(s) = streams.get_mut(&conn) {
-                    if let Err(e) = settle(s, &registry) {
-                        if debug {
-                            eprintln!("stream {conn}: {e}");
-                        }
-                        if let Some(s) = streams.remove(&conn) {
-                            close(s, &mut server, &mut per_ip, &registry);
-                        }
-                    }
-                }
-            }
+            self.write_touched();
         }
+        self.work = work;
 
-        if now - last_tick >= Duration::from_secs(1) {
-            server.tick(now);
-            last_tick = now;
-            let stale: Vec<u32> = streams
-                .iter()
-                .filter(|(_, s)| {
-                    (!s.spoke && now - s.opened > FIRST_MESSAGE) || now - s.heard > IDLE
-                })
-                .map(|(&c, _)| c)
-                .collect();
-            for conn in stale {
-                if let Some(s) = streams.remove(&conn) {
-                    close(s, &mut server, &mut per_ip, &registry);
-                }
+        if now - self.last_tick >= Duration::from_secs(1) {
+            self.last_tick = now;
+            if !self.every_second(now) {
+                return false;
             }
-            if let Some(n) = &network {
-                while let Ok(c) = n.controls.try_recv() {
-                    match c {
-                        Control::Key(k) => server.set_node_key(k, now, limits.key_overlap),
-                        Control::Accepting(yes) => server.set_accepting(yes),
-                        Control::Exit => std::process::exit(0),
+        }
+        if now - self.last_log >= Duration::from_secs(60) {
+            self.last_log = now;
+            self.every_minute();
+        }
+        true
+    }
+
+    fn read_udp(&mut self, now: Instant) {
+        for _ in 0..UDP_BUDGET {
+            match self.links.udp.recv_from(&mut self.buf) {
+                Ok((n, from)) => {
+                    self.links.bytes_in += n as u64;
+                    self.out.clear();
+                    self.server.handle(now, from, &self.buf[..n], &mut self.out);
+                    for (to, packet) in self.out.sends() {
+                        self.links.send(to, packet);
                     }
                 }
-                if let Ok(mut s) = n.snapshot.lock() {
-                    *s = Snapshot {
-                        allocations: server.allocations() as u64,
-                        bytes_in,
-                        bytes_out,
-                    };
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                // A client's ICMP unreachable can surface here on some systems.
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    eprintln!("recv: {e}");
+                    return;
                 }
             }
         }
-        if now - last_log >= Duration::from_secs(60) {
-            if let Some(c) = &cert {
-                c.reload_if_changed();
+        self.again.push(UDP);
+    }
+
+    fn accept(&mut self, tls: bool, now: Instant) {
+        loop {
+            let listener = if tls {
+                self.tls.as_ref().map(|t| &t.0)
+            } else {
+                self.tcp.as_ref()
+            };
+            let Some(listener) = listener else { return };
+            match listener.accept() {
+                Ok((socket, addr)) => self.open(socket, addr, tls, now),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                // Out of file descriptors, or a connection reset before we took it.
+                Err(e) => {
+                    eprintln!("accept: {e}");
+                    return;
+                }
             }
-            let s = server.stats();
-            eprintln!(
-                "allocations {}, streams {}, permissions allowed {} denied {}, unauthenticated requests dropped {}, relayed {} packets {} bytes, dropped over rate {} unroutable {}",
-                server.allocations(),
-                streams.len(),
-                s.permissions_allowed,
-                s.permissions_denied,
-                s.unauthenticated_dropped,
-                s.relayed_packets,
-                s.relayed_bytes,
-                s.dropped_rate,
-                s.dropped_route
-            );
-            last_log = now;
         }
+    }
+
+    /// A new connection, unless it's over the caps (dropped: that closes it).
+    fn open(&mut self, socket: TcpStream, addr: SocketAddr, tls: bool, now: Instant) {
+        let ip = addr.ip().to_canonical();
+        if self.links.streams.len() >= self.limits.max_streams
+            || self.per_ip.get(&ip).copied().unwrap_or(0) >= self.limits.max_streams_per_ip
+        {
+            return;
+        }
+        let tls_conn = match &self.tls {
+            Some((_, _, config)) if tls => match ServerConnection::new(config.clone()) {
+                Ok(c) => Some(c),
+                Err(_) => return,
+            },
+            _ => None,
+        };
+        let _ = socket.set_nodelay(true);
+        let conn = self.next_conn();
+        let mut s = Stream {
+            socket,
+            client: Client {
+                addr: SocketAddr::new(ip, addr.port()),
+                conn,
+            },
+            tls: tls_conn,
+            framer: Framer::default(),
+            queue: Outbox::default(),
+            opened: now,
+            heard: now,
+            spoke: false,
+            waiting: false,
+        };
+        let token = s.token();
+        if self
+            .poll
+            .registry()
+            .register(&mut s.socket, token, Interest::READABLE)
+            .is_err()
+        {
+            return;
+        }
+        if self.limits.debug_streams {
+            eprintln!(
+                "stream {conn}: opened from {addr} ({})",
+                if tls { "tls" } else { "tcp" }
+            );
+        }
+        *self.per_ip.entry(ip).or_default() += 1;
+        self.links.streams.insert(conn, s);
+    }
+
+    /// The next connection number no open stream has (they wrap after 2^32).
+    fn next_conn(&mut self) -> u32 {
+        loop {
+            let conn = self.next_conn;
+            self.next_conn = conn.checked_add(1).unwrap_or(1);
+            if !self.links.streams.contains_key(&conn) {
+                return conn;
+            }
+        }
+    }
+
+    /// A stream that's ready: read for up to its budget, its answers written.
+    fn serve(&mut self, token: Token, readable: bool, now: Instant) {
+        let conn = (token.0 - STREAMS) as u32;
+        // Out of the map while it's read, so the core's answers to other streams can be queued
+        // on them.
+        let Some(mut s) = self.links.streams.remove(&conn) else {
+            return;
+        };
+        match self.read_stream(&mut s, readable, now) {
+            Ok(()) => {
+                self.links.streams.insert(conn, s);
+            }
+            Err(why) => self.close(s, why),
+        }
+    }
+
+    fn read_stream(&mut self, s: &mut Stream, readable: bool, now: Instant) -> Result<(), Why> {
+        if readable {
+            let mut budget = STREAM_BUDGET;
+            loop {
+                let fill = s.fill_some(&mut self.buf);
+                // What arrived before an end or an error still counts (a last Refresh).
+                self.take_messages(s, now)?;
+                match fill.map_err(Why::Error)? {
+                    Fill::Read(n) => {
+                        budget = budget.saturating_sub(n);
+                        if budget == 0 {
+                            self.again.push(s.token());
+                            break;
+                        }
+                    }
+                    Fill::Drained => break,
+                    Fill::Closed => return Err(Why::Hangup),
+                }
+            }
+        }
+        s.settle(self.poll.registry()).map_err(Why::Error)
+    }
+
+    /// Hands each whole message to the core and routes its answers.
+    fn take_messages(&mut self, s: &mut Stream, now: Instant) -> Result<(), Why> {
+        while let Some(frame) = s.framer.next() {
+            let Frame::Message(m) = frame else {
+                return Err(Why::Junk);
+            };
+            self.links.bytes_in += m.len() as u64;
+            self.out.clear();
+            self.server.handle_from(now, s.client, m, &mut self.out);
+            for (to, packet) in self.out.sends() {
+                // This stream is out of the map: its own answers go straight on its queue.
+                if to.conn != s.client.conn {
+                    self.links.send(to, packet);
+                } else if s.queue.push(packet) {
+                    self.links.bytes_out += packet.len() as u64;
+                }
+            }
+            s.spoke = true;
+            s.heard = now;
+        }
+        Ok(())
+    }
+
+    /// Streams the core just queued something on (from UDP or another stream).
+    fn write_touched(&mut self) {
+        let mut touched = std::mem::take(&mut self.links.touched);
+        touched.sort_unstable();
+        touched.dedup();
+        for conn in &touched {
+            let Some(s) = self.links.streams.get_mut(conn) else {
+                continue;
+            };
+            if let Err(e) = s.settle(self.poll.registry()) {
+                if let Some(s) = self.links.streams.remove(conn) {
+                    self.close(s, Why::Error(e));
+                }
+            }
+        }
+        touched.clear();
+        self.links.touched = touched;
+    }
+
+    fn close(&mut self, mut s: Stream, why: Why) {
+        if self.limits.debug_streams {
+            eprintln!("stream {}: {why}", s.client.conn);
+        }
+        let _ = self.poll.registry().deregister(&mut s.socket);
+        self.server.closed(s.client);
+        let ip = s.client.addr.ip();
+        if let Some(n) = self.per_ip.get_mut(&ip) {
+            *n -= 1;
+            if *n == 0 {
+                self.per_ip.remove(&ip);
+            }
+        }
+    }
+
+    /// The core's expiries, streams past their deadlines, and the heartbeat thread's news. False
+    /// once revoked.
+    fn every_second(&mut self, now: Instant) -> bool {
+        self.server.tick(now);
+        let (first, idle) = (self.limits.first_message, self.limits.idle);
+        let stale: Vec<(u32, Why)> = self
+            .links
+            .streams
+            .iter()
+            .filter_map(|(&c, s)| {
+                if !s.spoke && now - s.opened > first {
+                    Some((c, Why::Silent))
+                } else if now - s.heard > idle {
+                    Some((c, Why::Idle))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (conn, why) in stale {
+            if let Some(s) = self.links.streams.remove(&conn) {
+                self.close(s, why);
+            }
+        }
+        let Some(n) = &self.network else {
+            return true;
+        };
+        if let Ok(mut s) = n.snapshot.lock() {
+            *s = Snapshot {
+                allocations: self.server.allocations() as u64,
+                bytes_in: self.links.bytes_in,
+                bytes_out: self.links.bytes_out,
+            };
+        }
+        while let Ok(c) = n.controls.try_recv() {
+            match c {
+                Control::Key(k) => self.server.set_node_key(k, now, self.limits.key_overlap),
+                Control::Accepting(yes) => self.server.set_accepting(yes),
+                Control::Exit => return false,
+            }
+        }
+        true
+    }
+
+    /// A renewed certificate, and the stats line.
+    fn every_minute(&mut self) {
+        if let Some((_, cert, _)) = &self.tls {
+            cert.reload_if_changed();
+        }
+        let s = self.server.stats();
+        eprintln!(
+            "allocations {}, streams {}, permissions allowed {} denied {}, unauthenticated requests dropped {}, relayed {} packets {} bytes, dropped over rate {} unroutable {}",
+            self.server.allocations(),
+            self.links.streams.len(),
+            s.permissions_allowed,
+            s.permissions_denied,
+            s.unauthenticated_dropped,
+            s.relayed_packets,
+            s.relayed_bytes,
+            s.dropped_rate,
+            s.dropped_route
+        );
     }
 }

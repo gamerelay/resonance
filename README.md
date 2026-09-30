@@ -35,7 +35,7 @@ clients and Chromium, Firefox and WebKit relay through it, over UDP, TCP and TLS
 |---|---|
 | [`resonance-turn`](crates/resonance-turn) | The TURN relay, sans-I/O: `handle(now, from, packet) → packets`. Every rule lives here, testable without sockets. Its own STUN codec: parsed in place, nothing allocated per packet. Stream framing for TCP and TLS. |
 | [`resonance-proto`](crates/resonance-proto) | The control plane's wire types: node ids, signed requests, join, key, heartbeat. Fixtures shared with the control plane. |
-| [`resonance-node`](crates/resonance-node) | The binary: the core on one event loop (the UDP socket, and TCP and TLS listeners); joining, the key, heartbeats; config and logs. |
+| [`resonance-node`](crates/resonance-node) | The node: a library (the event loop over the UDP socket and the TCP and TLS listeners; joining, the key, heartbeats) and a thin binary that reads the settings and runs it. |
 | [`interop`](interop) | Other clients against the built node: pion's over UDP, TCP and TLS (`go test`), coturn's (`coturn.sh`), and Chromium, Firefox and WebKit's own (`browsers/relay.mjs`, every pairing, `TRANSPORT=udp\|tcp\|tls`). Also the benchmark (`cmd/bench`). |
 
 ## Running a node
@@ -83,7 +83,7 @@ URLs go with its join and every heartbeat, so the control plane hands out the ne
 ## Tests
 
 ```sh
-cargo test --release                                     # the core, and a fuzz run
+cargo test --release                                     # the core, a fuzz run, and the loop in-process
 FUZZ_ITERS=5000000 cargo test --release --test fuzz      # a longer fuzz run
 cd interop && go test ./...                              # pion's client against the node
 interop/coturn.sh                                        # coturn's client (needs coturn installed)

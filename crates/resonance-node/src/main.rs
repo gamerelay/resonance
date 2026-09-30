@@ -38,21 +38,17 @@
 //!   unknown client IP; the burst follows the per-IP cap, so a shared address can fill it at once.
 //! - TURN_RATE_BYTES (131072) and TURN_BURST_BYTES (twice that): per allocation.
 
-mod control;
-mod relay;
-mod state;
-mod tls;
-
 use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use control::{Client, Snapshot};
+use resonance_node::control::{self, Client, Snapshot};
+use resonance_node::state::{Joined, State};
+use resonance_node::{relay, tls};
 use resonance_turn::{Config, Server};
 use socket2::{Domain, Protocol, Socket, Type};
-use state::{Joined, State};
 
 /// How often the control plane hears from a joined node (it stops handing out one silent for 45 s).
 const HEARTBEAT: Duration = Duration::from_secs(15);
@@ -87,7 +83,7 @@ fn num<T: std::str::FromStr + PartialOrd + Default + Copy>(key: &str, fallback: 
     }
 }
 
-pub(crate) fn fail(msg: &str) -> ! {
+fn fail(msg: &str) -> ! {
     eprintln!("{msg}");
     std::process::exit(1)
 }
@@ -269,7 +265,10 @@ fn run_node() {
         max_streams: num("TURN_MAX_STREAMS", 4096),
         max_streams_per_ip: cfg.max_per_ip as usize,
         key_overlap: KEY_OVERLAP,
+        debug_streams: env("TURN_DEBUG_STREAMS").is_some_and(|v| v == "1"),
+        ..relay::Limits::default()
     };
+    // It returns once the control plane revokes this node.
     relay::run(
         relay::Listeners {
             udp: socket,
@@ -279,7 +278,8 @@ fn run_node() {
         Server::new(cfg),
         network,
         limits,
-    );
+    )
+    .unwrap_or_else(|e| fail(&format!("the relay loop: {e}")));
 }
 
 /// TCP and TLS, as configured (the module doc).
