@@ -1,0 +1,283 @@
+//! The node's settings, from its environment (/etc/gamerelay-turn.env), read once and checked
+//! before anything starts. `from_lookup` takes any lookup, so they're tested without a process.
+//! What each one means: the binary's doc (main.rs).
+
+use std::net::IpAddr;
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::time::Duration;
+
+use resonance_turn::Config;
+
+use crate::relay::Limits;
+
+/// How often the control plane hears from a joined node (it stops handing out one silent for 45 s).
+pub const HEARTBEAT: Duration = Duration::from_secs(15);
+
+pub struct Settings {
+    /// Where players reach this node.
+    pub public_ip: IpAddr,
+    /// UDP, and TCP with `tcp`.
+    pub port: u16,
+    pub tcp: bool,
+    pub tls: Option<TlsSettings>,
+    /// The core's settings. Its node key and nonce key are placeholders: filled in when it runs.
+    pub turn: Config,
+    pub limits: Limits,
+    pub heartbeat: Duration,
+    /// The control plane to join.
+    pub control: String,
+    /// The key to run by hand with (not joined): RESONANCE_NODE_KEY, or TURN_SECRET as the Go
+    /// relay called it.
+    pub node_key: Option<String>,
+    /// Settings that mean nothing any more and are set, to say so at startup.
+    pub ignored: Vec<&'static str>,
+}
+
+pub struct TlsSettings {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+    pub port: u16,
+    /// The name on the certificate, that players connect to.
+    pub host: String,
+}
+
+/// Reads settings by name; empty is the same as unset.
+struct Env<F>(F);
+
+impl<F: Fn(&str) -> Option<String>> Env<F> {
+    fn get(&self, key: &str) -> Option<String> {
+        (self.0)(key).filter(|v| !v.is_empty())
+    }
+
+    fn flag(&self, key: &str) -> bool {
+        self.get(key).is_some_and(|v| v == "1")
+    }
+
+    fn port(&self, key: &str, fallback: u16) -> Result<u16, String> {
+        match self.get(key) {
+            None => Ok(fallback),
+            Some(v) => v
+                .parse()
+                .map_err(|_| format!("{key} must be a port, not {v:?}")),
+        }
+    }
+
+    /// A positive number, or fallback.
+    fn num<T: FromStr + PartialOrd + Default>(&self, key: &str, fallback: T) -> Result<T, String> {
+        match self.get(key) {
+            None => Ok(fallback),
+            Some(v) => match v.parse::<T>() {
+                Ok(n) if n > T::default() => Ok(n),
+                _ => Err(format!("{key} must be a positive number, not {v:?}")),
+            },
+        }
+    }
+}
+
+impl Settings {
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let env = Env(lookup);
+        let public_ip: IpAddr = env
+            .get("TURN_PUBLIC_IP")
+            .and_then(|v| v.parse().ok())
+            .ok_or("TURN_PUBLIC_IP (where players reach this node) is required")?;
+
+        let tls = match (env.get("TURN_TLS_CERT"), env.get("TURN_TLS_KEY")) {
+            (Some(cert), Some(key)) => Some(TlsSettings {
+                cert: cert.into(),
+                key: key.into(),
+                port: env.port("TURN_TLS_PORT", 5349)?,
+                host: env.get("TURN_TLS_HOST").ok_or(
+                    "TURN_TLS_HOST (the name on the certificate players connect to) is required with TURN_TLS_CERT",
+                )?,
+            }),
+            (None, None) => None,
+            _ => return Err("TURN_TLS_CERT and TURN_TLS_KEY go together".into()),
+        };
+
+        let mut turn = Config::new(String::new(), public_ip, [0; 32]);
+        turn.min_port = env.port("TURN_MIN_PORT", turn.min_port)?;
+        turn.max_port = env.port("TURN_MAX_PORT", turn.max_port)?;
+        if turn.min_port > turn.max_port {
+            return Err(format!(
+                "TURN_MIN_PORT {} is above TURN_MAX_PORT {}",
+                turn.min_port, turn.max_port
+            ));
+        }
+        turn.max_per_player = env.num("TURN_MAX_PER_PLAYER", turn.max_per_player)?;
+        turn.max_per_ip = env.num("TURN_MAX_PER_IP", turn.max_per_ip)?;
+        turn.max_per_instance = env.num("TURN_MAX_PER_INSTANCE", turn.max_per_instance)?;
+        turn.unauth_rate = env.num("TURN_UNAUTH_RATE", turn.unauth_rate)?;
+        // A shared address can fill its allocation cap at once.
+        turn.unauth_burst = env.num("TURN_UNAUTH_BURST", turn.max_per_ip as f64)?;
+        turn.rate_bytes = env.num("TURN_RATE_BYTES", turn.rate_bytes)?;
+        turn.burst_bytes = env.num("TURN_BURST_BYTES", turn.rate_bytes * 2.0)?;
+
+        let limits = Limits {
+            max_streams: env.num("TURN_MAX_STREAMS", 4096)?,
+            max_streams_per_ip: turn.max_per_ip as usize,
+            debug_streams: env.flag("TURN_DEBUG_STREAMS"),
+            ..Limits::default()
+        };
+
+        Ok(Settings {
+            public_ip,
+            port: env.port("TURN_PORT", 3478)?,
+            tcp: env.flag("TURN_TCP"),
+            tls,
+            turn,
+            limits,
+            // RESONANCE_HEARTBEAT_S: for tests; the control plane expects 15.
+            heartbeat: Duration::from_secs(env.num("RESONANCE_HEARTBEAT_S", HEARTBEAT.as_secs())?),
+            control: env
+                .get("RESONANCE_CONTROL")
+                .unwrap_or_else(|| "https://gamerelay.io".into()),
+            node_key: env
+                .get("RESONANCE_NODE_KEY")
+                .or_else(|| env.get("TURN_SECRET")),
+            ignored: ["TURN_PEER_IPS"]
+                .into_iter()
+                .filter(|k| env.get(k).is_some())
+                .collect(),
+        })
+    }
+
+    /// What players are told: UDP first (the SDK times a relay by it and names it by its first
+    /// URL), then TCP, then TLS by its certificate's name.
+    pub fn urls(&self) -> Vec<String> {
+        let host = match self.public_ip {
+            IpAddr::V4(ip) => ip.to_string(),
+            IpAddr::V6(ip) => format!("[{ip}]"),
+        };
+        let port = self.port;
+        let mut urls = vec![format!("turn:{host}:{port}")];
+        if self.tcp {
+            urls.push(format!("turn:{host}:{port}?transport=tcp"));
+        }
+        if let Some(t) = &self.tls {
+            urls.push(format!("turns:{}:{}?transport=tcp", t.host, t.port));
+        }
+        urls
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings(vars: &[(&str, &str)]) -> Result<Settings, String> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        Settings::from_lookup(move |k| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()))
+    }
+
+    fn error(vars: &[(&str, &str)]) -> String {
+        settings(vars).err().expect("an error")
+    }
+
+    #[test]
+    fn the_defaults_are_the_go_relays() {
+        let s = settings(&[("TURN_PUBLIC_IP", "192.0.2.1")]).unwrap();
+        assert_eq!(s.port, 3478);
+        assert!(!s.tcp && s.tls.is_none());
+        assert_eq!(s.urls(), ["turn:192.0.2.1:3478"]);
+        let t = &s.turn;
+        assert_eq!((t.min_port, t.max_port), (49152, 65535));
+        assert_eq!(
+            (t.max_per_player, t.max_per_ip, t.max_per_instance),
+            (8, 64, 4096)
+        );
+        assert_eq!((t.unauth_rate, t.unauth_burst), (20.0, 64.0));
+        assert_eq!((t.rate_bytes, t.burst_bytes), (131072.0, 262144.0));
+        assert_eq!(
+            (s.limits.max_streams, s.limits.max_streams_per_ip),
+            (4096, 64)
+        );
+        assert_eq!(s.heartbeat, HEARTBEAT);
+        assert_eq!(s.control, "https://gamerelay.io");
+        assert!(s.node_key.is_none() && s.ignored.is_empty());
+    }
+
+    #[test]
+    fn the_per_ip_cap_carries_the_burst_and_the_stream_cap_with_it() {
+        let s = settings(&[("TURN_PUBLIC_IP", "192.0.2.1"), ("TURN_MAX_PER_IP", "256")]).unwrap();
+        assert_eq!(s.turn.unauth_burst, 256.0);
+        assert_eq!(s.limits.max_streams_per_ip, 256);
+        let s = settings(&[
+            ("TURN_PUBLIC_IP", "192.0.2.1"),
+            ("TURN_MAX_PER_IP", "256"),
+            ("TURN_UNAUTH_BURST", "10"),
+            ("TURN_RATE_BYTES", "1000"),
+        ])
+        .unwrap();
+        assert_eq!(s.turn.unauth_burst, 10.0);
+        assert_eq!(s.turn.burst_bytes, 2000.0, "twice the rate");
+    }
+
+    #[test]
+    fn urls_are_udp_first_then_tcp_then_tls_by_name() {
+        let s = settings(&[
+            ("TURN_PUBLIC_IP", "2001:db8::1"),
+            ("TURN_PORT", "3479"),
+            ("TURN_TCP", "1"),
+            ("TURN_TLS_CERT", "/c"),
+            ("TURN_TLS_KEY", "/k"),
+            ("TURN_TLS_PORT", "443"),
+            ("TURN_TLS_HOST", "turn.example.com"),
+        ])
+        .unwrap();
+        assert_eq!(
+            s.urls(),
+            [
+                "turn:[2001:db8::1]:3479",
+                "turn:[2001:db8::1]:3479?transport=tcp",
+                "turns:turn.example.com:443?transport=tcp",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hand_run_key_and_old_settings() {
+        let s = settings(&[
+            ("TURN_PUBLIC_IP", "192.0.2.1"),
+            ("TURN_SECRET", "old"),
+            ("TURN_PEER_IPS", "10.0.0.1"),
+        ])
+        .unwrap();
+        assert_eq!(s.node_key.as_deref(), Some("old"));
+        assert_eq!(s.ignored, ["TURN_PEER_IPS"]);
+        let s = settings(&[
+            ("TURN_PUBLIC_IP", "192.0.2.1"),
+            ("TURN_SECRET", "old"),
+            ("RESONANCE_NODE_KEY", "new"),
+        ])
+        .unwrap();
+        assert_eq!(s.node_key.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn bad_settings_are_refused_before_anything_starts() {
+        assert!(error(&[]).contains("TURN_PUBLIC_IP"));
+        assert!(error(&[("TURN_PUBLIC_IP", "somewhere")]).contains("TURN_PUBLIC_IP"));
+        let ip = ("TURN_PUBLIC_IP", "192.0.2.1");
+        assert!(error(&[ip, ("TURN_PORT", "70000")]).contains("TURN_PORT must be a port"));
+        assert!(error(&[ip, ("TURN_MAX_PER_IP", "0")]).contains("positive"));
+        assert!(error(&[ip, ("TURN_RATE_BYTES", "-5")]).contains("positive"));
+        assert!(
+            error(&[ip, ("TURN_MIN_PORT", "60000"), ("TURN_MAX_PORT", "50000")]).contains("above")
+        );
+        assert!(error(&[ip, ("TURN_TLS_CERT", "/c")]).contains("go together"));
+        assert!(
+            error(&[ip, ("TURN_TLS_CERT", "/c"), ("TURN_TLS_KEY", "/k")]).contains("TURN_TLS_HOST")
+        );
+        // Empty is unset.
+        assert!(settings(&[ip, ("TURN_PORT", ""), ("TURN_TLS_CERT", "")]).is_ok());
+    }
+}

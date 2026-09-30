@@ -39,49 +39,20 @@
 //! - TURN_RATE_BYTES (131072) and TURN_BURST_BYTES (twice that): per allocation.
 
 use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
-use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use resonance_node::control::{self, Client, Snapshot};
+use resonance_node::settings::Settings;
 use resonance_node::state::{Joined, State};
 use resonance_node::{relay, tls};
-use resonance_turn::{Config, Server};
+use resonance_turn::Server;
 use socket2::{Domain, Protocol, Socket, Type};
-
-/// How often the control plane hears from a joined node (it stops handing out one silent for 45 s).
-const HEARTBEAT: Duration = Duration::from_secs(15);
-/// How long a rotated-out node key is still accepted: credentials last an hour.
-const KEY_OVERLAP: Duration = Duration::from_secs(3600);
 
 /// The listener carries every client's traffic; the kernel's default buffer (about 200 KB) drops
 /// packets in a burst long before the relay is busy. 4 MB is about 2,800 full-size packets.
 const SOCKET_BUFFER: usize = 4 << 20;
-
-fn env(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|v| !v.is_empty())
-}
-
-fn port(key: &str, fallback: u16) -> u16 {
-    match env(key) {
-        None => fallback,
-        Some(v) => v
-            .parse()
-            .unwrap_or_else(|_| fail(&format!("{key} must be a port, not {v:?}"))),
-    }
-}
-
-/// A positive number from key, or fallback.
-fn num<T: std::str::FromStr + PartialOrd + Default + Copy>(key: &str, fallback: T) -> T {
-    match env(key) {
-        None => fallback,
-        Some(v) => match v.parse::<T>() {
-            Ok(n) if n > T::default() => n,
-            _ => fail(&format!("{key} must be a positive number, not {v:?}")),
-        },
-    }
-}
 
 fn fail(msg: &str) -> ! {
     eprintln!("{msg}");
@@ -95,40 +66,33 @@ fn usage() -> ! {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        [] | ["run"] => run_node(),
-        ["join", token] => join(token),
+        [] | ["run"] => run_node(settings()),
+        ["join", token] => join(settings(), token),
         ["status"] => status(),
         ["version" | "--version"] => println!("{}", control::software()),
         _ => usage(),
     }
 }
 
-fn public_ip() -> IpAddr {
-    env("TURN_PUBLIC_IP")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| fail("TURN_PUBLIC_IP (where players reach this node) is required"))
-}
-
-fn control_url() -> String {
-    env("RESONANCE_CONTROL").unwrap_or_else(|| "https://gamerelay.io".into())
+fn settings() -> Settings {
+    Settings::from_env().unwrap_or_else(|e| fail(&e))
 }
 
 /// `join <token>`: this node's key (made now if new), registered with the control plane.
-fn join(token: &str) {
+fn join(s: Settings, token: &str) {
     let state = State::from_env();
     let key = state
         .key()
         .unwrap_or_else(|e| fail(&format!("key in {}: {e}", state.dir().display())));
-    let urls = Streams::from_env().urls(public_ip(), port("TURN_PORT", 3478));
-    let control = control_url();
-    let client = Client::new(&control, key, None, resonance_proto::VERSION);
+    let urls = s.urls();
+    let client = Client::new(&s.control, key, None, resonance_proto::VERSION);
     let joined = client
         .join(token, urls.clone())
         .unwrap_or_else(|e| fail(&format!("join: {e}")));
     let j = Joined {
         node_id: joined.node_id,
         region: joined.region,
-        control,
+        control: s.control,
         api_version: resonance_proto::VERSION.into(),
     };
     state
@@ -159,8 +123,7 @@ fn status() {
 }
 
 /// `run`: joined if there's a node.json, else by hand with TURN_SECRET.
-fn run_node() {
-    let public = public_ip();
+fn run_node(s: Settings) {
     let state = State::from_env();
     let joined = state
         .joined()
@@ -175,10 +138,7 @@ fn run_node() {
             eprintln!("joined {} as {} in {}", j.control, j.node_id, j.region);
             let snapshot = Arc::new(Mutex::new(Snapshot::default()));
             let (tx, rx) = mpsc::channel();
-            let (snap, kv) = (snapshot.clone(), k.key_version);
-            // RESONANCE_HEARTBEAT_S: for tests; the control plane expects 15.
-            let every = Duration::from_secs(num("RESONANCE_HEARTBEAT_S", HEARTBEAT.as_secs()));
-            let urls = Streams::from_env().urls(public, port("TURN_PORT", 3478));
+            let (snap, kv, every, urls) = (snapshot.clone(), k.key_version, s.heartbeat, s.urls());
             std::thread::Builder::new()
                 .name("heartbeat".into())
                 .spawn(move || control::heartbeats(client, every, snap, kv, urls, tx))
@@ -191,65 +151,43 @@ fn run_node() {
                 }),
             )
         }
-        None => {
-            let key = env("RESONANCE_NODE_KEY")
-                .or_else(|| env("TURN_SECRET"))
-                .unwrap_or_default();
-            if key.len() < 32 {
-                fail(
-                    "not joined (resonance-node join <token>), and no TURN_SECRET (this node's key, 32+ chars) to run by hand",
-                );
-            }
-            (key, None)
-        }
+        None => match &s.node_key {
+            Some(k) if k.len() >= 32 => (k.clone(), None),
+            _ => fail(
+                "not joined (resonance-node join <token>), and no TURN_SECRET (this node's key, 32+ chars) to run by hand",
+            ),
+        },
     };
-    if env("TURN_PEER_IPS").is_some() {
-        eprintln!("TURN_PEER_IPS is ignored: pairs of players share one relay");
+    for k in &s.ignored {
+        eprintln!("{k} is ignored: pairs of players share one relay");
     }
-    let listen = port("TURN_PORT", 3478);
-    let mut nonce_key = [0u8; 32];
-    getrandom::fill(&mut nonce_key).unwrap_or_else(|e| fail(&format!("random: {e}")));
-    let mut cfg = Config::new(key, public, nonce_key);
-    cfg.min_port = port("TURN_MIN_PORT", cfg.min_port);
-    cfg.max_port = port("TURN_MAX_PORT", cfg.max_port);
-    if cfg.min_port > cfg.max_port {
-        fail(&format!(
-            "TURN_MIN_PORT {} is above TURN_MAX_PORT {}",
-            cfg.min_port, cfg.max_port
-        ));
-    }
-    cfg.max_per_player = num("TURN_MAX_PER_PLAYER", cfg.max_per_player);
-    cfg.max_per_ip = num("TURN_MAX_PER_IP", cfg.max_per_ip);
-    cfg.max_per_instance = num("TURN_MAX_PER_INSTANCE", cfg.max_per_instance);
-    cfg.unauth_rate = num("TURN_UNAUTH_RATE", cfg.unauth_rate);
-    cfg.unauth_burst = num("TURN_UNAUTH_BURST", cfg.max_per_ip as f64);
-    cfg.rate_bytes = num("TURN_RATE_BYTES", cfg.rate_bytes);
-    cfg.burst_bytes = num("TURN_BURST_BYTES", cfg.rate_bytes * 2.0);
-    let (min, max) = (cfg.min_port, cfg.max_port);
+    let mut cfg = s.turn;
+    cfg.node_key = key;
+    getrandom::fill(&mut cfg.nonce_key).unwrap_or_else(|e| fail(&format!("random: {e}")));
     let any = IpAddr::from([0, 0, 0, 0]);
-    let socket = bind(SocketAddr::new(any, listen));
-    let streams = Streams::from_env();
-    let tcp = streams
-        .tcp
-        .then(|| listen_tcp(SocketAddr::new(any, listen)));
-    let tls = streams.tls.as_ref().map(|t| {
+    let socket = bind(SocketAddr::new(any, s.port));
+    let tcp = s.tcp.then(|| listen_tcp(SocketAddr::new(any, s.port)));
+    let tls = s.tls.as_ref().map(|t| {
         let cert = tls::Certificate::open(t.cert.clone(), t.key.clone())
             .unwrap_or_else(|e| fail(&format!("TURN_TLS_CERT/TURN_TLS_KEY: {e}")));
         (listen_tcp(SocketAddr::new(any, t.port)), cert)
     });
     eprintln!(
-        "{} on udp :{listen}{}{}, relay addresses {public}:{min}-{max}",
+        "{} on udp :{}{}{}, relay addresses {}:{}-{}",
         control::software(),
+        s.port,
         if tcp.is_some() {
-            format!(", tcp :{listen}")
+            format!(", tcp :{}", s.port)
         } else {
             String::new()
         },
-        streams
-            .tls
+        s.tls
             .as_ref()
             .map(|t| format!(", tls :{} as {}", t.port, t.host))
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        s.public_ip,
+        cfg.min_port,
+        cfg.max_port
     );
     eprintln!(
         "limits: {} allocations per player, {} per IP, {} per game; {} B/s per allocation (burst {}); unauthenticated answers {}/s per IP (burst {})",
@@ -261,13 +199,6 @@ fn run_node() {
         cfg.unauth_rate,
         cfg.unauth_burst
     );
-    let limits = relay::Limits {
-        max_streams: num("TURN_MAX_STREAMS", 4096),
-        max_streams_per_ip: cfg.max_per_ip as usize,
-        key_overlap: KEY_OVERLAP,
-        debug_streams: env("TURN_DEBUG_STREAMS").is_some_and(|v| v == "1"),
-        ..relay::Limits::default()
-    };
     // It returns once the control plane revokes this node.
     relay::run(
         relay::Listeners {
@@ -277,58 +208,9 @@ fn run_node() {
         },
         Server::new(cfg),
         network,
-        limits,
+        s.limits,
     )
     .unwrap_or_else(|e| fail(&format!("the relay loop: {e}")));
-}
-
-/// TCP and TLS, as configured (the module doc).
-struct Streams {
-    tcp: bool,
-    tls: Option<TlsSettings>,
-}
-
-struct TlsSettings {
-    cert: PathBuf,
-    key: PathBuf,
-    port: u16,
-    host: String,
-}
-
-impl Streams {
-    fn from_env() -> Self {
-        let tcp = env("TURN_TCP").is_some_and(|v| v == "1");
-        let tls = match (env("TURN_TLS_CERT"), env("TURN_TLS_KEY")) {
-            (Some(cert), Some(key)) => Some(TlsSettings {
-                cert: cert.into(),
-                key: key.into(),
-                port: port("TURN_TLS_PORT", 5349),
-                host: env("TURN_TLS_HOST").unwrap_or_else(|| {
-                    fail("TURN_TLS_HOST (the name on the certificate players connect to) is required with TURN_TLS_CERT")
-                }),
-            }),
-            (None, None) => None,
-            _ => fail("TURN_TLS_CERT and TURN_TLS_KEY go together"),
-        };
-        Streams { tcp, tls }
-    }
-
-    /// What players are told: UDP first (the SDK times a relay by it and names it by its first
-    /// URL), then TCP, then TLS by its certificate's name.
-    fn urls(&self, public: IpAddr, port: u16) -> Vec<String> {
-        let host = match public {
-            IpAddr::V4(ip) => ip.to_string(),
-            IpAddr::V6(ip) => format!("[{ip}]"),
-        };
-        let mut urls = vec![format!("turn:{host}:{port}")];
-        if self.tcp {
-            urls.push(format!("turn:{host}:{port}?transport=tcp"));
-        }
-        if let Some(t) = &self.tls {
-            urls.push(format!("turns:{}:{}?transport=tcp", t.host, t.port));
-        }
-        urls
-    }
 }
 
 fn listen_tcp(addr: SocketAddr) -> TcpListener {

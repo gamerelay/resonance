@@ -6,7 +6,19 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
 
 ## 2026-09-30
 
-**The relay loop, taken apart.** No change in what it does.
+**Settings, read once.** No change in what they mean.
+
+- `resonance_node::settings::Settings` reads every setting at startup, from any lookup
+  (`from_lookup`), and returns what's wrong instead of exiting: main.rs is the wiring. Before,
+  the TCP and TLS settings were read three times over and every parser exited the process, so
+  none of it could be tested.
+- `join` checks every setting now, not only the ones for its URLs: a bad one fails at join
+  rather than at the first `run`.
+- Tests: the defaults (the Go relay's), `TURN_MAX_PER_IP` carrying the unauthenticated burst
+  and the per-IP stream cap, the URLs' order (UDP first, the rule the control plane checks),
+  the hand-run key, and each bad setting refused.
+
+**The relay loop, taken apart.** No change in what it does. `8a0fa0b`
 
 - `resonance-node` is a library and a thin binary. The loop (`relay::Relay`) is a struct with a
   method per job (UDP, accepting, a stream's turn, closing, the once-a-second and once-a-minute
@@ -27,7 +39,7 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
   279), within the run's drift (both went from about 210 to 360 µs); CPU the same. To check on a
   Linux host.
 
-**A stalled TLS client keeps its connection.**
+**A stalled TLS client keeps its connection.** `0fd9e53`, `89044fc`
 
 - Fixed: a TLS stream with more than 64 KB queued (a client whose network stalled for a few
   seconds) was closed instead of dropping messages. rustls takes at most its own buffer's limit
@@ -37,8 +49,8 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
 - Tests: `TestAStalledTLSClientKeepsItsConnection` (a client that stops reading while 20 MB is
   sent its way, then carries on; it fails on the old build on Linux and macOS). It first shrank
   the client's receive buffer to 4 KB, which on Linux trickles the backlog out for over a minute
-  and made it flaky in CI (it failed on `8a0fa0b`): now the buffers are the system's. The interop tests wait for the node to answer instead of
-  sleeping 200 ms, which lost the race now and then.
+  and made it flaky in CI (it failed on `8a0fa0b`): now the buffers are the system's. The interop
+  tests wait for the node to answer instead of sleeping 200 ms, which lost the race now and then.
 
 **TURN over TCP and TLS** (RFC 8656 §12.5), for networks that block UDP. `26d3138`, `9350911`
 
