@@ -11,8 +11,8 @@ control-plane side.
 ## Where things stand
 
 - **v0's node is done and in production.** The room-scoped TURN relay (UDP, and TCP and TLS),
-  joined to GameRelay's registry: join, key, heartbeats, drain, revoke, key rotation. Both of
-  GameRelay's relays run `9350911`.
+  joined to GameRelay's registry: join, key, heartbeats, drain, revoke, key rotation. NYC runs
+  `d2e154d` (2026-09-30), SF `9350911`.
 - **GameRelay is the only control plane** (`https://gamerelay.io/resonance/v0/…`, API
   `2026-09-29`). Nodes are minted, drained and revoked in its Admin → Nodes tab.
 - CI (`.github/workflows/ci.yml`) is green: the core's tests and a fuzz run, pion's and coturn's
@@ -81,8 +81,8 @@ The README's "Tests" has the commands. Locally on a Mac:
 
 ## Next
 
-- **Deploy `main` to NYC** (`install-resonance.sh`, at `allocations 0`): it still runs `9350911`,
-  without the fix for stalled TLS clients (CHANGELOG, 2026-09-30). SF is UDP only, so it can wait.
+- **SF onto `main`** when convenient: it runs `9350911`, which lacks only the stream fixes and
+  the refactors (it serves UDP only).
 - **The UDP benchmark on a Linux host** for the new loop: in Docker on a Mac, 1,000 pairs were
   even and 200 pairs a little behind in most rounds, within that run's drift (CHANGELOG).
 - **Safari over TLS:** check it against NYC. If it refuses Let's Encrypt too, Safari players on
