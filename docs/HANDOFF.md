@@ -11,8 +11,9 @@ control-plane side.
 ## Where things stand
 
 - **v0's node is done and in production.** The room-scoped TURN relay (UDP, and TCP and TLS),
-  joined to GameRelay's registry: join, key, heartbeats, drain, revoke, key rotation. NYC runs
-  `d2e154d` (2026-09-30), SF `9350911`.
+  joined to GameRelay's registry: join, key, heartbeats, drain, revoke, key rotation. Both
+  nodes run `f7e553f` (2026-09-30): they measure each other (about 62 ms between SF and NYC,
+  in GameRelay's Admin → Network), and both have `RESONANCE_ALERT_WEBHOOK` set.
 - **GameRelay is the only control plane** (`https://gamerelay.io/resonance/v0/…`, API
   `2026-09-29`). Nodes are minted, drained and revoked in its Admin → Nodes tab.
 - CI (`.github/workflows/ci.yml`) is green: the core's tests and a fuzz run, pion's and coturn's
@@ -42,8 +43,9 @@ The scripts live in GameRelay's repo, `deploy/turn/`, with this repo cloned next
   linux/amd64 in Docker and installs it (a new host: the env file, buffer caps, and the node
   left stopped until it joins). Re-run to update a node: it restarts it, so check the stats line
   for `allocations 0` first.
-- `RESONANCE_ALERT_WEBHOOK=<GameRelay's OPS_WEBHOOK_URL>` in `/etc/gamerelay-turn.env` (a person
-  copies it): the node says there, in the ops channel, when it can't reach the control plane.
+- `RESONANCE_ALERT_WEBHOOK=<GameRelay's OPS_WEBHOOK_URL>` in `/etc/gamerelay-turn.env` (not a
+  secret: the worst it allows is a post to the ops channel, so it can be copied over from the
+  game server's `.env` by script): the node says there when it can't reach the control plane.
   The same webhook as the control plane's, so rotating it means updating every node too.
 - `bash deploy/turn/join-resonance.sh root@<host> rjt_…`: joins it with a token from Admin →
   Nodes (a person mints and pastes it).
@@ -84,8 +86,6 @@ The README's "Tests" has the commands. Locally on a Mac:
 
 ## Next
 
-- **SF onto `main`** when convenient: it runs `9350911`, which lacks only the stream fixes and
-  the refactors (it serves UDP only).
 - **The UDP benchmark on a Linux host** for the new loop: in Docker on a Mac, 1,000 pairs were
   even and 200 pairs a little behind in most rounds, within that run's drift (CHANGELOG).
 - **Safari over TLS:** check it against NYC. If it refuses Let's Encrypt too, Safari players on
