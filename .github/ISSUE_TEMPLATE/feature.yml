@@ -1,0 +1,19 @@
+name: Feature request
+description: Something the node or the protocol should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you're trying to do, and what's in the way.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you'd like
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Anything you've tried instead

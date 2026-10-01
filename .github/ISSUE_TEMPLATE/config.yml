@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a vulnerability
+    url: https://github.com/gamerelay/resonance/security/advisories/new
+    about: Privately, please. See SECURITY.md.
+  - name: GameRelay
+    url: https://gamerelay.io
+    about: Questions about GameRelay's service rather than the node.

@@ -14,6 +14,11 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
 - `docs/PROTOCOL.md`: TURN as the node speaks it (transports, methods, credentials, nonces, the
   room rule, errors, limits), the control plane's API (identity, signed requests, the three
   endpoints, statuses, errors, versioning), and the peer probes.
+- `SECURITY.md` (private reports through GitHub's advisories), `CONTRIBUTING.md`, issue and
+  pull request templates. Dependabot for Cargo, Go and Actions, and `cargo audit` on dependency
+  changes and weekly (`.github/workflows/audit.yml`).
+- The hosts, firewalls and node ids left `docs/HANDOFF.md` for GameRelay's private
+  infrastructure doc: this repo is public.
 - The README has a banner, badges (CI, and the version, MSRV and API version read from the
   source), an overview and a diagram. This changelog moved to the root.
 

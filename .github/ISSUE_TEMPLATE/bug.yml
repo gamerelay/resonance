@@ -1,0 +1,33 @@
+name: Bug report
+description: Something the node does wrong
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "A security issue? Please report it privately instead: see SECURITY.md."
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce it
+      description: The client (browser, pion, coturn, …), the transport (UDP, TCP, TLS), and the steps.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`resonance-node version`, or the commit"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: "The node's output around it (`TURN_DEBUG_STREAMS=1` for TCP and TLS). Take out IPs you'd rather not share."
+      render: text

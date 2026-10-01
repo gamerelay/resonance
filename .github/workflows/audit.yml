@@ -1,0 +1,23 @@
+name: audit
+# RustSec advisories against Cargo.lock: on every change to the dependencies, and weekly for
+# advisories published since.
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.toml, Cargo.lock, "crates/*/Cargo.toml", .github/workflows/audit.yml]
+  pull_request:
+    paths: [Cargo.toml, Cargo.lock, "crates/*/Cargo.toml", .github/workflows/audit.yml]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit --deny warnings

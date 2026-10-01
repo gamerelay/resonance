@@ -21,7 +21,9 @@
   <a href="docs/PROTOCOL.md">Protocol</a> ·
   <a href="CHANGELOG.md">Changelog</a> ·
   <a href="docs/BENCH-2026-09-29.md">Benchmark</a> ·
-  <a href="docs/HANDOFF.md">Handoff</a>
+  <a href="docs/HANDOFF.md">Handoff</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a> ·
+  <a href="SECURITY.md">Security</a>
 </p>
 
 An easy-to-deploy relay network for real-time games. [GameRelay](https://gamerelay.io) is its

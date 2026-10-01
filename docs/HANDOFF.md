@@ -1,6 +1,6 @@
 # Handoff
 
-Read this first when picking up work on the node. **Last updated:** 2026-09-30.
+Read this first when picking up work on the node. **Last updated:** 2026-10-01.
 
 What changed and when: [CHANGELOG.md](../CHANGELOG.md). The design (roles, the registry API,
 credentials, versioning, rollout) is GameRelay's
@@ -21,18 +21,13 @@ control-plane side.
 
 ## The nodes
 
-| | SF (`sfo-1`) | NYC (`nyc-1`) |
-|---|---|---|
-| Host | `asleepace.com`, `192.241.216.26`, shared with other services (Ubuntu 23.10, 2 vCPU) | `gamerelay-turn-nyc3-1`, `167.172.234.10`, its own $6 droplet (Debian 13, 1 vCPU) |
-| Node id | `rn_mxuujbghsqg4bnt5n2lae3w54a` | `rn_hanrbqr7ezoznqcas43pibjmwu` |
-| Serves | UDP 3478 | UDP 3478, TLS 443 (`turns:turn-nyc.gamerelay.io:443?transport=tcp`) |
-| Firewall | ufw (UDP 3478; the old Go relay's 49152–65535 still open) | DigitalOcean cloud firewall `gamerelay-turn` (2026-09-30): UDP 3478, TCP 443 and 80 (certbot), SSH (key only; open to all by choice) |
-| Certificate | none (443 is nginx's) | Let's Encrypt, RSA, certbot's timer renews it |
+Two nodes, `sfo-1` and `nyc-1`, run as the systemd unit `gamerelay-turn` (a dynamic user,
+`StateDirectory=resonance`, `TURN_MAX_PER_IP=256`), from `/etc/gamerelay-turn.env`. NYC also
+serves TLS on 443 (`turns:turn-nyc.gamerelay.io:443?transport=tcp`, Let's Encrypt, RSA). Logs:
+`journalctl -u gamerelay-turn`, with a stats line each minute (`allocations N, streams N, …`).
 
-Both run as the systemd unit `gamerelay-turn` (a dynamic user, `StateDirectory=resonance`,
-`TURN_MAX_PER_IP=256`), from `/etc/gamerelay-turn.env` (`TURN_PUBLIC_IP`, and on NYC the
-`TURN_TLS_*` settings). Logs: `journalctl -u gamerelay-turn`, with a stats line each minute
-(`allocations N, streams N, …`).
+The hosts, their node ids, firewalls and certificates are in GameRelay's (private)
+`docs/INFRASTRUCTURE.md`, "TURN relays": this repo is public, so it doesn't map them.
 
 ## Deploying
 
@@ -91,9 +86,8 @@ The README's "Tests" has the commands. Locally on a Mac:
 - **Safari over TLS:** check it against NYC. If it refuses Let's Encrypt too, Safari players on
   networks that block UDP just play through the game server (nothing breaks); a certificate
   from a CA in libwebrtc's list would be the fix.
-- **The SF relay onto its own droplet**, off the shared box (GameRelay's HANDOFF, "Next, in
-  order"), and then TLS there too. Close the old Go relay's UDP 49152–65535 on SF: nothing
-  listens there now.
+- **The SF relay onto its own droplet** (GameRelay's HANDOFF, "Next, in order"), and then TLS
+  there too.
 - **Capacity with load from another machine**: on one box the load generator runs out first.
 - **Later in the design:** receipts and credits for node operators, community-run nodes, and the
   room "home" role (the envelope and receipts are drafted in the spec's appendices).
