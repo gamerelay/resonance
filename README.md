@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/gamerelay/resonance/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/gamerelay/resonance/ci.yml?branch=main&label=ci&logo=github"></a>
-  <a href="Cargo.toml"><img alt="version" src="https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fgamerelay%2Fresonance%2Fmain%2FCargo.toml&query=%24.workspace.package.version&label=version&color=black"></a>
+  <a href="https://github.com/gamerelay/resonance/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/gamerelay/resonance?label=release&color=black"></a>
   <a href="Cargo.toml"><img alt="MSRV" src="https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fgamerelay%2Fresonance%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=rust&logo=rust&color=black"></a>
   <a href="docs/PROTOCOL.md"><img alt="API" src="https://img.shields.io/badge/dynamic/regex?url=https%3A%2F%2Fraw.githubusercontent.com%2Fgamerelay%2Fresonance%2Fmain%2Fcrates%2Fresonance-proto%2Fsrc%2Flib.rs&search=VERSION%3A%20%26str%20%3D%20%22(%5B0-9-%5D%2B)%22&replace=%241&label=api&color=black"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/gamerelay/resonance?color=black"></a>
