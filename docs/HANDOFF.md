@@ -2,7 +2,7 @@
 
 Read this first when picking up work on the node. **Last updated:** 2026-09-30.
 
-What changed and when: [CHANGELOG.md](CHANGELOG.md). The design (roles, the registry API,
+What changed and when: [CHANGELOG.md](../CHANGELOG.md). The design (roles, the registry API,
 credentials, versioning, rollout) is GameRelay's
 `docs/superpowers/specs/2026-09-29-resonance-v0-design.md`, a loose outline: what building
 changed is in its "Changed while building" section. GameRelay's own `HANDOFF.md` has the

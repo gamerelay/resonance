@@ -1,4 +1,28 @@
-# Resonance
+<p align="center">
+  <img src=".github/assets/banner.png" alt="resonance: relay network for real-time games" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/gamerelay/resonance/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/gamerelay/resonance/ci.yml?branch=main&label=ci&logo=github"></a>
+  <a href="Cargo.toml"><img alt="version" src="https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fgamerelay%2Fresonance%2Fmain%2FCargo.toml&query=%24.workspace.package.version&label=version&color=black"></a>
+  <a href="Cargo.toml"><img alt="MSRV" src="https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fgamerelay%2Fresonance%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=rust&logo=rust&color=black"></a>
+  <a href="docs/PROTOCOL.md"><img alt="API" src="https://img.shields.io/badge/dynamic/regex?url=https%3A%2F%2Fraw.githubusercontent.com%2Fgamerelay%2Fresonance%2Fmain%2Fcrates%2Fresonance-proto%2Fsrc%2Flib.rs&search=VERSION%3A%20%26str%20%3D%20%22(%5B0-9-%5D%2B)%22&replace=%241&label=api&color=black"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/gamerelay/resonance?color=black"></a>
+  <br>
+  <img alt="RFC 8656" src="https://img.shields.io/badge/TURN-RFC%208656-555">
+  <img alt="Transports" src="https://img.shields.io/badge/transports-UDP%20%7C%20TCP%20%7C%20TLS-555">
+  <img alt="Browsers" src="https://img.shields.io/badge/tested-Chromium%20%7C%20Firefox%20%7C%20WebKit-555">
+  <a href="https://github.com/gamerelay/resonance/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/gamerelay/resonance?color=555"></a>
+  <a href="https://github.com/gamerelay/resonance/graphs/commit-activity"><img alt="Commit activity" src="https://img.shields.io/github/commit-activity/m/gamerelay/resonance?color=555"></a>
+</p>
+
+<p align="center">
+  <a href="docs/ARCHITECTURE.md">Architecture</a> ·
+  <a href="docs/PROTOCOL.md">Protocol</a> ·
+  <a href="CHANGELOG.md">Changelog</a> ·
+  <a href="docs/BENCH-2026-09-29.md">Benchmark</a> ·
+  <a href="docs/HANDOFF.md">Handoff</a>
+</p>
 
 An easy-to-deploy relay network for real-time games. [GameRelay](https://gamerelay.io) is its
 first customer.
@@ -7,9 +31,36 @@ This repo is the **node**: a room-scoped TURN relay in Rust. It replaces GameRel
 rule for rule, and is the base for the network's later roles.
 
 **Status: v0, in production.** GameRelay's relays (San Francisco and New York) run it, joined
-to GameRelay's registry (heartbeats, drain, revoke, key rotation). pion's and coturn's TURN
-clients and Chromium, Firefox and WebKit relay through it, over UDP, TCP and TLS. What changed:
-[docs/CHANGELOG.md](docs/CHANGELOG.md). Picking up work: [docs/HANDOFF.md](docs/HANDOFF.md).
+to GameRelay's registry (heartbeats, drain, revoke, key rotation), measuring each other every
+2 s. pion's and coturn's TURN clients and Chromium, Firefox and WebKit relay through it, over
+UDP, TCP and TLS.
+
+## At a glance
+
+- **Fast.** ~0.2 ms median relay time, flat to 2,000 pairs, at about a fifth of the Go relay's
+  CPU and 15–20× less memory per allocation ([benchmark](docs/BENCH-2026-09-29.md)).
+- **Closed by design.** It only relays between allocations of the same room on the same node,
+  so it is never an open proxy, and it can't read what it relays.
+- **Credentials per node.** Each node's key is derived from the control plane's master and is
+  good for that node only.
+- **Gets through firewalls.** UDP, TCP and TLS on 443, reloading its certificate when it's
+  renewed.
+- **Watches itself.** Nodes probe each other from their relay sockets, and the control plane
+  alerts on a node that's silent, unreachable, restarting or near its certificate's expiry. Nodes
+  alert on the control plane too.
+- **One binary.** `join <token>`, then `run`. Its identity is an ed25519 key that never leaves
+  the box.
+- **Tested against real clients.** A sans-I/O core with conformance vectors and a fuzz run, plus
+  pion, coturn and three browser engines in CI.
+
+```mermaid
+flowchart LR
+  A[Player A] <-- "TURN · UDP / TCP / TLS" --> N((resonance-node))
+  B[Player B] <-- "TURN" --> N
+  N -- "signed heartbeat · 15 s" --> CP[Control plane]
+  N <-. "STUN probes · 2 s" .-> P((peer nodes))
+  CP -- "credentials per node" --> A & B
+```
 
 ## What it relays, and to whom
 
@@ -98,9 +149,10 @@ docker run --rm -v "$PWD":/w -w /w/interop/browsers mcr.microsoft.com/playwright
 clients check: RFC 5769's vectors, real Chrome and Firefox captures (`tests/testdata`, from pion),
 coturn's and eturnal's auth corner cases, and libwebrtc's and nICEr's behavior on the wire.
 
-The design is in GameRelay's repo:
-`docs/superpowers/specs/2026-09-29-resonance-v0-design.md`.
+How it's built and why: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The wire formats, for
+players and for the control plane: [docs/PROTOCOL.md](docs/PROTOCOL.md). The original design is
+in GameRelay's repo: `docs/superpowers/specs/2026-09-29-resonance-v0-design.md`.
 
 ## License
 
-MIT
+[MIT](LICENSE)

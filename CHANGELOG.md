@@ -4,6 +4,19 @@ What changed in the node, newest first. Versions: the crates are all `0.1.0` unt
 tagged release; entries are by date, with the commits. The control plane's API is dated
 separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it changes.
 
+## 2026-10-01
+
+**Docs.** No change in the node.
+
+- `docs/ARCHITECTURE.md`: the network's roles, what each leaked secret allows, inside a node
+  (the sans-I/O core, the one event loop, the control thread), observing the network,
+  performance, compatibility, and where it's going.
+- `docs/PROTOCOL.md`: TURN as the node speaks it (transports, methods, credentials, nonces, the
+  room rule, errors, limits), the control plane's API (identity, signed requests, the three
+  endpoints, statuses, errors, versioning), and the peer probes.
+- The README has a banner, badges (CI, and the version, MSRV and API version read from the
+  source), an overview and a diagram. This changelog moved to the root.
+
 ## 2026-09-30
 
 **Nodes measure each other, and watch the control plane.** Additions within API `2026-09-29`.
@@ -119,7 +132,7 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
 
 **Docs.** `d318209`, `671367f`
 
-- `docs/CHANGELOG.md` (this) and `docs/HANDOFF.md` (where things stand, the deployed nodes,
+- `docs/CHANGELOG.md` (this file, since moved to the root) and `docs/HANDOFF.md` (where things stand, the deployed nodes,
   deploying, testing, what bites, what's next). The README says v0 is in production and covers
   TCP and TLS.
 
