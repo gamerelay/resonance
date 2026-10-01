@@ -1,10 +1,13 @@
 # Changelog
 
-What changed in the node, newest first. Versions: the crates are all `0.1.0` until the first
-tagged release; entries are by date, with the commits. The control plane's API is dated
+What changed in the node, newest first, by date, with the commits. Releases are tagged
+`v<version>` (the crates' version, `Cargo.toml`); an entry says where one was cut. The control plane's API is dated
 separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it changes.
 
 ## 2026-10-01
+
+**v0.1.0**, the first tagged release: everything below, as in production on both nodes since
+2026-09-30, with these docs.
 
 **Docs.** No change in the node.
 
