@@ -5,29 +5,23 @@ How Resonance is put together, and why. The wire formats are in [PROTOCOL.md](PR
 ## The network
 
 ```mermaid
-flowchart LR
+flowchart TB
+  CP["<b>Control plane</b><br/>gamerelay.io<br/>registry · API · watch"]
+  OPS["Discord / Slack"]
   subgraph players [Players]
     A[Browser / SDK A]
     B[Browser / SDK B]
   end
-  subgraph cp [Control plane · gamerelay.io]
-    REG[(Registry)]
-    API["/resonance/v0"]
-    WATCH[Watch + alerts]
-  end
   subgraph nodes [Relay nodes]
-    N1[resonance-node · SF]
-    N2[resonance-node · NYC]
+    N1((SF))
+    N2((NYC))
+    N1 <-. "STUN probes · 2 s" .-> N2
   end
-  A -- "1 · ask for relays" --> cp
-  cp -- "credentials per node" --> A
-  A <-- "2 · TURN (UDP / TCP / TLS)" --> N2
-  B <-- "TURN" --> N2
-  N1 -- "3 · signed heartbeat · 15 s" --> API
-  N2 -- "signed heartbeat · 15 s" --> API
-  N1 <-. "4 · STUN probes · 2 s" .-> N2
-  WATCH -- "Discord / Slack" --> OPS((ops))
-  N2 -. "control plane unreachable" .-> OPS
+  CP -- "relays + credentials" --> players
+  CP <-- "signed heartbeats · 15 s" --> nodes
+  players <== "TURN · UDP / TCP / TLS" ==> nodes
+  CP -- "alerts" --> OPS
+  nodes -. "control plane down" .-> OPS
 ```
 
 The network has three roles:
@@ -67,31 +61,14 @@ The design also holds the following:
 
 ```mermaid
 flowchart TB
-  subgraph bin [resonance-node · binary]
-    MAIN[main.rs · settings → wiring]
-  end
-  subgraph lib [resonance-node · library]
-    RELAY[relay::Relay · mio event loop, one thread]
-    PROBE[probe::Prober · sans-I/O]
-    CTRL[control::Heartbeats · own thread]
-    TLS[tls · rustls, certificate reload]
-    STATE[state · key + registration on disk]
-  end
-  subgraph core [resonance-turn · sans-I/O]
-    SERVER["Server::handle(now, from, packet) → packets"]
-    STUN[stun · codec, parsed in place]
-    AUTH[auth · credentials, nonces]
-    LIM[limiter · token buckets]
-    STREAM[stream · TCP/TLS framing]
-  end
-  PROTO[resonance-proto · wire types, signing]
-  MAIN --> RELAY & CTRL
-  RELAY --> SERVER & PROBE & TLS
-  CTRL --> PROTO & STATE
-  CTRL -- "Control: key, drain, revoke, peers" --> RELAY
-  RELAY -- "Snapshot: counts, peer reports" --> CTRL
-  SERVER --> STUN & AUTH & LIM
-  RELAY --> STREAM
+  MAIN["main.rs<br/>settings → wiring"] --> CTRL & RELAY
+  CTRL["control::Heartbeats<br/>own thread · signed HTTP"] <-- "Control ⇄ Snapshot" --> RELAY["relay::Relay<br/>mio loop · UDP, TCP, TLS"]
+  CTRL --> PROTO["resonance-proto<br/>wire types, signing"]
+  CTRL --> STATE["state<br/>key + registration"]
+  RELAY --> PROBE["probe::Prober<br/>peer probes"]
+  RELAY --> TLS["tls<br/>rustls, cert reload"]
+  RELAY --> CORE["resonance-turn · sans-I/O<br/>Server::handle(now, from, packet) → packets"]
+  CORE --> STUN[stun codec] & AUTH[auth] & LIM[limiter] & STREAM[stream framing]
 ```
 
 ### A sans-I/O core

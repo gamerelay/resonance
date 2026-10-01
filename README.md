@@ -55,11 +55,17 @@ UDP, TCP and TLS.
 
 ```mermaid
 flowchart LR
-  A[Player A] <-- "TURN · UDP / TCP / TLS" --> N((resonance-node))
-  B[Player B] <-- "TURN" --> N
-  N -- "signed heartbeat · 15 s" --> CP[Control plane]
-  N <-. "STUN probes · 2 s" .-> P((peer nodes))
-  CP -- "credentials per node" --> A & B
+  subgraph players [Players]
+    A[Player A]
+    B[Player B]
+  end
+  N((resonance-node))
+  P((peer nodes))
+  CP[Control plane]
+  players <== "TURN · UDP / TCP / TLS" ==> N
+  N <-. "STUN probes · 2 s" .-> P
+  N <-- "signed heartbeat · 15 s" --> CP
+  CP -. "credentials per node" .-> players
 ```
 
 ## What it relays, and to whom
