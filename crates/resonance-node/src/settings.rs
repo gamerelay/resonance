@@ -8,6 +8,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use resonance_turn::Config;
+use resonance_turn::ticket::Issuer;
 
 use crate::relay::Limits;
 
@@ -34,6 +35,9 @@ pub struct Settings {
     /// (RESONANCE_ALERT_WEBHOOK), after `alert_after` in a row.
     pub alert_webhook: Option<String>,
     pub alert_after: Duration,
+    /// Issuers whose tickets this node accepts whatever its control plane says
+    /// (RESONANCE_ISSUERS: ed25519 public keys, base64url, comma-separated). Also in `turn`.
+    pub issuers: Vec<String>,
     /// Settings that mean nothing any more and are set, to say so at startup.
     pub ignored: Vec<&'static str>,
 }
@@ -122,6 +126,23 @@ impl Settings {
         turn.rate_bytes = env.num("TURN_RATE_BYTES", turn.rate_bytes)?;
         turn.burst_bytes = env.num("TURN_BURST_BYTES", turn.rate_bytes * 2.0)?;
 
+        let issuers: Vec<String> = env
+            .get("RESONANCE_ISSUERS")
+            .map(|v| {
+                v.split(',')
+                    .map(|k| k.trim().to_string())
+                    .filter(|k| !k.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for k in &issuers {
+            turn.issuers.push(Issuer::parse(k).ok_or_else(|| {
+                format!(
+                    "RESONANCE_ISSUERS: {k:?} isn't an ed25519 public key (base64url, 32 bytes)"
+                )
+            })?);
+        }
+
         let limits = Limits {
             max_streams: env.num("TURN_MAX_STREAMS", 4096)?,
             max_streams_per_ip: turn.max_per_ip as usize,
@@ -146,6 +167,7 @@ impl Settings {
                 .or_else(|| env.get("TURN_SECRET")),
             alert_webhook: env.get("RESONANCE_ALERT_WEBHOOK"),
             alert_after: Duration::from_secs(env.num("RESONANCE_ALERT_AFTER_S", 120)?),
+            issuers,
             ignored: ["TURN_PEER_IPS"]
                 .into_iter()
                 .filter(|k| env.get(k).is_some())
@@ -271,6 +293,17 @@ mod tests {
     }
 
     #[test]
+    fn trusted_issuers() {
+        let ip = ("TURN_PUBLIC_IP", "192.0.2.1");
+        let a = "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w";
+        let b = "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw";
+        let s = settings(&[ip, ("RESONANCE_ISSUERS", &format!("{a}, {b},"))]).unwrap();
+        assert_eq!(s.issuers, vec![a.to_string(), b.to_string()]);
+        assert_eq!(s.turn.issuers.len(), 2);
+        assert!(settings(&[ip]).unwrap().issuers.is_empty());
+    }
+
+    #[test]
     fn bad_settings_are_refused_before_anything_starts() {
         assert!(error(&[]).contains("TURN_PUBLIC_IP"));
         assert!(error(&[("TURN_PUBLIC_IP", "somewhere")]).contains("TURN_PUBLIC_IP"));
@@ -285,6 +318,7 @@ mod tests {
         assert!(
             error(&[ip, ("TURN_TLS_CERT", "/c"), ("TURN_TLS_KEY", "/k")]).contains("TURN_TLS_HOST")
         );
+        assert!(error(&[ip, ("RESONANCE_ISSUERS", "nope")]).contains("RESONANCE_ISSUERS"));
         // Empty is unset.
         assert!(settings(&[ip, ("TURN_PORT", ""), ("TURN_TLS_CERT", "")]).is_ok());
     }

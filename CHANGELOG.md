@@ -6,6 +6,32 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
 
 ## 2026-10-01
 
+**Signed tickets from several issuers.** Additions within API `2026-09-29`.
+
+- A credential any trusted issuer mints, an ed25519 key: a control plane, or a game's own server
+  (`resonance_turn::ticket`). The username carries the issuer's signature. The password comes
+  from key agreement between a fresh X25519 key in the ticket and the node's sealing key, so the
+  node shares no secret with the issuer, and one ticket serves every node (docs/PROTOCOL.md,
+  "Tickets").
+- Rooms are scoped by issuer (`<kid>/<instance>`), so one issuer can't mint into another's rooms.
+  A ticket lasts a day at most. An issuer no longer trusted is refused at its allocations' next
+  request.
+- The sealing key is derived from the node's ed25519 seed, so there's no new key file. It goes
+  with the join and each heartbeat (`seal_key`); `status` prints it.
+- Trusted issuers: `RESONANCE_ISSUERS`, and the control plane's list in each heartbeat's answer
+  (`issuers`), saved to `issuers.json`.
+- **A restart while the control plane is out of reach still relays.** With saved issuers, the
+  node waits a few seconds for its key, then relays ticket holders, and fetches the key with the
+  first heartbeat answered. Before, it waited for the control plane to come back. Nothing is
+  checked against an empty key meanwhile.
+- The control plane's HMAC credentials still work, for nodes and control planes that don't know
+  tickets yet. Any mix of old and new nodes and control planes works.
+- Tests: the fixture shared with the control plane (the same ticket and password minted by
+  GameRelay's `turn.test.ts`); untrusted, tampered, expired, over-long and wrongly keyed tickets;
+  rooms scoped by issuer; an issuer dropped mid-allocation; a node with no key yet (and an empty
+  key signing nothing). In GameRelay's e2e: Chrome players relaying through a joined node with
+  tickets, and through the same node restarted with its control plane out of reach.
+
 **v0.1.0**, the first tagged release: everything below, as in production on both nodes since
 2026-09-30, with these docs.
 

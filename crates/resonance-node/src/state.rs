@@ -1,6 +1,8 @@
 //! What a node keeps between runs, in RESONANCE_STATE_DIR (default /var/lib/resonance; the
 //! systemd unit's StateDirectory): its ed25519 key (`key`, 32 bytes, mode 0600, never leaves the
-//! box) and, once joined, who it is to the control plane (`node.json`).
+//! box), once joined, who it is to the control plane (`node.json`), and the issuers it was last
+//! told to trust (`issuers.json`), so a restart while the control plane is down still takes
+//! players' tickets.
 
 use std::fs;
 use std::io::Write;
@@ -90,6 +92,25 @@ impl State {
         )?;
         fs::rename(tmp, self.dir.join("node.json"))
     }
+
+    /// The issuers last saved (base64url public keys); none if there's no file yet.
+    pub fn issuers(&self) -> std::io::Result<Vec<String>> {
+        match fs::read(self.dir.join("issuers.json")) {
+            Ok(b) => serde_json::from_slice(&b).map_err(std::io::Error::other),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn save_issuers(&self, keys: &[String]) -> std::io::Result<()> {
+        fs::create_dir_all(&self.dir)?;
+        let tmp = self.dir.join("issuers.json.tmp");
+        fs::write(
+            &tmp,
+            serde_json::to_vec(keys).map_err(std::io::Error::other)?,
+        )?;
+        fs::rename(tmp, self.dir.join("issuers.json"))
+    }
 }
 
 #[cfg(test)]
@@ -120,6 +141,15 @@ mod tests {
         assert_eq!(mode, 0o600);
         fs::write(s.dir().join("key"), b"short").unwrap();
         assert!(s.key().is_err(), "a damaged key isn't replaced silently");
+        fs::remove_dir_all(s.dir()).unwrap();
+    }
+
+    #[test]
+    fn issuers_round_trip() {
+        let s = State::new(tmp());
+        assert_eq!(s.issuers().unwrap(), Vec::<String>::new());
+        s.save_issuers(&["a".into(), "b".into()]).unwrap();
+        assert_eq!(s.issuers().unwrap(), vec!["a".to_string(), "b".to_string()]);
         fs::remove_dir_all(s.dir()).unwrap();
     }
 

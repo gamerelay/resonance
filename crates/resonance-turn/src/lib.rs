@@ -8,5 +8,6 @@ pub mod limiter;
 pub mod server;
 pub mod stream;
 pub mod stun;
+pub mod ticket;
 
 pub use server::{Client, Config, Output, Server, Stats};

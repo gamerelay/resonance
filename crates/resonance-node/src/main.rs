@@ -15,6 +15,11 @@
 //!   `TURN_SECRET=<this node's key> TURN_PUBLIC_IP=192.0.2.1 resonance-node` (RESONANCE_NODE_KEY
 //!   is the same as TURN_SECRET), and the control plane lists it in RESONANCE_NODES.
 //!
+//! Tickets (docs/PROTOCOL.md, "Tickets"): signed credentials from issuers this node trusts, its
+//! control plane's and RESONANCE_ISSUERS's (ed25519 public keys, base64url, comma-separated).
+//! A joined node takes them always; one run by hand, with RESONANCE_ISSUERS, keeping a key in
+//! RESONANCE_STATE_DIR for its sealing key, which it prints at startup.
+//!
 //! TURN_PUBLIC_IP is always needed: where players reach it. One socket, UDP 3478 by default. Relay
 //! addresses are names on TURN_PUBLIC_IP, ports TURN_MIN_PORT–TURN_MAX_PORT, but nothing listens
 //! on them: every relayed packet goes from one allocation to another in memory (the only
@@ -47,12 +52,15 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine;
 use resonance_node::control::{self, Client, Snapshot};
 use resonance_node::settings::Settings;
 use resonance_node::state::{Joined, State};
 use resonance_node::{relay, tls};
-use resonance_turn::Server;
+use resonance_turn::{Server, ticket};
 use socket2::{Domain, Protocol, Socket, Type};
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 /// The listener carries every client's traffic; the kernel's default buffer (about 200 KB) drops
 /// packets in a burst long before the relay is busy. 4 MB is about 2,800 full-size packets.
@@ -114,10 +122,18 @@ fn join(s: Settings, token: &str) {
 fn status() {
     let state = State::from_env();
     match state.joined() {
-        Ok(Some(j)) => println!(
-            "{} in {} (control plane {}, API {})",
-            j.node_id, j.region, j.control, j.api_version
-        ),
+        Ok(Some(j)) => {
+            println!(
+                "{} in {} (control plane {}, API {})",
+                j.node_id, j.region, j.control, j.api_version
+            );
+            if let Ok(k) = state.key() {
+                println!(
+                    "sealing key (for issuers): {}",
+                    B64.encode(ticket::seal_public(&ticket::seal_secret(&k.to_bytes())))
+                );
+            }
+        }
         Ok(None) => println!(
             "not joined (state in {}): run by hand with TURN_SECRET, or join <token>",
             state.dir().display()
@@ -132,13 +148,44 @@ fn run_node(s: Settings) {
     let joined = state
         .joined()
         .unwrap_or_else(|e| fail(&format!("state in {}: {e}", state.dir().display())));
+    let mut seal = None;
+    let mut issuers = s.issuers.clone();
     let (key, network) = match joined {
         Some(j) => {
             let signing = state
                 .key()
                 .unwrap_or_else(|e| fail(&format!("key in {}: {e}", state.dir().display())));
+            seal = Some(ticket::seal_secret(&signing.to_bytes()));
+            // The issuers it was last told to trust, so a restart while the control plane is
+            // down still takes the tickets players hold.
+            for k in state.issuers().unwrap_or_else(|e| {
+                eprintln!("the saved issuers in {}: {e}", state.dir().display());
+                Vec::new()
+            }) {
+                if !issuers.contains(&k) && ticket::Issuer::parse(&k).is_some() {
+                    issuers.push(k);
+                }
+            }
             let client = Client::new(&j.control, signing, Some(j.node_id.clone()), &j.api_version);
-            let k = fetch_key_patiently(&client);
+            // With issuers to trust, it can relay ticket holders before it has its own key: so it
+            // waits for the key a little, not until the control plane is back.
+            let k = if issuers.is_empty() {
+                fetch_key_patiently(&client)
+            } else {
+                fetch_key_briefly(&client).unwrap_or_else(|| {
+                    eprintln!(
+                        "the control plane is out of reach: relaying tickets from {} saved issuer{} until it's back",
+                        issuers.len(),
+                        if issuers.len() == 1 { "" } else { "s" }
+                    );
+                    // No key yet, and a version no control plane has: the first heartbeat
+                    // answered fetches it.
+                    resonance_proto::KeyResponse {
+                        node_key: String::new(),
+                        key_version: u32::MAX,
+                    }
+                })
+            };
             eprintln!("joined {} as {} in {}", j.control, j.node_id, j.region);
             let snapshot = Arc::new(Mutex::new(Snapshot::default()));
             let (tx, rx) = mpsc::channel();
@@ -149,6 +196,9 @@ fn run_node(s: Settings) {
                 key_version: k.key_version,
                 urls: s.urls(),
                 controls: tx,
+                local_issuers: s.issuers.clone(),
+                issuers: issuers.clone(),
+                state: State::from_env(),
                 alert: s.alert_webhook.clone().map(|w| {
                     let who = format!("{} ({})", j.region, j.node_id);
                     (
@@ -170,7 +220,22 @@ fn run_node(s: Settings) {
             )
         }
         None => match &s.node_key {
-            Some(k) if k.len() >= 32 => (k.clone(), None),
+            Some(k) if k.len() >= 32 => {
+                // By hand with RESONANCE_ISSUERS: tickets need this node's sealing key, so its
+                // key is kept in the state directory as when joined.
+                if !s.issuers.is_empty() {
+                    let signing = state.key().unwrap_or_else(|e| {
+                        fail(&format!("key in {}: {e}", state.dir().display()))
+                    });
+                    let secret = ticket::seal_secret(&signing.to_bytes());
+                    eprintln!(
+                        "sealing key (for issuers): {}",
+                        B64.encode(ticket::seal_public(&secret))
+                    );
+                    seal = Some(secret);
+                }
+                (k.clone(), None)
+            }
             _ => fail(
                 "not joined (resonance-node join <token>), and no TURN_SECRET (this node's key, 32+ chars) to run by hand",
             ),
@@ -181,6 +246,19 @@ fn run_node(s: Settings) {
     }
     let mut cfg = s.turn;
     cfg.node_key = key;
+    cfg.seal = seal;
+    cfg.issuers = issuers
+        .iter()
+        .filter_map(|k| ticket::Issuer::parse(k))
+        .collect();
+    if seal.is_some() {
+        eprintln!(
+            "tickets: accepted from {} issuer{} so far ({} local), and the control plane's",
+            cfg.issuers.len(),
+            if cfg.issuers.len() == 1 { "" } else { "s" },
+            s.issuers.len()
+        );
+    }
     getrandom::fill(&mut cfg.nonce_key).unwrap_or_else(|e| fail(&format!("random: {e}")));
     let any = IpAddr::from([0, 0, 0, 0]);
     let socket = bind(SocketAddr::new(any, s.port));
@@ -245,6 +323,24 @@ fn listen_tcp(addr: SocketAddr) -> TcpListener {
 
 /// The key, retried until the control plane answers: a node that can't get its key can't relay.
 /// A refusal (revoked, unknown) is final.
+/// Its key within a few seconds, or none (the control plane out of reach). A refusal is final,
+/// as when patient.
+fn fetch_key_briefly(client: &Client) -> Option<resonance_proto::KeyResponse> {
+    for wait in [1, 2, 4] {
+        match client.fetch_key() {
+            Ok(k) => return Some(k),
+            Err(e @ control::Error::Refused { .. }) => {
+                fail(&format!("the control plane refused this node its key: {e}"))
+            }
+            Err(e) => {
+                eprintln!("fetching this node's key: {e}");
+                std::thread::sleep(Duration::from_secs(wait));
+            }
+        }
+    }
+    None
+}
+
 fn fetch_key_patiently(client: &Client) -> resonance_proto::KeyResponse {
     let mut wait = Duration::from_secs(1);
     loop {

@@ -14,10 +14,13 @@ use crate::auth::{self, NonceCheck, Nonces, User};
 use crate::counts::Counts;
 use crate::limiter::{Bucket, Reflection};
 use crate::stun::{self, Class, Message, Writer, attr, method};
+use crate::ticket::{self, Issuer};
 
 pub struct Config {
     pub realm: String,
-    /// This node's own key (Resonance v0 §1). It mints credentials for this node only.
+    /// This node's own key (Resonance v0 §1). It mints credentials for this node only. Empty: none
+    /// yet (a node that started on tickets while its control plane was out of reach), and no
+    /// credential checks against it.
     pub node_key: String,
     /// The address players reach this relay at, and the one relay addresses are named on.
     pub public_ip: IpAddr,
@@ -46,6 +49,10 @@ pub struct Config {
     pub grace: Duration,
     /// Makes nonces; any random bytes, new at each start.
     pub nonce_key: [u8; 32],
+    /// This node's sealing secret (`ticket::seal_secret`): tickets are accepted only with one.
+    pub seal: Option<[u8; 32]>,
+    /// Whose tickets are accepted (`Server::set_issuers` changes them).
+    pub issuers: Vec<Issuer>,
 }
 
 impl Config {
@@ -72,6 +79,8 @@ impl Config {
             channel_lifetime: Duration::from_secs(600),
             grace: Duration::from_secs(60),
             nonce_key,
+            seal: None,
+            issuers: Vec::new(),
         }
     }
 }
@@ -262,10 +271,16 @@ impl Server {
             return;
         }
         let old = std::mem::replace(&mut self.cfg.node_key, key);
-        self.previous_key = Some((old, now + overlap));
+        self.previous_key = (!old.is_empty()).then(|| (old, now + overlap));
     }
 
     /// While false (draining, or told to upgrade), new allocations get 508; existing ones carry on.
+    /// Whose tickets are accepted from now on. An allocation made with another's is refused at
+    /// its next request, so it ends within a refresh.
+    pub fn set_issuers(&mut self, issuers: Vec<Issuer>) {
+        self.cfg.issuers = issuers;
+    }
+
     pub fn set_accepting(&mut self, accepting: bool) {
         self.accepting = accepting;
     }
@@ -453,12 +468,20 @@ impl Server {
         if self.nonces.check(nonce, self.unix(now), from.addr) != NonceCheck::Ok {
             return Err(Refusal::unsigned(438));
         }
-        let Some(user) = auth::parse_username(username) else {
+        // A ticket (`t1:`, any trusted issuer's), else the control plane's own credential.
+        let ticket = ticket::parse(username);
+        let Some(user) = ticket
+            .as_ref()
+            .map(|t| t.user())
+            .or_else(|| auth::parse_username(username))
+        else {
             return Err(Refusal::unsigned(401));
         };
         // No request succeeds past the credential's expiry, so an allocation outlives it by at
-        // most one lifetime.
-        if user.expiry <= self.unix(now) {
+        // most one lifetime. A ticket lasts a day at most.
+        let unix = self.unix(now);
+        if user.expiry <= unix || (ticket.is_some() && user.expiry > unix + ticket::MAX_LIFETIME_S)
+        {
             return Err(Refusal::unsigned(401));
         }
         let existing = self.live_alloc(from, now);
@@ -480,14 +503,29 @@ impl Server {
             .as_ref()
             .filter(|(_, until)| *until > now)
             .map(|(k, _)| k.as_str());
-        let key = [
-            cached,
-            Some(derive(&self.cfg.node_key)),
-            previous.map(derive),
-        ]
-        .into_iter()
-        .flatten()
-        .find(|k| msg.integrity_ok(k));
+        // A ticket: its issuer's signature, then the password from its key and this node's
+        // sealing secret. Checked only when nothing cached matches, so a refresh costs a hash.
+        let key = match &ticket {
+            // An issuer no longer trusted ends its tickets at their next request, cached or not.
+            Some(t) if !self.cfg.issuers.iter().any(|i| i.kid == t.kid) => None,
+            Some(t) => cached.filter(|k| msg.integrity_ok(k)).or_else(|| {
+                let seal = self.cfg.seal.as_ref()?;
+                if !t.verify(&self.cfg.issuers) {
+                    return None;
+                }
+                let k = auth::long_term_key(username, &self.cfg.realm, &t.password(seal)?);
+                msg.integrity_ok(&k).then_some(k)
+            }),
+            // No key yet: nothing is signed with an empty one, which anyone could do.
+            None => [
+                cached,
+                (!self.cfg.node_key.is_empty()).then(|| derive(&self.cfg.node_key)),
+                previous.filter(|k| !k.is_empty()).map(derive),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|k| msg.integrity_ok(k)),
+        };
         let Some(key) = key else {
             return Err(Refusal::unsigned(401));
         };

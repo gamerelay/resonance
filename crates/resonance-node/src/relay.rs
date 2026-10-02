@@ -18,6 +18,7 @@ use mio::net::{TcpListener, TcpStream, UdpSocket};
 use mio::{Events, Interest, Poll, Registry, Token};
 use resonance_turn::counts::Counts;
 use resonance_turn::stream::{Frame, Framer, padding};
+use resonance_turn::ticket::Issuer;
 use resonance_turn::{Client, Output, Server};
 use rustls::{ServerConfig, ServerConnection};
 
@@ -658,6 +659,9 @@ impl Relay {
                 Control::Peers(peers) => self.prober.set_peers(peers, now),
                 Control::Key(k) => self.server.set_node_key(k, now, self.limits.key_overlap),
                 Control::Accepting(yes) => self.server.set_accepting(yes),
+                Control::Issuers(keys) => self
+                    .server
+                    .set_issuers(keys.iter().filter_map(|k| Issuer::parse(k)).collect()),
                 Control::Exit => return false,
             }
         }

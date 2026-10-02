@@ -61,6 +61,10 @@ pub struct JoinRequest {
     /// Where players reach it: `turn:ip:port`.
     pub urls: Vec<String>,
     pub software: String,
+    /// Its X25519 sealing key, base64url: issuers derive its ticket passwords with it. An
+    /// addition within 2026-09-29.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -94,6 +98,10 @@ pub struct Heartbeat {
     /// its relay socket, over the last 30 s. An addition within 2026-09-29.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<PeerReport>,
+    /// As at join, so a node that joined before tickets says it now. An addition within
+    /// 2026-09-29.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal_key: Option<String>,
 }
 
 /// One peer's Bindings over the report's window.
@@ -140,6 +148,16 @@ pub struct HeartbeatResponse {
     /// send it means none.
     #[serde(default)]
     pub peers: Vec<Peer>,
+    /// Whose tickets to accept, besides the node's own `RESONANCE_ISSUERS`. An addition within
+    /// 2026-09-29: none sent means none.
+    #[serde(default)]
+    pub issuers: Vec<IssuerKey>,
+}
+
+/// An issuer's ed25519 public key, base64url (no padding).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct IssuerKey {
+    pub pubkey: String,
 }
 
 /// An error answer: `{ error, message }`.

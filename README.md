@@ -43,8 +43,9 @@ UDP, TCP and TLS.
   CPU and 15–20× less memory per allocation ([benchmark](docs/BENCH-2026-09-29.md)).
 - **Closed by design.** It only relays between allocations of the same room on the same node,
   so it is never an open proxy, and it can't read what it relays.
-- **Credentials per node.** Each node's key is derived from the control plane's master and is
-  good for that node only.
+- **Credentials without shared secrets.** Any trusted issuer (a control plane, or a game's own
+  server) signs tickets that nodes check by key agreement, with rooms scoped by issuer. The
+  control plane's own credentials are per node.
 - **Gets through firewalls.** UDP, TCP and TLS on 443, reloading its certificate when it's
   renewed.
 - **Watches itself.** Nodes probe each other from their relay sockets, and the control plane
