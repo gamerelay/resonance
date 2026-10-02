@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 crc32fast = "1"
 # Tickets: the issuer's signature, and the password by key agreement with the node.
 ed25519-dalek = "2"
