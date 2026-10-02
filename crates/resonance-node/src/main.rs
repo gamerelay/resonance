@@ -10,7 +10,9 @@
 //!   A joined node measures the other nodes the control plane names (a STUN Binding every 2 s from
 //!   its relay socket, reported with each heartbeat), and with RESONANCE_ALERT_WEBHOOK (a Discord
 //!   or Slack incoming webhook) says there when the control plane has been out of reach for
-//!   RESONANCE_ALERT_AFTER_S (120) in a row, and when it's back.
+//!   RESONANCE_ALERT_AFTER_S (120) in a row, and when it's back. RESONANCE_CONTROL_KEY (base64url)
+//!   gives the control plane's answer key out of band; otherwise it's pinned from the join's
+//!   answer (docs/PROTOCOL.md, "Signed answers").
 //! - **On its own** (self-hosted, no control plane): `RESONANCE_ISSUERS=<issuer public keys>
 //!   TURN_PUBLIC_IP=192.0.2.1 resonance-node`. Its issuers mint tickets for it with its sealing key
 //!   (`resonance-node seal-key`); `resonance-node issuer <file>` and `mint` are a minimal issuer.
@@ -110,6 +112,9 @@ fn join(s: Settings, token: &str) {
         .unwrap_or_else(|e| fail(&format!("key in {}: {e}", state.dir().display())));
     let urls = s.urls();
     let mut client = Client::new(&s.control, key, None, resonance_proto::VERSION);
+    if let Some(k) = s.control_key.as_deref().and_then(control::control_key) {
+        client.pin(k);
+    }
     let joined = client
         .join(token, urls.clone())
         .unwrap_or_else(|e| fail(&format!("join: {e}")));
@@ -225,19 +230,27 @@ fn run_node(s: Settings) {
             }
             let mut client =
                 Client::new(&j.control, signing, Some(j.node_id.clone()), &j.api_version);
-            match j
-                .control_key
-                .as_deref()
-                .map(|k| (k, control::control_key(k)))
-            {
-                Some((_, Some(k))) => client.pin(k),
-                Some((k, None)) => fail(&format!(
-                    "node.json's control_key {k:?} isn't an ed25519 public key"
+            match (j.control_key.as_deref(), s.control_key.as_deref()) {
+                (Some(saved), Some(given)) if saved != given => fail(&format!(
+                    "node.json pins the control plane's key {saved}, but RESONANCE_CONTROL_KEY is {given}: join again, or remove one"
                 )),
+                (Some(k), _) | (None, Some(k)) => match control::control_key(k) {
+                    Some(key) => {
+                        client.pin(key);
+                        if j.control_key.is_none() {
+                            if let Err(e) = state.save_control_key(k) {
+                                eprintln!("saving the control plane's key: {e}");
+                            }
+                        }
+                    }
+                    None => fail(&format!(
+                        "node.json's control_key {k:?} isn't an ed25519 public key"
+                    )),
+                },
                 // Joined before signed answers: pinned from the first heartbeat's.
-                None => {
-                    eprintln!("the control plane's answers aren't checked until it sends its key")
-                }
+                (None, None) => eprintln!(
+                    "the control plane's answers aren't checked until it sends its key, or RESONANCE_CONTROL_KEY gives it"
+                ),
             }
             eprintln!("joined {} as {} in {}", j.control, j.node_id, j.region);
             let snapshot = Arc::new(Mutex::new(Snapshot::default()));

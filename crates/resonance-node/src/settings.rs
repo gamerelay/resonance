@@ -28,6 +28,9 @@ pub struct Settings {
     pub heartbeat: Duration,
     /// The control plane to join.
     pub control: String,
+    /// Its answers' key, given out of band (RESONANCE_CONTROL_KEY, base64url): pinned before the
+    /// first answer, so nothing between a node and its control plane can choose it.
+    pub control_key: Option<String>,
     /// A Discord or Slack incoming webhook this node says the control plane is out of reach on
     /// (RESONANCE_ALERT_WEBHOOK), after `alert_after` in a row.
     pub alert_webhook: Option<String>,
@@ -126,6 +129,14 @@ impl Settings {
         turn.max_per_instance = env.num("TURN_MAX_PER_INSTANCE", turn.max_per_instance)?;
         turn.max_per_issuer = env.num("TURN_MAX_PER_ISSUER", turn.max_per_issuer)?;
         turn.ticket_check_rate = env.num("TURN_TICKET_CHECK_RATE", turn.ticket_check_rate)?;
+        let control_key = env.get("RESONANCE_CONTROL_KEY");
+        if let Some(k) = &control_key {
+            if Issuer::parse(k).is_none() {
+                return Err(format!(
+                    "RESONANCE_CONTROL_KEY {k:?} isn't an ed25519 public key (base64url)"
+                ));
+            }
+        }
         turn.unauth_rate = env.num("TURN_UNAUTH_RATE", turn.unauth_rate)?;
         // A shared address can fill its allocation cap at once.
         turn.unauth_burst = env.num("TURN_UNAUTH_BURST", turn.max_per_ip as f64)?;
@@ -166,6 +177,7 @@ impl Settings {
             // RESONANCE_HEARTBEAT_S: for tests; the control plane expects 15.
             heartbeat: Duration::from_secs(env.num("RESONANCE_HEARTBEAT_S", HEARTBEAT.as_secs())?),
             control: control_url(env.get("RESONANCE_CONTROL"))?,
+            control_key,
             alert_webhook: env.get("RESONANCE_ALERT_WEBHOOK"),
             alert_after: Duration::from_secs(env.num("RESONANCE_ALERT_AFTER_S", 120)?),
             issuers,
@@ -336,6 +348,34 @@ mod tests {
                 "turns:turn.example.com:443?transport=tcp",
             ]
         );
+    }
+
+    #[test]
+    fn the_control_planes_key_can_be_given_and_must_be_one() {
+        let key = "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg";
+        let s = settings(&[
+            ("TURN_PUBLIC_IP", "192.0.2.1"),
+            ("RESONANCE_CONTROL_KEY", key),
+        ])
+        .unwrap();
+        assert_eq!(s.control_key.as_deref(), Some(key));
+        assert_eq!(
+            settings(&[("TURN_PUBLIC_IP", "192.0.2.1")])
+                .unwrap()
+                .control_key,
+            None
+        );
+        for bad in [
+            "nope",
+            "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg=",
+            "AAAA",
+        ] {
+            let e = error(&[
+                ("TURN_PUBLIC_IP", "192.0.2.1"),
+                ("RESONANCE_CONTROL_KEY", bad),
+            ]);
+            assert!(e.contains("RESONANCE_CONTROL_KEY"), "{bad}: {e}");
+        }
     }
 
     #[test]

@@ -7,8 +7,9 @@
 //! `Resonance-Node` after `join`.
 //!
 //! Every answer, refusals included, is signed by the control plane's own ed25519 key:
-//! `Resonance-Answer-Sig` over [`answer_signing_string`], which names the request's signature so an
-//! answer can't be replayed against another request. The key comes with the join's answer (and
+//! `Resonance-Answer-Sig` over [`answer_signing_string`], which names the whole request it answers
+//! (its node, its signing string and its signature), so an answer can't be replayed against another
+//! request, or got by asking with another node's id, path or body. The key comes with the join's answer (and
 //! the heartbeat's, for nodes that joined before), and the node keeps it (`control_key`).
 
 use serde::{Deserialize, Serialize};
@@ -60,16 +61,36 @@ pub fn signing_string(method: &str, path: &str, version: &str, ts: &str, body: &
     format!("{method}\n{path}\n{version}\n{ts}\n{hex}")
 }
 
-/// What the control plane signs on an answer: `resonance/answer/v1 \n status \n request_sig \n
-/// hex(sha256(body))`. `request_sig` is the request's `Resonance-Sig` as sent, so each answer
-/// belongs to one request: an old answer can't be replayed against a new one.
-pub fn answer_signing_string(status: u16, request_sig: &str, body: &[u8]) -> String {
-    let digest = Sha256::digest(body);
+/// The request an answer is for, as sent: its `Resonance-Node` ("" at join), its signing string
+/// ([`signing_string`], from its method, path, `Resonance-Version`, `Resonance-Ts` and body as
+/// sent), and its `Resonance-Sig`.
+pub struct Asked<'a> {
+    pub node: &'a str,
+    pub signing: &'a str,
+    pub sig: &'a str,
+}
+
+/// What the control plane signs on an answer: `resonance/answer/v1 \n status \n node \n
+/// hex(sha256(request signing string)) \n request sig \n hex(sha256(body))`. Each answer belongs
+/// to one request, all of it: a refusal the control plane gives a request someone else made up
+/// (another node's id with this one's signature, another path, another body) doesn't check out for
+/// the request this node sent.
+pub fn answer_signing_string(status: u16, asked: &Asked, body: &[u8]) -> String {
+    format!(
+        "resonance/answer/v1\n{status}\n{}\n{}\n{}\n{}",
+        asked.node,
+        hex_sha256(asked.signing.as_bytes()),
+        asked.sig,
+        hex_sha256(body)
+    )
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
     let mut hex = String::with_capacity(64);
-    for b in digest {
+    for b in Sha256::digest(bytes) {
         hex.push_str(&format!("{b:02x}"));
     }
-    format!("resonance/answer/v1\n{status}\n{request_sig}\n{hex}")
+    hex
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -231,18 +252,27 @@ mod tests {
             B64.encode(key.verifying_key().to_bytes()),
             "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg"
         );
-        let s = answer_signing_string(
-            200,
-            "4ouzZqtxvtuhwCVpoFdbIPlXyqwSQibcBU0iJUVZIS9U6-454Juxtd9lAfd5pSrSVOwXx4N60C_qPwuzXlWNCA",
-            br#"{"status":"active"}"#,
+        // The request of the fixture above, from node rn_72asyextvngonlc5w2nmguxzay.
+        let signing = signing_string(
+            "POST",
+            "/nodes/heartbeat",
+            "2026-09-29",
+            "1790000000000",
+            br#"{"allocations":1}"#,
         );
+        let asked = Asked {
+            node: "rn_72asyextvngonlc5w2nmguxzay",
+            signing: &signing,
+            sig: "4ouzZqtxvtuhwCVpoFdbIPlXyqwSQibcBU0iJUVZIS9U6-454Juxtd9lAfd5pSrSVOwXx4N60C_qPwuzXlWNCA",
+        };
+        let s = answer_signing_string(200, &asked, br#"{"status":"active"}"#);
         assert_eq!(
             s,
-            "resonance/answer/v1\n200\n4ouzZqtxvtuhwCVpoFdbIPlXyqwSQibcBU0iJUVZIS9U6-454Juxtd9lAfd5pSrSVOwXx4N60C_qPwuzXlWNCA\nffcc9870a751a0241f5f2bdac8e6646c40b92bb226e8efc4af2e29cc242fc176"
+            "resonance/answer/v1\n200\nrn_72asyextvngonlc5w2nmguxzay\na05c3e6d54aeb6f6005967b87d96b97bd01ca4af5c3141e8dbe9b04dd696f29b\n4ouzZqtxvtuhwCVpoFdbIPlXyqwSQibcBU0iJUVZIS9U6-454Juxtd9lAfd5pSrSVOwXx4N60C_qPwuzXlWNCA\nffcc9870a751a0241f5f2bdac8e6646c40b92bb226e8efc4af2e29cc242fc176"
         );
         assert_eq!(
             B64.encode(key.sign(s.as_bytes()).to_bytes()),
-            "6jeCCK-pbDqjd1r43oH605BNEL6WhjBAvXx3-T0NHvYKzQ5KQFaTE0ObvKHF3ICjivrZzysgiE_0hmTzywsQAw"
+            "ONhZUk49L7ZGJriqZzrNUAwwwT_VJXsPshgKGO_kGfcg8BfzTd4glET5WevXFoHNBnz9wqXyH9u7ZfgWXY5YDQ"
         );
     }
 

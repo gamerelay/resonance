@@ -35,7 +35,9 @@ struct Answer {
     body: String,
     /// Its `Resonance-Answer-Sig`, if any.
     sig: Option<String>,
-    /// The `Resonance-Sig` of the request it answers.
+    /// The request it answers: its `Resonance-Node` ("" at join), signing string and signature.
+    node: String,
+    signing: String,
     request_sig: String,
 }
 
@@ -48,7 +50,12 @@ impl Answer {
         let Ok(bytes) = <[u8; 64]>::try_from(B64.decode(sig).unwrap_or_default()) else {
             return false;
         };
-        let s = proto::answer_signing_string(self.status, &self.request_sig, self.body.as_bytes());
+        let asked = proto::Asked {
+            node: &self.node,
+            signing: &self.signing,
+            sig: &self.request_sig,
+        };
+        let s = proto::answer_signing_string(self.status, &asked, self.body.as_bytes());
         key.verify_strict(s.as_bytes(), &Signature::from_bytes(&bytes))
             .is_ok()
     }
@@ -169,10 +176,8 @@ impl Client {
             .map(|d| d.as_millis())
             .unwrap_or(0)
             .to_string();
-        let sig = self
-            .key
-            .sign(proto::signing_string("POST", path, &self.version, &ts, &text).as_bytes());
-        let request_sig = B64.encode(sig.to_bytes());
+        let signing = proto::signing_string("POST", path, &self.version, &ts, &text);
+        let request_sig = B64.encode(self.key.sign(signing.as_bytes()).to_bytes());
         let mut req = self
             .agent
             .post(format!("{}{}{}", self.control, proto::BASE, path))
@@ -200,6 +205,8 @@ impl Client {
             status,
             body,
             sig,
+            node: self.node_id.clone().unwrap_or_default(),
+            signing,
             request_sig,
         })
     }
@@ -213,7 +220,8 @@ impl Client {
     }
 
     /// Joins, and pins the control plane's key from the answer, which that key must have signed.
-    /// A control plane from before signed answers sends none: nothing is pinned.
+    /// A control plane from before signed answers sends none: nothing is pinned. With a key given
+    /// beforehand (`pin`, from RESONANCE_CONTROL_KEY), the answer must be that key's.
     pub fn join(&mut self, token: &str, urls: Vec<String>) -> Result<JoinResponse, Error> {
         let req = JoinRequest {
             token: token.into(),
@@ -223,6 +231,9 @@ impl Client {
             seal_key: Some(self.seal_public()),
         };
         let path = "/nodes/join";
+        if self.control_key.is_some() {
+            return self.post(path, &req);
+        }
         let a = self.send(path, &req)?;
         let r: JoinResponse = Self::parse(path, &a)?;
         self.learn(r.control_key.as_deref(), &a)?;
@@ -339,6 +350,8 @@ impl Heartbeats {
         };
         let seal_key = Some(self.client.seal_public());
         let mut first = true;
+        // Said once a run while the control plane's answers can't be checked.
+        let mut warned = false;
         loop {
             // The first at once: a node is handed out to players from its first heartbeat.
             if !first {
@@ -361,6 +374,12 @@ impl Heartbeats {
             (last_cpu, last_at) = (cpu, at);
             let had = self.client.pinned();
             let result = self.client.heartbeat(&h);
+            if self.client.pinned().is_none() && result.is_ok() && !warned {
+                warned = true;
+                eprintln!(
+                    "the control plane's answers aren't signed: they're believed on TLS alone (RESONANCE_CONTROL_KEY pins its key)"
+                );
+            }
             if let Some(key) = self.client.pinned().filter(|k| had.as_ref() != Some(k)) {
                 eprintln!("the control plane's key is {key}: only answers it signs are believed");
                 if let Err(e) = self.state.save_control_key(&key) {
@@ -369,7 +388,7 @@ impl Heartbeats {
             }
             if let Some((webhook, watch)) = &mut self.alert {
                 let said = match &result {
-                    Err(e) if e.unreachable() => watch.failed(Instant::now(), &e.to_string()),
+                    Err(e) if !heard(&result) => watch.failed(Instant::now(), &e.to_string()),
                     _ => watch.ok(Instant::now()),
                 };
                 if let Some(text) = said {
@@ -407,6 +426,17 @@ impl Heartbeats {
                 }
             }
         }
+    }
+}
+
+/// Whether a heartbeat's result means the control plane heard this node: an answer, or that it
+/// doesn't know the node. Any other refusal counts as out of reach for the alert: a node fed
+/// refusals (a request of its signed for another path or time, a replay) is as cut off as one
+/// that hears nothing.
+fn heard<T>(result: &Result<T, Error>) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(e) => e.unknown_node(),
     }
 }
 
@@ -791,10 +821,18 @@ mod tests {
         assert!(!refused(401).unreachable(), "it answered");
     }
 
-    /// A control plane on loopback that answers each request with `answer(its Resonance-Sig)`:
-    /// status, body, and the answer's signature header if any.
+    /// A request as the test control plane got it.
+    #[derive(Clone)]
+    struct Got {
+        node: String,
+        signing: String,
+        sig: String,
+    }
+
+    /// A control plane on loopback that answers each request with `answer(the request)`: status,
+    /// body, and the answer's signature header if any.
     fn control_plane(
-        answer: impl Fn(&str) -> (u16, String, Option<String>) + Send + 'static,
+        answer: impl Fn(&Got) -> (u16, String, Option<String>) + Send + 'static,
     ) -> String {
         use std::io::{BufRead, BufReader, Read, Write};
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -802,7 +840,22 @@ mod tests {
         std::thread::spawn(move || {
             for c in l.incoming() {
                 let mut c = BufReader::new(c.unwrap());
-                let (mut sig, mut len) = (String::new(), 0usize);
+                let mut first = String::new();
+                c.read_line(&mut first).unwrap();
+                let mut parts = first.split_whitespace();
+                let method = parts.next().unwrap_or("").to_owned();
+                let path = parts
+                    .next()
+                    .unwrap_or("")
+                    .trim_start_matches(proto::BASE)
+                    .to_owned();
+                let (mut node, mut sig, mut ts, mut version, mut len) = (
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    0usize,
+                );
                 loop {
                     let mut line = String::new();
                     c.read_line(&mut line).unwrap();
@@ -811,15 +864,24 @@ mod tests {
                         break;
                     }
                     let (k, v) = line.split_once(':').unwrap_or((line, ""));
+                    let v = v.trim().to_owned();
                     match k.to_ascii_lowercase().as_str() {
-                        proto::header::SIG => sig = v.trim().to_owned(),
-                        "content-length" => len = v.trim().parse().unwrap(),
+                        proto::header::NODE => node = v,
+                        proto::header::SIG => sig = v,
+                        proto::header::TS => ts = v,
+                        proto::header::VERSION => version = v,
+                        "content-length" => len = v.parse().unwrap(),
                         _ => {}
                     }
                 }
                 let mut body = vec![0; len];
                 c.read_exact(&mut body).unwrap();
-                let (status, body, answer_sig) = answer(&sig);
+                let got = Got {
+                    node,
+                    signing: proto::signing_string(&method, &path, &version, &ts, &body),
+                    sig,
+                };
+                let (status, body, answer_sig) = answer(&got);
                 let mut res = format!(
                     "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
                     body.len()
@@ -845,9 +907,14 @@ mod tests {
     fn b64(k: &SigningKey) -> String {
         B64.encode(k.verifying_key().to_bytes())
     }
-    fn sign(k: &SigningKey, status: u16, request_sig: &str, body: &str) -> String {
+    fn sign(k: &SigningKey, status: u16, r: &Got, body: &str) -> String {
+        let asked = proto::Asked {
+            node: &r.node,
+            signing: &r.signing,
+            sig: &r.sig,
+        };
         B64.encode(
-            k.sign(proto::answer_signing_string(status, request_sig, body.as_bytes()).as_bytes())
+            k.sign(proto::answer_signing_string(status, &asked, body.as_bytes()).as_bytes())
                 .to_bytes(),
         )
     }
@@ -866,6 +933,14 @@ mod tests {
             c.pin(k.verifying_key());
         }
         c
+    }
+
+    /// A request like `r`, changed by `f`: what someone between the node and its control plane
+    /// could send the control plane with this node's signature.
+    fn like(r: &Got, f: impl FnOnce(&mut Got)) -> Got {
+        let mut r = r.clone();
+        f(&mut r);
+        r
     }
 
     #[test]
@@ -889,19 +964,59 @@ mod tests {
         );
 
         // Anything else is no answer at all: out of reach, and nothing changes on the node.
-        type Forge = fn(&str) -> Option<String>;
-        let forged: [(&str, Forge); 5] = [
+        type Forge = fn(&Got) -> Option<String>;
+        let forged: [(&str, Forge); 10] = [
             ("unsigned", |_| None),
             ("signed by another key", |r| {
                 Some(sign(&theirs(), 401, r, UNKNOWN))
-            }),
-            ("an answer to another request", |_| {
-                Some(sign(&ours(), 401, "another", UNKNOWN))
             }),
             ("signed with another status", |r| {
                 Some(sign(&ours(), 200, r, UNKNOWN))
             }),
             ("not a signature", |_| Some("x".into())),
+            ("empty", |_| Some(String::new())),
+            // A refusal the control plane signed for a request someone else made with this
+            // node's signature: another node's id (unknown_node is decided before the signature
+            // is checked), another path, another body or time, another signature.
+            ("for another node", |r| {
+                Some(sign(
+                    &ours(),
+                    401,
+                    &like(r, |r| r.node = "rn_nobody".into()),
+                    UNKNOWN,
+                ))
+            }),
+            ("for another path", |r| {
+                let signing = r.signing.replacen("/nodes/heartbeat", "/nodes/nothing", 1);
+                Some(sign(
+                    &ours(),
+                    401,
+                    &like(r, |r| r.signing = signing),
+                    UNKNOWN,
+                ))
+            }),
+            ("for another body", |r| {
+                let signing = format!("{}0", &r.signing[..r.signing.len() - 1]);
+                Some(sign(
+                    &ours(),
+                    401,
+                    &like(r, |r| r.signing = signing),
+                    UNKNOWN,
+                ))
+            }),
+            ("for another request", |r| {
+                Some(sign(
+                    &ours(),
+                    401,
+                    &like(r, |r| r.sig = "another".into()),
+                    UNKNOWN,
+                ))
+            }),
+            ("in the standard base64 alphabet, padded", |r| {
+                let s = sign(&ours(), 401, r, UNKNOWN);
+                let bytes = B64.decode(&s).unwrap();
+                Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+            }),
         ];
         for (what, forge) in forged {
             let url = control_plane(move |r| (401, UNKNOWN.into(), forge(r)));
@@ -915,6 +1030,28 @@ mod tests {
             .heartbeat(&Heartbeat::default())
             .unwrap_err();
         assert!(e.unreachable(), "another body: {e}");
+    }
+
+    #[test]
+    fn a_pinned_key_isnt_replaced_by_one_an_answer_names() {
+        // Signed by our key, but naming another: still ours, and only ours is believed after.
+        let body = format!(
+            r#"{{"status":"active","latest_version":"2026-09-29","min_version":"2026-09-29","control_key":"{}"}}"#,
+            b64(&theirs())
+        );
+        let b = body.clone();
+        let url = control_plane(move |r| (200, b.clone(), Some(sign(&ours(), 200, r, &b))));
+        let mut c = client(&url, Some(&ours()));
+        c.heartbeat(&Heartbeat::default()).unwrap();
+        assert_eq!(c.pinned(), Some(b64(&ours())));
+        let b = body.clone();
+        let url = control_plane(move |r| (200, b.clone(), Some(sign(&theirs(), 200, r, &b))));
+        let mut c = client(&url, Some(&ours()));
+        assert!(
+            c.heartbeat(&Heartbeat::default())
+                .unwrap_err()
+                .unreachable()
+        );
     }
 
     #[test]
@@ -940,6 +1077,13 @@ mod tests {
         );
         assert_eq!(c.pinned(), None);
 
+        // Nor is one that isn't a key.
+        let bad = r#"{"status":"active","latest_version":"2026-09-29","min_version":"2026-09-29","control_key":"nope"}"#;
+        let url = control_plane(move |r| (200, bad.into(), Some(sign(&ours(), 200, r, bad))));
+        let mut c = client(&url, None);
+        assert!(c.heartbeat(&Heartbeat::default()).is_err());
+        assert_eq!(c.pinned(), None);
+
         // A control plane from before signed answers: believed as before, nothing pinned.
         let url = control_plane(|_| (200, ACTIVE.into(), None));
         let mut c = client(&url, None);
@@ -956,16 +1100,48 @@ mod tests {
             r#"{{"node_id":"rn_x","region":"sfo","heartbeat_s":15,"control_key":"{}"}}"#,
             b64(&ours())
         );
+        let joining =
+            |url: &str| Client::new(url, SigningKey::from_bytes(&[7; 32]), None, "2026-09-29");
         let b = body.clone();
-        let url = control_plane(move |r| (200, b.clone(), Some(sign(&ours(), 200, r, &b))));
-        let mut c = client(&url, None);
+        let url = control_plane(move |r| {
+            // A join names no node yet.
+            assert_eq!(r.node, "");
+            (200, b.clone(), Some(sign(&ours(), 200, r, &b)))
+        });
+        let mut c = joining(&url);
         assert_eq!(c.join("rjt_x", vec![]).unwrap().region, "sfo");
         assert_eq!(c.pinned(), Some(b64(&ours())));
 
         let b = body.clone();
         let url = control_plane(move |_| (200, b.clone(), None));
-        let mut c = client(&url, None);
+        let mut c = joining(&url);
         assert!(c.join("rjt_x", vec![]).is_err(), "a key with no signature");
         assert_eq!(c.pinned(), None);
+
+        // With the key given beforehand (RESONANCE_CONTROL_KEY), the join's answer must be its.
+        let b = body.replace(&b64(&ours()), &b64(&theirs()));
+        let url = control_plane(move |r| (200, b.clone(), Some(sign(&theirs(), 200, r, &b))));
+        let mut c = joining(&url);
+        c.pin(ours().verifying_key());
+        assert!(c.join("rjt_x", vec![]).unwrap_err().unreachable());
+        assert_eq!(c.pinned(), Some(b64(&ours())));
+    }
+
+    #[test]
+    fn only_an_answer_or_unknown_node_counts_as_hearing_from_the_control_plane() {
+        // Any other refusal, signed or not, counts toward the out-of-reach alert: a node fed
+        // refusals is as cut off as one that hears nothing.
+        let refused = |error: &str| Error::Refused {
+            status: 401,
+            error: error.into(),
+            message: String::new(),
+        };
+        let heard = |r: Result<(), Error>| heard(&r);
+        assert!(heard(Ok(())));
+        assert!(heard(Err(refused("unknown_node"))));
+        for e in ["replayed", "bad_signature", "bad_time", "not_found"] {
+            assert!(!heard(Err(refused(e))), "{e}");
+        }
+        assert!(!heard(Err(Error::Transport("down".into()))));
     }
 }

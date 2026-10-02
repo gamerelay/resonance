@@ -182,6 +182,14 @@ mod tests {
     }
 
     #[test]
+    fn a_key_isnt_saved_for_a_node_that_hasnt_joined() {
+        let s = State::new(tmp());
+        assert!(s.save_control_key("k").is_err());
+        assert_eq!(s.joined().unwrap(), None);
+        let _ = fs::remove_dir_all(s.dir());
+    }
+
+    #[test]
     fn joined_round_trips() {
         let s = State::new(tmp());
         assert_eq!(s.joined().unwrap(), None);
@@ -201,6 +209,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.joined().unwrap().unwrap().control_key, None);
+        // A key learnt later is kept with the rest as it was.
+        s.save_control_key("k").unwrap();
+        let j = s.joined().unwrap().unwrap();
+        assert_eq!(
+            (j.node_id.as_str(), j.control_key.as_deref()),
+            ("rn_x", Some("k"))
+        );
         fs::remove_dir_all(s.dir()).unwrap();
     }
 }

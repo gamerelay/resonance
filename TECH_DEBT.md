@@ -51,7 +51,7 @@ C1 and C2 first: they remove the two classes this review found most of. C3 is ch
 
 ## Tests
 
-`cargo test --workspace` passes (120 tests, about 4 s), clippy is clean, and MSRV 1.85 builds.
+`cargo test --workspace` passes (124 tests, about 4 s), clippy is clean, and MSRV 1.85 builds.
 
 | # | Priority | Size | Item |
 |---|---|---|---|

@@ -198,19 +198,35 @@ The same fixture is tested on both sides: `resonance-proto`'s tests and GameRela
 Every answer, refusals included, is signed by the control plane's own ed25519 key:
 
 ```
-Resonance-Answer-Sig = base64url( ed25519(control key, answer signing string) )
-answer signing string = "resonance/answer/v1" "\n" STATUS "\n" REQUEST-SIG "\n" hex( SHA-256(body) )
+Resonance-Answer-Sig  = base64url( ed25519(control key, answer signing string) )
+answer signing string = "resonance/answer/v1" "\n" STATUS "\n" NODE "\n"
+                        hex( SHA-256(request signing string) ) "\n" REQUEST-SIG "\n" hex( SHA-256(body) )
 ```
 
-`REQUEST-SIG` is the request's `Resonance-Sig` as sent, so an answer belongs to one request: an
-old one can't be replayed against a new request, and no clock is needed.
+`NODE`, the request signing string (above, from its method, path, `Resonance-Version`,
+`Resonance-Ts` and body) and `REQUEST-SIG` are the request's as it came (`NODE` is empty at
+join). So an answer belongs to one request, all of it:
+
+- An old answer can't be replayed against a new request, and no clock is needed.
+- A refusal the control plane gives a request someone else made up with this node's signature
+  doesn't check out for the node either. The control plane decides `unknown_node` before it
+  checks a signature, so without `NODE` a made-up request naming another node would get a signed
+  `unknown_node` to hand this one.
 
 - **The key** (`control_key`, base64url) comes with the join's answer and each heartbeat's. The
   node keeps it in `node.json`. A node that joined before signed answers keeps the key from the
   first heartbeat answer that key signed, over TLS as its join was.
 - **Once it has the key, the node believes nothing else.** An answer without a signature, or
   with any other, counts as no answer: the node carries on as it was, as if the control plane
-  were out of reach, and alerts if that lasts. So whoever stands between a node and its control
+  were out of reach, and alerts if that lasts. For the alert, a refusal other than
+  `unknown_node` counts as out of reach too: a node fed refusals is as cut off as one that hears
+  nothing.
+- **The key can be given out of band**: `RESONANCE_CONTROL_KEY` (base64url) pins it before the
+  first answer, at join or at any start; one that doesn't match `node.json`'s stops the node from
+  starting. Without it, a node that joined before signed answers pins the first key a signed
+  answer names, over TLS: someone between it and its control plane from the start could keep it
+  unpinned, or pin their own (it says so at start, and once a run while unpinned). GameRelay logs
+  its key at startup (`resonance: answer key`). So whoever stands between a node and its control
   plane (or holds its DNS, or a certificate for its name) can't tell it whose tickets to take,
   what to probe, or to drain or stop. They can only cut it off, which they could anyway.
 - **Rotating the key** means every node joins again (or has `control_key` changed in its
