@@ -127,7 +127,9 @@ impl Settings {
         turn.max_per_issuer = env.num("TURN_MAX_PER_ISSUER", turn.max_per_issuer)?;
         turn.ticket_check_rate = env.num("TURN_TICKET_CHECK_RATE", turn.ticket_check_rate)?;
         turn.memory_total = env.num("TURN_MEMORY_BYTES", turn.memory_total)?;
-        turn.memory_per_ip = env.num("TURN_MEMORY_PER_IP_BYTES", turn.memory_per_ip)?;
+        // Unset, one IP's share is the default or the whole total, whichever is less.
+        let per_ip = turn.memory_per_ip.min(turn.memory_total);
+        turn.memory_per_ip = env.num("TURN_MEMORY_PER_IP_BYTES", per_ip)?;
         if turn.memory_per_ip > turn.memory_total {
             return Err("TURN_MEMORY_PER_IP_BYTES is above TURN_MEMORY_BYTES".into());
         }
@@ -365,6 +367,16 @@ mod tests {
             ("TURN_MEMORY_PER_IP_BYTES", "2000"),
         ]);
         assert!(e.contains("above"), "{e}");
+        // A total under the per-IP default, with no share given: the share is the whole total.
+        let s = settings(&[
+            ("TURN_PUBLIC_IP", "192.0.2.1"),
+            ("TURN_MEMORY_BYTES", "8000000"),
+        ])
+        .unwrap();
+        assert_eq!(
+            (s.turn.memory_total, s.turn.memory_per_ip),
+            (8_000_000, 8_000_000)
+        );
     }
 
     #[test]
