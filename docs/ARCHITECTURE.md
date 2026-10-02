@@ -102,12 +102,15 @@ read, handled and answered in one go.
 - **Fairness.** Each turn of the loop reads at most 1,024 datagrams from UDP and 256 KB from any
   one stream, so a busy client can't starve the rest.
 - **One memory budget.** Everything a client can make the node hold is charged to one
-  budget (`resonance_turn::budget`), to the client's IP (4 MB) and to everyone's total (64 MB):
+  budget (`resonance_turn::budget`), to the client's IP (16 MB) and to everyone's total (96 MB):
   allocations (about 1 KB each, their channels' room reserved up front), the checked tickets
-  kept, and each stream's queue and half-read message. A charge that doesn't fit is refused,
-  never allocated: an Allocate gets 508, a ticket is checked but not kept, a message isn't
-  queued, and a stream whose read doesn't fit is closed. A new path that holds memory has one
-  place to charge.
+  kept (until they expire), and each stream's queue and framer, by the room they hold, not only
+  what's in them. A charge that doesn't fit is refused, never allocated: an Allocate gets 508, a
+  ticket is checked but not kept, a message isn't queued, and a stream whose read doesn't fit is
+  closed. A queue or framer gives its room back once a burst has gone through, so a client that
+  keeps up holds a few KB. One IP's share fits everything its caps allow (64 allocations, 64
+  streams with full queues), so a busy NAT is never refused for memory; the total is what binds
+  when many IPs press at once. A new path that holds memory has one place to charge.
 - **Back-pressure.** Each stream has its own outgoing queue (`Outbox`), capped at 64 KB and
   charged to the budget; the kernel's send buffer for a stream is fixed at 64 KB. Past that,
   whole messages are dropped and the connection stays open. Games prefer a lost frame to a

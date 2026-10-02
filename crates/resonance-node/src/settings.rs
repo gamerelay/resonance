@@ -267,7 +267,7 @@ mod tests {
         );
         assert_eq!(
             (t.memory_total, t.memory_per_ip),
-            (64 * 1024 * 1024, 4 * 1024 * 1024)
+            (96 * 1024 * 1024, 16 * 1024 * 1024)
         );
         assert_eq!(s.heartbeat, HEARTBEAT);
         assert_eq!(s.control, "https://gamerelay.io");

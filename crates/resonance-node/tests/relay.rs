@@ -143,7 +143,8 @@ fn streams_that_send_and_never_read_are_closed_and_a_reader_is_kept() {
     );
     let mut reader = TcpStream::connect(node.tcp).unwrap();
     bind(&mut reader);
-    let mut hoarders: Vec<TcpStream> = (0..8).map(|_| small_reader(node.tcp)).collect();
+    // More than the budget can hold for all of them, so it fills past the sweep's mark.
+    let mut hoarders: Vec<TcpStream> = (0..12).map(|_| small_reader(node.tcp)).collect();
     for h in &mut hoarders {
         // About 1.3 MB of answers each: past the kernel's buffers and the stream's queue.
         flood(h, 20_000);
@@ -158,7 +159,13 @@ fn streams_that_send_and_never_read_are_closed_and_a_reader_is_kept() {
             closed += 1;
         }
     }
-    assert!(closed >= 4, "only {closed} of 8 hoarders were closed");
+    // On Linux the node's writes stop at the kernel's buffers (64 KB here), so what the hoarders
+    // don't read piles up in their queues, charged, until the sweep closes the biggest. macOS's
+    // loopback takes all of it into the kernel instead: nothing piles up in the node, so there's
+    // nothing to close (the sweep itself is checked on every system by the next test).
+    if cfg!(target_os = "linux") {
+        assert!(closed >= 3, "only {closed} of 12 hoarders were closed");
+    }
     bind(&mut reader);
     // What the closed streams held was given back: new ones are answered.
     for _ in 0..4 {

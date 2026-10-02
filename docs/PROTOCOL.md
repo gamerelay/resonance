@@ -152,7 +152,7 @@ Most are settings; the allocation and rate defaults are the Go relay's.
 | Open streams (TCP + TLS) | 1,024 | `TURN_MAX_STREAMS` |
 | Open streams per client IP | 64 | `TURN_MAX_STREAMS_PER_IP` |
 | A stream's outgoing queue | 64 KB, then whole messages are dropped | |
-| Memory clients make the node hold: allocations, checked tickets kept, streams' queues and half-read messages | 64 MB in all, 4 MB per client IP: a charge past either is refused (an Allocate gets 508). Past three quarters, the streams holding the most are closed | `TURN_MEMORY_BYTES`, `TURN_MEMORY_PER_IP_BYTES` |
+| Memory clients make the node hold: allocations, checked tickets kept, streams' queues and half-read messages | 96 MB in all, 16 MB per client IP (what one IP's caps allow): a charge past either is refused (an Allocate gets 508). Past three quarters, the streams holding the most are closed | `TURN_MEMORY_BYTES`, `TURN_MEMORY_PER_IP_BYTES` |
 
 ## 2. The control plane API
 

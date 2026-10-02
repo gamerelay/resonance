@@ -23,7 +23,7 @@ control-plane side.
 - **The 2026-10-01 review** ([TECH_DEBT.md](../TECH_DEBT.md)): every security item is fixed and
   deployed (#9, #11, and GameRelay's control plane), each with a test that fails without it. What's left
   is correctness, tests, organization and docs debt, and the "Classes of bug to rule out".
-- **A node's memory is bounded** whatever its clients do: one budget (64 MB, 4 MB per IP) that
+- **A node's memory is bounded** whatever its clients do: one budget (96 MB, 16 MB per IP) that
   allocations, kept tickets and streams all charge, streams per IP, and channels per allocation
   (PROTOCOL.md, "Limits"; TECH_DEBT C1). GameRelay's unit caps the process at 384 MB.
 - **GameRelay is the only control plane** (`https://gamerelay.io/resonance/v0/…`, API

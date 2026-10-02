@@ -87,6 +87,9 @@ impl Default for Limits {
 /// reads what it's sent holds about a message.
 const HOARDING: usize = 16 * 1024;
 
+/// The least room a queue grows to, and keeps once drained.
+const MIN_QUEUE: usize = 4096;
+
 /// What a stream has waiting to go out: whole messages, each padded as a stream needs.
 struct Outbox {
     /// Plaintext not yet taken: by the socket (TCP), or by rustls (TLS, which takes more only once
@@ -99,23 +102,40 @@ impl Outbox {
         Outbox { bytes: Vec::new() }
     }
 
-    /// One message, or false if it didn't fit in this stream's queue or in the memory budget
-    /// (`ip`'s share, or everyone's): dropped whole, as UDP would. What's queued is charged to
-    /// `ip` here; the stream gives it back as it's sent (`Stream::settle_charge`).
-    fn push(&mut self, packet: &[u8], memory: &mut Budget, ip: IpAddr) -> bool {
+    /// One message, or None if it didn't fit in this stream's queue or in the memory budget
+    /// (`ip`'s share, or everyone's): dropped whole, as UDP would. The queue's room is what's
+    /// charged, as it grows (doubling, up to QUEUE_CAP), so nothing is allocated that wasn't
+    /// charged: the bytes charged now, if any. The stream gives them back as its queue shrinks
+    /// (`Stream::settle_charge`).
+    fn push(&mut self, packet: &[u8], memory: &mut Budget, ip: IpAddr) -> Option<usize> {
         let pad = padding(packet);
         let n = packet.len() + pad.len();
-        if self.bytes.len() + n > QUEUE_CAP || !memory.charge(ip, n) {
-            return false;
+        let (len, room) = (self.bytes.len(), self.bytes.capacity());
+        if len + n > QUEUE_CAP {
+            return None;
+        }
+        let mut grew = 0;
+        if len + n > room {
+            let want = (len + n).max(room * 2).clamp(MIN_QUEUE, QUEUE_CAP);
+            if !memory.charge(ip, want - room) {
+                return None;
+            }
+            self.bytes.reserve_exact(want - len);
+            debug_assert_eq!(self.bytes.capacity(), want);
+            grew = want - room;
         }
         self.bytes.extend_from_slice(packet);
         self.bytes.extend_from_slice(pad);
-        true
+        Some(grew)
     }
 
-    /// The first `n` bytes went out.
+    /// The first `n` bytes went out. A queue that's mostly drained gives its room back.
     fn sent(&mut self, n: usize) {
         self.bytes.drain(..n);
+        let (len, room) = (self.bytes.len(), self.bytes.capacity());
+        if room > MIN_QUEUE && len <= room / 4 {
+            self.bytes.shrink_to((len * 2).max(MIN_QUEUE));
+        }
     }
 }
 
@@ -125,7 +145,7 @@ struct Stream {
     tls: Option<ServerConnection>,
     framer: Framer,
     queue: Outbox,
-    /// What it's charged in the memory budget: its queue as pushed, and its framer's room.
+    /// What it's charged in the memory budget: its queue's room, and its framer's.
     charged: usize,
     opened: Instant,
     heard: Instant,
@@ -139,9 +159,9 @@ impl Stream {
         Token(self.client.conn as usize + STREAMS)
     }
 
-    /// What it holds now: what waits in its queue, and its framer's room.
+    /// What it holds now: its queue's room, and its framer's.
     fn holds(&self) -> usize {
-        self.queue.bytes.len() + self.framer.held()
+        self.queue.bytes.capacity() + self.framer.held()
     }
 
     /// Brings its charge to what it holds now. False (and nothing changed) if it grew past the
@@ -157,11 +177,13 @@ impl Stream {
 
     /// One message on its queue, charged.
     fn push(&mut self, packet: &[u8], memory: &mut Budget) -> bool {
-        let ok = self.queue.push(packet, memory, self.client.addr.ip());
-        if ok {
-            self.charged += packet.len() + padding(packet).len();
+        match self.queue.push(packet, memory, self.client.addr.ip()) {
+            Some(grew) => {
+                self.charged += grew;
+                true
+            }
+            None => false,
         }
-        ok
     }
 
     /// Writes what it can without blocking. Err: the stream is broken.
@@ -609,6 +631,7 @@ impl Relay {
                 }
                 // What arrived before an end or an error still counts (a last Refresh).
                 self.take_messages(s, now)?;
+                s.framer.trim();
                 match fill.map_err(Why::Error)? {
                     Fill::Read(n) => {
                         budget = budget.saturating_sub(n);
@@ -792,36 +815,64 @@ mod tests {
     }
 
     #[test]
-    fn a_queue_drops_past_its_own_cap_and_charges_what_it_takes() {
+    fn a_queue_is_charged_its_room_as_it_grows_and_drops_past_its_own_cap() {
         let mut memory = Budget::new(usize::MAX, usize::MAX);
         let mut q = Outbox::new();
         let m = [0u8; 1000];
+        let mut charged = 0;
         let fits = QUEUE_CAP / 1000;
         for _ in 0..fits {
-            assert!(q.push(&m, &mut memory, ip(1)));
+            charged += q.push(&m, &mut memory, ip(1)).unwrap();
+            // Everything it holds is charged, never more than its cap.
+            assert_eq!((charged, memory.of(ip(1))), (q.bytes.capacity(), charged));
         }
-        assert!(
-            !q.push(&m, &mut memory, ip(1)),
+        assert!(q.bytes.capacity() <= QUEUE_CAP);
+        assert_eq!(
+            q.push(&m, &mut memory, ip(1)),
+            None,
             "past QUEUE_CAP: dropped whole"
         );
-        assert_eq!(memory.of(ip(1)), fits * 1000, "and not charged");
+        assert_eq!(memory.of(ip(1)), charged, "and not charged");
+    }
+
+    #[test]
+    fn a_drained_queue_gives_its_room_back() {
+        let mut memory = Budget::new(usize::MAX, usize::MAX);
+        let mut q = Outbox::new();
+        let m = [0u8; 1000];
+        while q.push(&m, &mut memory, ip(1)).is_some() {}
+        let full = q.bytes.capacity();
+        q.sent(1000);
+        assert_eq!(q.bytes.capacity(), full, "still most of it waiting");
+        let rest = q.bytes.len();
+        q.sent(rest);
+        assert!(q.bytes.capacity() <= MIN_QUEUE, "{}", q.bytes.capacity());
     }
 
     #[test]
     fn queues_stop_at_their_ips_share_and_at_everyones_total() {
-        let mut memory = Budget::new(3000, 2000);
-        let (mut a, mut b, mut c) = (Outbox::new(), Outbox::new(), Outbox::new());
+        let mut memory = Budget::new(3 * MIN_QUEUE, 2 * MIN_QUEUE);
+        let (mut a, mut b, mut c, mut d) =
+            (Outbox::new(), Outbox::new(), Outbox::new(), Outbox::new());
         let m = [0u8; 1000];
-        assert!(a.push(&m, &mut memory, ip(1)) && b.push(&m, &mut memory, ip(1)));
-        assert!(
-            !b.push(&m, &mut memory, ip(1)),
-            "its IP's share, whichever stream it is"
+        assert_eq!(a.push(&m, &mut memory, ip(1)), Some(MIN_QUEUE));
+        assert_eq!(b.push(&m, &mut memory, ip(1)), Some(MIN_QUEUE));
+        assert_eq!(
+            b.push(&m, &mut memory, ip(1)),
+            Some(0),
+            "within its room: nothing more"
         );
-        assert!(c.push(&m, &mut memory, ip(2)));
-        assert!(!c.push(&m, &mut memory, ip(2)), "everyone's total");
-        memory.refund(ip(1), 1000);
+        let mut e = Outbox::new();
+        assert_eq!(
+            e.push(&m, &mut memory, ip(1)),
+            None,
+            "its IP's share, whichever stream"
+        );
+        assert_eq!(c.push(&m, &mut memory, ip(2)), Some(MIN_QUEUE));
+        assert_eq!(d.push(&m, &mut memory, ip(2)), None, "everyone's total");
+        memory.refund(ip(1), MIN_QUEUE);
         assert!(
-            c.push(&m, &mut memory, ip(2)),
+            d.push(&m, &mut memory, ip(2)).is_some(),
             "room once some is given back"
         );
     }

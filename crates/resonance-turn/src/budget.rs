@@ -133,4 +133,35 @@ mod tests {
         assert!(b.recharge(ip(1), 50, 5));
         assert_eq!((b.of(ip(1)), b.used()), (5, 5));
     }
+
+    #[test]
+    fn any_sequence_of_charges_and_refunds_keeps_the_books() {
+        // A deterministic walk: whatever happens, the total is the sum of the IPs', none is past
+        // its share, the total isn't past its limit, and an IP at zero isn't kept.
+        let mut b = Budget::new(10_000, 3_000);
+        let mut held = [0usize; 8];
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..100_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let who = (x % 8) as usize;
+            let n = ((x >> 8) % 2_000) as usize;
+            if x & 1 << 40 == 0 {
+                if b.charge(ip(who as u8), n) {
+                    held[who] += n;
+                }
+            } else {
+                b.refund(ip(who as u8), n);
+                held[who] -= n.min(held[who]);
+            }
+            assert_eq!(b.used(), held.iter().sum::<usize>());
+            assert!(b.used() <= b.total());
+            for (i, h) in held.iter().enumerate() {
+                assert_eq!(b.of(ip(i as u8)), *h);
+                assert!(*h <= b.per_ip());
+            }
+            assert_eq!(b.ips(), held.iter().filter(|h| **h > 0).count());
+        }
+    }
 }

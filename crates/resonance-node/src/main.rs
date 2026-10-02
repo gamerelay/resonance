@@ -49,7 +49,7 @@
 //! - TURN_RATE_BYTES (131072) and TURN_BURST_BYTES (twice that): per allocation.
 //! - TURN_TICKET_CHECK_RATE (5000/s): ticket checks from all clients together, on top of each
 //!   IP's own budget (TURN_UNAUTH_RATE).
-//! - TURN_MEMORY_BYTES (64 MB) and TURN_MEMORY_PER_IP_BYTES (4 MB): what clients may make the
+//! - TURN_MEMORY_BYTES (96 MB) and TURN_MEMORY_PER_IP_BYTES (16 MB): what clients may make the
 //!   node hold (allocations, checked tickets, streams' queues and half-read messages), all
 //!   together and from one IP. Past it a charge is refused (an Allocate gets 508, a message
 //!   isn't queued), and past three quarters the streams holding the most are closed.
