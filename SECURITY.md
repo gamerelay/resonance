@@ -28,7 +28,7 @@ nodes are kept on it.
 - **Crashes and resource exhaustion.** A packet or a stream that crashes a node, or exhausts it
   past its limits.
 - **The control-plane protocol.** Forging or replaying signed requests, or a node obtaining
-  another node's key.
+  another node's identity or sealing secret, or minting tickets without an issuer's key.
 
 ## Out of scope
 

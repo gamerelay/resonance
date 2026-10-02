@@ -89,7 +89,8 @@ key      = MD5( username ":" realm ":" password )        # RFC 8489 §9.2.2, rea
   reach still relays ticket holders.
 - **A minimal issuer.** `resonance-node issuer <file>` makes an issuer key (or reads it) and
   prints its public key. `resonance-node mint <file> <seal key> <instance> <room> <player>
-  [seconds]` prints a ticket's username and password for one node.
+  [seconds]` prints a ticket's username and password for one node (3600 s by default, at most
+  86,400).
 - **Fixture.** `crates/resonance-turn/src/ticket.rs`, `interop/ticket` (Go) and GameRelay's
   `test/turn.test.ts` mint the same ticket and password from the same keys.
 
