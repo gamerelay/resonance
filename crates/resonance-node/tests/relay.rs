@@ -93,6 +93,16 @@ fn a_silent_stream_is_closed_once_idle() {
     assert!(hung_up(&mut s, Duration::from_secs(3)));
 }
 
+/// A client that takes little into its own kernel (a 4 KB receive buffer, set before connecting),
+/// so what it doesn't read piles up in the node, as it would across a real network.
+fn small_reader(to: SocketAddr) -> TcpStream {
+    use socket2::{Domain, Socket, Type};
+    let s = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    s.set_recv_buffer_size(4096).unwrap();
+    s.connect(&to.into()).unwrap();
+    s.into()
+}
+
 /// Binding requests back to back, `n` of them, never reading the answers.
 fn flood(s: &mut TcpStream, n: usize) {
     let many: Vec<u8> = BINDING
@@ -116,9 +126,7 @@ fn streams_that_send_and_never_read_are_closed_and_a_reader_is_kept() {
     });
     let mut reader = TcpStream::connect(node.tcp).unwrap();
     bind(&mut reader);
-    let mut hoarders: Vec<TcpStream> = (0..8)
-        .map(|_| TcpStream::connect(node.tcp).unwrap())
-        .collect();
+    let mut hoarders: Vec<TcpStream> = (0..8).map(|_| small_reader(node.tcp)).collect();
     for h in &mut hoarders {
         // About 1.3 MB of answers each: past the kernel's buffers and the stream's queue.
         flood(h, 20_000);
