@@ -9,7 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 base64 = "0.22"
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 getrandom = "0.3"
 libc = "0.2"
 mio = { version = "1", features = ["os-poll", "net"] }
