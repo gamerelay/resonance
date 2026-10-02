@@ -58,9 +58,12 @@ The design also holds the following:
 - **A node can't read what it relays.** The node never sees plaintext.
 - **The node is safe to point at the internet.** The answers it sends to sources it doesn't know
   are rate-limited per IP, so it can't be used to reflect traffic at a third party. Nonces are
-  bound to the client's address, and every allocation limit is per player, per IP and per game.
+  bound to the client's address, and every allocation limit is per player, per IP, per game and per issuer.
 - **Control requests can't be forged or replayed.** Each one is signed, timestamped within 30 s,
-  and remembered.
+  and remembered. A node reaches its control plane over https only.
+- **A control plane can't push a node around much.** It can't make a node probe more than 64
+  peers, or any address a node couldn't have. A node it no longer knows stops taking new
+  allocations but doesn't exit. Its answers are trusted on TLS alone for now (TECH_DEBT.md, C2).
 
 ## Inside a node
 

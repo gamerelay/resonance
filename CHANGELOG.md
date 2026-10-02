@@ -10,9 +10,9 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
 build has one copy of each: ed25519-dalek and x25519-dalek 3 (curve25519-dalek 5), hmac 0.13,
 sha1, sha2 and md-5 0.11 (digest 0.11), base64 0.23, getrandom 0.4; actions/checkout 7 and
 actions/setup-go 7 (pinned to commits). No change on the wire: the ticket, signing and RFC 5769
-vectors are byte-for-byte the same.
+vectors are byte-for-byte the same. `b356ec6` (#13)
 
-**The review's other security items.** Each has a test that fails without it.
+**The review's other security items.** Each has a test that fails without it. `5c100a6`, `68a20c4` (#11)
 
 - **Ticket checks are budgeted for everyone together too** (`TURN_TICKET_CHECK_RATE`, 5,000/s),
   not only per IP, so many IPs can't fill the loop with them.
@@ -29,7 +29,8 @@ vectors are byte-for-byte the same.
   lockfile (`npm ci`).
 
 **A node's memory stays bounded whatever its clients do.** The review of 2026-10-01 (TECH_DEBT.md)
-found two ways for clients to fill a node past its memory cap; both are closed.
+found two ways for clients to fill a node past its memory cap; both are closed. `17ea382`,
+`9ca8c53` (#9)
 
 - **Streams.** Clients that send over TCP or TLS and never read their answers could pile up
   queued answers: 256 KB a stream, 256 streams an IP. Now a stream's queue is 64 KB, all queues
@@ -46,8 +47,11 @@ found two ways for clients to fill a node past its memory cap; both are closed.
 
 ## 2026-10-01
 
+**A review of the node** (organization, tests, docs, security): [TECH_DEBT.md](TECH_DEBT.md), and
+the docs brought up to date with tickets. No change in the node. `316c9cf` (#8)
+
 **Players' credentials are tickets, from any issuer the node trusts.** The shared-key
-credentials are gone.
+credentials are gone. `5617b28`, `c6ef1cc`, `a0e229a`, `825fe7a` (#7)
 
 - A ticket is signed by an issuer, an ed25519 key: a control plane, or a game's own server
   (`resonance_turn::ticket`). The password comes from key agreement between a fresh X25519 key in
@@ -85,7 +89,7 @@ credentials are gone.
 **v0.1.0**, the first tagged release: everything below, as in production on both nodes since
 2026-09-30, with these docs.
 
-**Docs.** No change in the node.
+**Docs.** No change in the node. `a636e38`, `a739698`, `08e5721`, `ff98090`
 
 - `docs/ARCHITECTURE.md`: the network's roles, what each leaked secret allows, inside a node
   (the sans-I/O core, the one event loop, the control thread), observing the network,

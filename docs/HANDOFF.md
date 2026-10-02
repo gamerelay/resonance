@@ -1,6 +1,6 @@
 # Handoff
 
-Read this first when picking up work on the node. **Last updated:** 2026-10-01.
+Read this first when picking up work on the node. **Last updated:** 2026-10-02.
 
 What changed and when: [CHANGELOG.md](../CHANGELOG.md). The design (roles, the registry API,
 credentials, versioning, rollout) is GameRelay's
@@ -12,18 +12,25 @@ control-plane side.
 
 - **v0's node is done and in production.** The room-scoped TURN relay (UDP, and TCP and TLS),
   joined to GameRelay's registry: join, heartbeats, drain, revoke. Both nodes, `sfo-1` and
-  `nyc-1`, run the ticket build (`cdea8f1`, 2026-10-01), each on its own droplet with TLS on
-  443; they measure each other in GameRelay's Admin → Network, and both have
-  `RESONANCE_ALERT_WEBHOOK` set.
+  `nyc-1`, run `afb2677` (2026-10-02: tickets, plus every security fix from the review), each on
+  its own droplet with TLS on 443; they measure each other in GameRelay's Admin → Network, and
+  both have `RESONANCE_ALERT_WEBHOOK` set. `main` is ahead only by docs and dependency updates
+  (#12, #13: no change on the wire), so there's nothing to redeploy until the next node change.
 - **Players' credentials are tickets** since 2026-10-01 (PR #7; docs/PROTOCOL.md, "Tickets"):
   the shared-key credentials are gone. A control plane that mints only tickets doesn't hand out
-  a node that hasn't sent its sealing key (deployed 2026-10-01: control plane first, then each
-  node; a leftover `TURN_SECRET` is ignored, and said to be).
-- **Known debt:** [TECH_DEBT.md](../TECH_DEBT.md), from the 2026-10-01 review.
+  a node that hasn't sent its sealing key.
+- **The 2026-10-01 review** ([TECH_DEBT.md](../TECH_DEBT.md)): every security item is fixed and
+  deployed (#9, #11, and GameRelay's control plane), each with a test that fails without it. What's left
+  is correctness, tests, organization and docs debt, and the "Classes of bug to rule out".
+- **A node's memory is bounded** whatever its clients do: stream queues, streams per IP,
+  channels per allocation, and the streams holding the most closed past 32 MB (PROTOCOL.md,
+  "Limits"). GameRelay's unit caps the process at 384 MB.
 - **GameRelay is the only control plane** (`https://gamerelay.io/resonance/v0/…`, API
-  `2026-09-29`). Nodes are minted, drained and revoked in its Admin → Nodes tab.
-- CI (`.github/workflows/ci.yml`) is green: the core's tests and a fuzz run, pion's and coturn's
-  clients, and Chromium, Firefox and WebKit over UDP, TCP and TLS.
+  `2026-09-29`). Nodes are minted, drained, revoked and deleted in its Admin → Nodes tab.
+- **Dependencies** are current as of #13 (dalek 3, RustCrypto 0.11). The crypto crates share
+  `digest` and `curve25519-dalek`, so bump them together, not one Dependabot PR at a time.
+- CI (`.github/workflows/ci.yml`, actions pinned to commits) is green: the core's tests and a
+  fuzz run, pion's and coturn's clients, and Chromium, Firefox and WebKit over UDP, TCP and TLS.
 
 ## The nodes and deploying
 
@@ -42,6 +49,8 @@ The README's "Tests" has the commands. Locally on a Mac:
 - The browser test runs in the Playwright container (Linux), with the node built for Linux in
   Docker too. `TRANSPORT=tcp` or `tls`; TLS needs `libnss3-tools` in the container
   (`apt-get install -y libnss3-tools`) and `BROWSERS=chromium,firefox`.
+- Tests that depend on kernel buffers (the streams that never read) behave differently on macOS
+  and Linux: check them in Docker on Linux before trusting a pass on a Mac.
 - The benchmark: `docs/BENCH-2026-09-29.md`, "Reproduce".
 
 ## Things that bite
@@ -62,16 +71,23 @@ The README's "Tests" has the commands. Locally on a Mac:
   (`again` in `relay.rs`), or it would never be read again.
 - **Scanners probe 443 within minutes.** Their connections close at the 10 s first-message
   deadline or as junk; `TURN_DEBUG_STREAMS=1` shows them.
+- **The repo is public.** Security findings stay in GameRelay's private
+  `docs/RESONANCE-SECURITY.md` until fixed and deployed, then move to TECH_DEBT.md (SECURITY.md).
 
 ## Next
 
+- **The 0.2.0 release** (TECH_DEBT 12): the crates still say 0.1.0 after tickets' breaking
+  change. A version bump, a CHANGELOG line and a tag.
+- **IPv6** (TECH_DEBT 11): a v6 `TURN_PUBLIC_IP` is accepted but never served. Bind `[::]`, or
+  refuse it until then.
+- **C1 and C2** from "Classes of bug to rule out": one memory budget for everything a client can
+  make the node hold, and signed heartbeat answers. C3 (lints against panics and overflow) is
+  cheap insurance.
 - **The UDP benchmark on a Linux host** for the new loop: in Docker on a Mac, 1,000 pairs were
   even and 200 pairs a little behind in most rounds, within that run's drift (CHANGELOG).
 - **Safari over TLS:** check it against NYC. If it refuses Let's Encrypt too, Safari players on
   networks that block UDP just play through the game server (nothing breaks); a certificate
   from a CA in libwebrtc's list would be the fix.
-- **The open security items** from the 2026-10-01 review (kept privately until fixed): two
-  are high and small.
 - **Capacity with load from another machine**: on one box the load generator runs out first.
 - **Later in the design:** receipts and credits for node operators, community-run nodes, and the
   room "home" role (the envelope and receipts are drafted in the spec's appendices).
