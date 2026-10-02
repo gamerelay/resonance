@@ -321,8 +321,6 @@ fn listen_tcp(addr: SocketAddr) -> TcpListener {
     s.into()
 }
 
-/// The key, retried until the control plane answers: a node that can't get its key can't relay.
-/// A refusal (revoked, unknown) is final.
 /// Its key within a few seconds, or none (the control plane out of reach). A refusal is final,
 /// as when patient.
 fn fetch_key_briefly(client: &Client) -> Option<resonance_proto::KeyResponse> {
@@ -341,6 +339,8 @@ fn fetch_key_briefly(client: &Client) -> Option<resonance_proto::KeyResponse> {
     None
 }
 
+/// The key, retried until the control plane answers: a node that can't get its key, and has no
+/// issuers to relay tickets for, can't relay. A refusal (revoked, unknown) is final.
 fn fetch_key_patiently(client: &Client) -> resonance_proto::KeyResponse {
     let mut wait = Duration::from_secs(1);
     loop {
