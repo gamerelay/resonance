@@ -7,12 +7,12 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use resonance_turn::auth::{long_term_key, password};
-use resonance_turn::stun::{self, Class, Message, Writer, attr, method};
-use resonance_turn::{Config, Output, Server};
+mod common;
 
-const KEY: &str = "fiahLYMg85YkiFJQ0Xp3Bl0x3pXkUhI4nMU8jj6QRio";
-const UNIX: u64 = 1_790_000_000;
+use common::{UNIX, config, pass, ticket};
+use resonance_turn::auth::long_term_key;
+use resonance_turn::stun::{self, Class, Message, Writer, attr, method};
+use resonance_turn::{Output, Server};
 
 struct Rng(u64);
 impl Rng {
@@ -40,7 +40,7 @@ fn signed(
     w.attr(attr::USERNAME, name.as_bytes())
         .attr(attr::REALM, b"gamerelay")
         .attr(attr::NONCE, nonce.as_bytes())
-        .integrity(&long_term_key(name, "gamerelay", &password(KEY, name)))
+        .integrity(&long_term_key(name, "gamerelay", &pass(name)))
         .fingerprint();
     buf
 }
@@ -52,8 +52,7 @@ fn nothing_panics_and_nothing_goes_astray() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(200_000);
     let t = Instant::now();
-    let public = "192.0.2.1".parse().unwrap();
-    let mut s = Server::with_clock(Config::new(KEY, public, [3; 32]), t, UNIX);
+    let mut s = Server::with_clock(config(), t, UNIX);
     let clients: Vec<SocketAddr> = (0..6)
         .map(|i| {
             format!("198.51.100.{}:{}", i % 3 + 1, 5000 + i)
@@ -62,7 +61,7 @@ fn nothing_panics_and_nothing_goes_astray() {
         })
         .collect();
     let names: Vec<String> = (0..6)
-        .map(|i| format!("{}:ins:g{}:p{i}", UNIX + 7200, i % 2))
+        .map(|i| ticket(UNIX + 7200, "ins", &format!("g{}", i % 2), &format!("p{i}")))
         .collect();
 
     // A nonce (each client's own: they're bound to its address), then an allocation and a

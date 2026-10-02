@@ -1,6 +1,6 @@
 [package]
 name = "resonance-proto"
-description = "Resonance's wire types: node ids, signed control-plane requests, join, key, heartbeat."
+description = "Resonance's wire types: node ids, signed control-plane requests, join, heartbeat, issuers."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

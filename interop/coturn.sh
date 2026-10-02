@@ -6,17 +6,25 @@
 #   cargo build --release && interop/coturn.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
-KEY=fiahLYMg85YkiFJQ0Xp3Bl0x3pXkUhI4nMU8jj6QRio
+BIN=./target/release/resonance-node
 PORT=${PORT:-34790}
-TURN_SECRET=$KEY TURN_PUBLIC_IP=127.0.0.1 TURN_PORT=$PORT ./target/release/resonance-node 2>/tmp/resonance-coturn.log &
+# Players hold tickets (docs/PROTOCOL.md, "Tickets"), minted by the node's own minimal issuer.
+KEYS=$(mktemp -d)
+ISSUER=$("$BIN" issuer "$KEYS/issuer.key")
+SEAL=$(RESONANCE_STATE_DIR="$KEYS/state" "$BIN" seal-key)
+RESONANCE_STATE_DIR="$KEYS/state" RESONANCE_ISSUERS=$ISSUER TURN_PUBLIC_IP=127.0.0.1 TURN_PORT=$PORT \
+  "$BIN" 2>/tmp/resonance-coturn.log &
 NODE=$!
-trap 'kill $NODE 2>/dev/null || true' EXIT
+trap 'kill $NODE 2>/dev/null || true; rm -rf "$KEYS"' EXIT
 sleep 0.5
 fail=0
 run() {
   local name=$1; shift
-  local out
-  out=$(timeout 90 turnutils_uclient -y -c -W "$KEY" -u "ins:$name:p" -m 2 -n 200 -l 170 -z 5 -p "$PORT" "$@" 127.0.0.1 2>&1 || true)
+  local out ticket user pass
+  ticket=$("$BIN" mint "$KEYS/issuer.key" "$SEAL" ins "$name" p)
+  user=$(sed -n 1p <<<"$ticket")
+  pass=$(sed -n 2p <<<"$ticket")
+  out=$(timeout 90 turnutils_uclient -y -c -u "$user" -w "$pass" -m 2 -n 200 -l 170 -z 5 -p "$PORT" "$@" 127.0.0.1 2>&1 || true)
   local total
   total=$(grep -E 'Total lost packets' <<<"$out" | tail -1 || true)
   echo "$name: ${total:-no result}"

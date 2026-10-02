@@ -61,6 +61,10 @@ pub struct JoinRequest {
     /// Where players reach it: `turn:ip:port`.
     pub urls: Vec<String>,
     pub software: String,
+    /// Its X25519 sealing key, base64url: issuers derive its ticket passwords with it. An
+    /// addition within 2026-09-29.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -68,13 +72,6 @@ pub struct JoinResponse {
     pub node_id: String,
     pub region: String,
     pub heartbeat_s: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct KeyResponse {
-    /// This node's own key: it mints credentials for this node only.
-    pub node_key: String,
-    pub key_version: u32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -94,6 +91,10 @@ pub struct Heartbeat {
     /// its relay socket, over the last 30 s. An addition within 2026-09-29.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<PeerReport>,
+    /// As at join, so a node that joined before tickets says it now. An addition within
+    /// 2026-09-29.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal_key: Option<String>,
 }
 
 /// One peer's Bindings over the report's window.
@@ -133,13 +134,22 @@ pub enum Status {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct HeartbeatResponse {
     pub status: Status,
-    pub key_version: u32,
     pub latest_version: String,
     pub min_version: String,
     /// The other nodes to measure. An addition within 2026-09-29: a control plane that doesn't
     /// send it means none.
     #[serde(default)]
     pub peers: Vec<Peer>,
+    /// Whose tickets to accept, besides the node's own `RESONANCE_ISSUERS`. An addition within
+    /// 2026-09-29: none sent means none.
+    #[serde(default)]
+    pub issuers: Vec<IssuerKey>,
+}
+
+/// An issuer's ed25519 public key, base64url (no padding).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IssuerKey {
+    pub pubkey: String,
 }
 
 /// An error answer: `{ error, message }`.
@@ -226,6 +236,10 @@ mod tests {
         let r: HeartbeatResponse = serde_json::from_str(r#"{"status":"paused","key_version":0,"latest_version":"2027-01-01","min_version":"2026-09-29","extra":1}"#).unwrap();
         assert_eq!(r.status, Status::Unknown);
         let r: HeartbeatResponse = serde_json::from_str(r#"{"status":"upgrade_required","key_version":2,"latest_version":"x","min_version":"y"}"#).unwrap();
-        assert_eq!((r.status, r.key_version), (Status::UpgradeRequired, 2));
+        assert_eq!(
+            r.status,
+            Status::UpgradeRequired,
+            "a key_version from an older control plane is ignored"
+        );
     }
 }

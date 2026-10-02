@@ -33,7 +33,7 @@ This repo is the **node**: a room-scoped TURN relay in Rust. It replaces GameRel
 rule for rule, and is the base for the network's later roles.
 
 **Status: v0, in production.** GameRelay's relays (San Francisco and New York) run it, joined
-to GameRelay's registry (heartbeats, drain, revoke, key rotation), measuring each other every
+to GameRelay's registry (heartbeats, drain, revoke, tickets), measuring each other every
 2 s. pion's and coturn's TURN clients and Chromium, Firefox and WebKit relay through it, over
 UDP, TCP and TLS.
 
@@ -43,8 +43,8 @@ UDP, TCP and TLS.
   CPU and 15–20× less memory per allocation ([benchmark](docs/BENCH-2026-09-29.md)).
 - **Closed by design.** It only relays between allocations of the same room on the same node,
   so it is never an open proxy, and it can't read what it relays.
-- **Credentials per node.** Each node's key is derived from the control plane's master and is
-  good for that node only.
+- **Credentials without shared secrets.** Any trusted issuer (a control plane, or a game's own
+  server) signs tickets that nodes check by key agreement, with rooms scoped by issuer.
 - **Gets through firewalls.** UDP, TCP and TLS on 443, reloading its certificate when it's
   renewed.
 - **Watches itself.** Nodes probe each other from their relay sockets, and the control plane
@@ -105,24 +105,27 @@ flowchart LR
 cargo build --release
 export TURN_PUBLIC_IP=<its public IP>        # where players reach it
 ./target/release/resonance-node join <token> # once: makes its key, registers it
-./target/release/resonance-node run          # fetches its own key; a heartbeat every 15 s
+./target/release/resonance-node run          # a heartbeat every 15 s
 ./target/release/resonance-node status
 ```
 
 The node's ed25519 key and registration stay in `RESONANCE_STATE_DIR` (default
 `/var/lib/resonance`); the key never leaves the box. `RESONANCE_CONTROL` is the control plane
 (default `https://gamerelay.io`). While it's active and heard from, the control plane hands it out
-to players; draining it stops new allocations, and revoking it stops the node. A rotated key
-takes over at the next heartbeat, with the old one still accepted for an hour.
+to players with tickets it signs, and tells it whose tickets to take; draining it stops new
+allocations, and revoking it stops the node.
 
-**By hand**, like the Go relay it replaces:
+**On its own** (self-hosted, no control plane): it takes the tickets of the issuers you name.
 
 ```sh
-TURN_SECRET=<this node's key> TURN_PUBLIC_IP=<its public IP> ./target/release/resonance-node
+./target/release/resonance-node issuer issuer.key   # makes an issuer key, prints its public key
+RESONANCE_ISSUERS=<that public key> TURN_PUBLIC_IP=<its public IP> ./target/release/resonance-node
+./target/release/resonance-node seal-key            # what tickets for this node are minted with
+./target/release/resonance-node mint issuer.key <seal key> <game> <room> <player>  # username, password
 ```
 
-The key comes from the control plane (in GameRelay, `bun apps/server/src/turn.ts key <id>`),
-which lists the node in `RESONANCE_NODES`.
+Your game's server mints tickets the same way (docs/PROTOCOL.md, "Tickets"); `mint` is the
+minimal version.
 
 Either way it listens on UDP 3478 (`TURN_PORT`). Relay addresses use ports 49152–65535
 (`TURN_MIN_PORT`, `TURN_MAX_PORT`), but nothing listens on them, so they need no firewall opening.

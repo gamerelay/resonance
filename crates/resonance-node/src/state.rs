@@ -1,6 +1,8 @@
 //! What a node keeps between runs, in RESONANCE_STATE_DIR (default /var/lib/resonance; the
 //! systemd unit's StateDirectory): its ed25519 key (`key`, 32 bytes, mode 0600, never leaves the
-//! box) and, once joined, who it is to the control plane (`node.json`).
+//! box), once joined, who it is to the control plane (`node.json`), and the issuers it was last
+//! told to trust (`issuers.json`), so a restart while the control plane is down still takes
+//! players' tickets.
 
 use std::fs;
 use std::io::Write;
@@ -44,7 +46,17 @@ impl State {
 
     /// This node's key, made on first use.
     pub fn key(&self) -> std::io::Result<SigningKey> {
-        let path = self.dir.join("key");
+        self.make_key("key", true)
+    }
+
+    /// An ed25519 key in this directory, made on first use: 32 bytes, mode 0600. The directory is
+    /// left as it is, unless it's made for the key.
+    pub fn key_at(&self, name: &str) -> std::io::Result<SigningKey> {
+        self.make_key(name, false)
+    }
+
+    fn make_key(&self, name: &str, private_dir: bool) -> std::io::Result<SigningKey> {
+        let path = self.dir.join(name);
         match fs::read(&path) {
             Ok(b) if b.len() == 32 => Ok(SigningKey::from_bytes(
                 b.as_slice().try_into().expect("32 bytes"),
@@ -54,8 +66,12 @@ impl State {
                 path.display()
             ))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // The node's state directory is private; another directory only if made for it.
+                let made = !self.dir.exists();
                 fs::create_dir_all(&self.dir)?;
-                fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))?;
+                if private_dir || made {
+                    fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))?;
+                }
                 let mut seed = [0u8; 32];
                 getrandom::fill(&mut seed).map_err(|e| std::io::Error::other(e.to_string()))?;
                 let mut f = fs::OpenOptions::new()
@@ -90,6 +106,26 @@ impl State {
         )?;
         fs::rename(tmp, self.dir.join("node.json"))
     }
+
+    /// The control plane's issuers last saved (base64url public keys); none if there's no file
+    /// yet.
+    pub fn issuers(&self) -> std::io::Result<Vec<String>> {
+        match fs::read(self.dir.join("issuers.json")) {
+            Ok(b) => serde_json::from_slice(&b).map_err(std::io::Error::other),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn save_issuers(&self, keys: &[String]) -> std::io::Result<()> {
+        fs::create_dir_all(&self.dir)?;
+        let tmp = self.dir.join("issuers.json.tmp");
+        fs::write(
+            &tmp,
+            serde_json::to_vec(keys).map_err(std::io::Error::other)?,
+        )?;
+        fs::rename(tmp, self.dir.join("issuers.json"))
+    }
 }
 
 #[cfg(test)]
@@ -120,6 +156,15 @@ mod tests {
         assert_eq!(mode, 0o600);
         fs::write(s.dir().join("key"), b"short").unwrap();
         assert!(s.key().is_err(), "a damaged key isn't replaced silently");
+        fs::remove_dir_all(s.dir()).unwrap();
+    }
+
+    #[test]
+    fn issuers_round_trip() {
+        let s = State::new(tmp());
+        assert_eq!(s.issuers().unwrap(), Vec::<String>::new());
+        s.save_issuers(&["a".into(), "b".into()]).unwrap();
+        assert_eq!(s.issuers().unwrap(), vec!["a".to_string(), "b".to_string()]);
         fs::remove_dir_all(s.dir()).unwrap();
     }
 

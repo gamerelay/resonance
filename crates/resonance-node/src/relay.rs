@@ -18,6 +18,7 @@ use mio::net::{TcpListener, TcpStream, UdpSocket};
 use mio::{Events, Interest, Poll, Registry, Token};
 use resonance_turn::counts::Counts;
 use resonance_turn::stream::{Frame, Framer, padding};
+use resonance_turn::ticket::Issuer;
 use resonance_turn::{Client, Output, Server};
 use rustls::{ServerConfig, ServerConnection};
 
@@ -56,8 +57,6 @@ pub struct Limits {
     pub max_streams: usize,
     /// Open streams from one IP (the core's per-IP allocation cap).
     pub max_streams_per_ip: usize,
-    /// How long a rotated-out node key is still accepted.
-    pub key_overlap: Duration,
     /// A stream that hasn't sent a whole message by then (its TLS handshake included) is closed.
     pub first_message: Duration,
     /// Silence after which a stream is closed: longer than any client leaves between refreshes.
@@ -71,7 +70,6 @@ impl Default for Limits {
         Limits {
             max_streams: 4096,
             max_streams_per_ip: 64,
-            key_overlap: Duration::from_secs(3600),
             first_message: Duration::from_secs(10),
             idle: Duration::from_secs(15 * 60),
             debug_streams: false,
@@ -656,8 +654,10 @@ impl Relay {
         while let Ok(c) = n.controls.try_recv() {
             match c {
                 Control::Peers(peers) => self.prober.set_peers(peers, now),
-                Control::Key(k) => self.server.set_node_key(k, now, self.limits.key_overlap),
                 Control::Accepting(yes) => self.server.set_accepting(yes),
+                Control::Issuers(keys) => self
+                    .server
+                    .set_issuers(keys.iter().filter_map(|k| Issuer::parse(k)).collect()),
                 Control::Exit => return false,
             }
         }

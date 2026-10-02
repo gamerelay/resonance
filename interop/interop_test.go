@@ -6,9 +6,6 @@ package interop
 
 import (
 	"bytes"
-	"crypto/hmac"
-	"crypto/sha1"
-	"encoding/base64"
 	"fmt"
 	"net"
 	"os"
@@ -17,17 +14,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gamerelay/resonance/interop/ticket"
 	"github.com/pion/turn/v4"
 )
 
-const nodeKey = "fiahLYMg85YkiFJQ0Xp3Bl0x3pXkUhI4nMU8jj6QRio"
-
-// The control plane's credentials (gamerelay.io apps/server/src/turn.ts).
+// A ticket for a test node (docs/PROTOCOL.md, "Tickets"): from the issuer it trusts, for its
+// sealing key.
 func credentials(room, player string) (string, string) {
-	user := fmt.Sprintf("%d:ins_x:%s:%s", time.Now().Add(time.Hour).Unix(), room, player)
-	mac := hmac.New(sha1.New, []byte(nodeKey))
-	mac.Write([]byte(user))
-	return user, base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	return ticket.Mint(ticket.Issuer, time.Now().Add(time.Hour).Unix(), "ins_x", room, player, ticket.SealPublic(ticket.NodeSeed))
 }
 
 func startNode(t *testing.T) string {
@@ -52,8 +46,12 @@ func startNodeWith(t *testing.T, env ...string) string {
 	}
 	port := l.LocalAddr().(*net.UDPAddr).Port
 	_ = l.Close()
+	state, err := ticket.StateDir(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	cmd := exec.Command(bin)
-	cmd.Env = append([]string{"TURN_SECRET=" + nodeKey, "TURN_PUBLIC_IP=127.0.0.1", fmt.Sprintf("TURN_PORT=%d", port)}, env...)
+	cmd.Env = append([]string{"RESONANCE_STATE_DIR=" + state, "RESONANCE_ISSUERS=" + ticket.IssuerPublic(), "TURN_PUBLIC_IP=127.0.0.1", fmt.Sprintf("TURN_PORT=%d", port)}, env...)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)

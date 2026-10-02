@@ -14,11 +14,10 @@ use crate::auth::{self, NonceCheck, Nonces, User};
 use crate::counts::Counts;
 use crate::limiter::{Bucket, Reflection};
 use crate::stun::{self, Class, Message, Writer, attr, method};
+use crate::ticket::{self, Issuer};
 
 pub struct Config {
     pub realm: String,
-    /// This node's own key (Resonance v0 §1). It mints credentials for this node only.
-    pub node_key: String,
     /// The address players reach this relay at, and the one relay addresses are named on.
     pub public_ip: IpAddr,
     /// Relay addresses are this IP with a port from here.
@@ -46,15 +45,18 @@ pub struct Config {
     pub grace: Duration,
     /// Makes nonces; any random bytes, new at each start.
     pub nonce_key: [u8; 32],
+    /// This node's sealing secret (`ticket::seal_secret`): tickets are accepted only with one.
+    pub seal: Option<[u8; 32]>,
+    /// Whose tickets are accepted (`Server::set_issuers` changes them).
+    pub issuers: Vec<Issuer>,
 }
 
 impl Config {
     /// The Go relay's limits (deploy/turn/main.go).
-    pub fn new(node_key: impl Into<String>, public_ip: IpAddr, nonce_key: [u8; 32]) -> Self {
+    pub fn new(public_ip: IpAddr, nonce_key: [u8; 32]) -> Self {
         let max_per_ip = 64;
         Config {
             realm: "gamerelay".into(),
-            node_key: node_key.into(),
             public_ip: public_ip.to_canonical(),
             min_port: 49152,
             max_port: 65535,
@@ -72,6 +74,8 @@ impl Config {
             channel_lifetime: Duration::from_secs(600),
             grace: Duration::from_secs(60),
             nonce_key,
+            seal: None,
+            issuers: Vec::new(),
         }
     }
 }
@@ -169,11 +173,19 @@ struct Allocation {
 }
 
 const NONE: u32 = u32::MAX;
+/// Checked tickets remembered (`Server::tickets`): about a player each.
+const TICKETS_KEPT: usize = 8192;
 
 pub struct Server {
     cfg: Config,
     nonces: Nonces,
     limiter: Reflection,
+    /// Ticket checks (a signature and a key agreement, ~40 µs) per IP, on every transport: a
+    /// client reusing one nonce can't make the loop do them faster than this.
+    ticket_checks: Reflection,
+    /// Tickets already checked, username to key: a player's allocations share one ticket, and
+    /// a replayed ticket costs a hash, not a check. Emptied when full.
+    tickets: HashMap<String, [u8; 16]>,
     allocs: Vec<Option<Allocation>>,
     free: Vec<u32>,
     by_client: HashMap<Client, u32>,
@@ -188,7 +200,6 @@ pub struct Server {
     stats: Stats,
     clock: (Instant, u64),
     /// The key before the last rotation, and until when it's still accepted.
-    previous_key: Option<(String, Instant)>,
     /// False while draining: no new allocations, existing ones carry on.
     accepting: bool,
 }
@@ -230,6 +241,8 @@ impl Server {
         Server {
             nonces: Nonces::new(cfg.nonce_key),
             limiter: Reflection::new(cfg.unauth_rate, cfg.unauth_burst, cfg.unauth_tracked),
+            ticket_checks: Reflection::new(cfg.unauth_rate, cfg.unauth_burst, cfg.unauth_tracked),
+            tickets: HashMap::new(),
             allocs: Vec::new(),
             free: Vec::new(),
             by_client: HashMap::new(),
@@ -242,7 +255,6 @@ impl Server {
             per_instance: Counts::default(),
             stats: Stats::default(),
             clock: (base, unix),
-            previous_key: None,
             accepting: true,
             cfg,
         }
@@ -255,14 +267,10 @@ impl Server {
         }
     }
 
-    /// A rotated node key (Resonance v0 §3): the old one is still accepted for `overlap`, as long
-    /// as credentials minted with it last.
-    pub fn set_node_key(&mut self, key: String, now: Instant, overlap: Duration) {
-        if key == self.cfg.node_key {
-            return;
-        }
-        let old = std::mem::replace(&mut self.cfg.node_key, key);
-        self.previous_key = Some((old, now + overlap));
+    /// Whose tickets are accepted from now on. An allocation made with another's is refused at
+    /// its next request, so it ends within a refresh.
+    pub fn set_issuers(&mut self, issuers: Vec<Issuer>) {
+        self.cfg.issuers = issuers;
     }
 
     /// While false (draining, or told to upgrade), new allocations get 508; existing ones carry on.
@@ -453,12 +461,19 @@ impl Server {
         if self.nonces.check(nonce, self.unix(now), from.addr) != NonceCheck::Ok {
             return Err(Refusal::unsigned(438));
         }
-        let Some(user) = auth::parse_username(username) else {
+        // A ticket (`t1:`) from an issuer this node trusts. One it no longer trusts ends at its
+        // allocations' next request, cached or not.
+        let Some(t) = ticket::parse(username) else {
             return Err(Refusal::unsigned(401));
         };
-        // No request succeeds past the credential's expiry, so an allocation outlives it by at
-        // most one lifetime.
-        if user.expiry <= self.unix(now) {
+        if !self.cfg.issuers.iter().any(|i| i.kid == t.kid) {
+            return Err(Refusal::unsigned(401));
+        }
+        let user = t.user();
+        // No request succeeds past the ticket's expiry, so an allocation outlives it by at most
+        // one lifetime. A ticket lasts a day at most.
+        let unix = self.unix(now);
+        if user.expiry <= unix || user.expiry > unix + ticket::MAX_LIFETIME_S + ticket::SKEW_S {
             return Err(Refusal::unsigned(401));
         }
         let existing = self.live_alloc(from, now);
@@ -466,28 +481,31 @@ impl Server {
             .map(|i| self.alloc(i))
             .filter(|a| a.username == username)
             .map(|a| a.key);
-        // The current node key, else (for an hour after a rotation) the previous one, since
-        // credentials minted just before it still arrive.
-        let derive = |node_key: &str| {
-            auth::long_term_key(
-                username,
-                &self.cfg.realm,
-                &auth::password(node_key, username),
-            )
+        // Its issuer's signature, then the password from its key and this node's sealing
+        // secret: only when nothing cached matches, so a refresh or a player's next allocation
+        // costs a hash, and only within the IP's budget.
+        let known = cached.or_else(|| self.tickets.get(username).copied());
+        let key = match known {
+            Some(k) => msg.integrity_ok(&k).then_some(k),
+            None if self.ticket_checks.allow(from.addr.ip(), now) => {
+                let k = self.cfg.seal.as_ref().and_then(|seal| {
+                    t.verify(&self.cfg.issuers)
+                        .then(|| t.password(seal))
+                        .flatten()
+                        .map(|p| auth::long_term_key(username, &self.cfg.realm, &p))
+                });
+                // Only a ticket that checked out, and was used with its password, is remembered.
+                let k = k.filter(|k| msg.integrity_ok(k));
+                if let Some(k) = k {
+                    if self.tickets.len() >= TICKETS_KEPT {
+                        self.tickets.clear();
+                    }
+                    self.tickets.insert(username.to_owned(), k);
+                }
+                k
+            }
+            None => None,
         };
-        let previous = self
-            .previous_key
-            .as_ref()
-            .filter(|(_, until)| *until > now)
-            .map(|(k, _)| k.as_str());
-        let key = [
-            cached,
-            Some(derive(&self.cfg.node_key)),
-            previous.map(derive),
-        ]
-        .into_iter()
-        .flatten()
-        .find(|k| msg.integrity_ok(k));
         let Some(key) = key else {
             return Err(Refusal::unsigned(401));
         };

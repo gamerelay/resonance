@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use resonance_turn::Output;
-use resonance_turn::auth::{long_term_key, password};
+use resonance_turn::auth::long_term_key;
 use resonance_turn::stun::{self, Class, Message, Writer, attr, method};
 
 mod common;
@@ -23,7 +23,7 @@ fn hex(s: &str) -> Vec<u8> {
 }
 
 fn key_of(name: &str) -> [u8; 16] {
-    long_term_key(name, "gamerelay", &password(KEY, name))
+    long_term_key(name, "gamerelay", &pass(name))
 }
 
 /// A signed answer: its MESSAGE-INTEGRITY checks out with name's key.
@@ -235,7 +235,7 @@ fn nothing_after_message_integrity_counts() {
         method::REFRESH,
         tx,
         &name,
-        &password(KEY, &name),
+        &pass(&name),
         "gamerelay",
         &[],
         None,
@@ -250,7 +250,7 @@ fn nothing_after_message_integrity_counts() {
         method::REFRESH,
         tx,
         &name,
-        &password(KEY, &name),
+        &pass(&name),
         "gamerelay",
         &[lifetime(600)],
         None,
@@ -263,7 +263,7 @@ fn nothing_after_message_integrity_counts() {
         method::CREATE_PERMISSION,
         tx,
         &name,
-        &password(KEY, &name),
+        &pass(&name),
         "gamerelay",
         &[],
         None,
@@ -426,7 +426,7 @@ fn auth_corner_cases() {
         438
     );
     // An overlong username (RFC 8489: under 513 bytes) isn't even hashed.
-    let long = format!("{}:ins:{}:p", UNIX + 3600, "r".repeat(600));
+    let long = ticket(UNIX + 3600, "ins", &"r".repeat(600), "p");
     assert_eq!(
         c.ask(
             &mut s,
@@ -668,7 +668,7 @@ fn retransmissions_at_browser_rates_are_harmless() {
     let mut s = server(t);
     let (mut a, _, _, rb) = pair(&mut s, t, "g1");
     let name = user("g1", "p_a");
-    let pw = password(KEY, &name);
+    let pw = pass(&name);
     for (m, attrs, peer) in [
         (method::REFRESH, vec![lifetime(600)], None),
         (method::CREATE_PERMISSION, vec![], Some(rb)),
@@ -693,7 +693,7 @@ fn retransmissions_at_browser_rates_are_harmless() {
         method::ALLOCATE,
         tx,
         &p_c,
-        &password(KEY, &p_c),
+        &pass(&p_c),
         "gamerelay",
         &[transport()],
         None,
@@ -767,7 +767,7 @@ fn a_firefox_shaped_client_works_on_send_and_data_alone() {
     // (with a fresh credential for the same room and player, and a fresh nonce after a 438).
     let late = t + Duration::from_secs(3600 + 30);
     s.tick(late);
-    let fresh = format!("{}:ins:g1:p_a", UNIX + 7200);
+    let fresh = ticket(UNIX + 7200, "ins", "g1", "p_a");
     assert_eq!(
         a.request(&mut s, late, method::REFRESH, &fresh, &[lifetime(3600)])
             .code(),

@@ -24,26 +24,31 @@ flowchart TB
   nodes -. "control plane down" .-> OPS
 ```
 
-The network has three roles:
+The network has four roles:
 
 - **Players.** A browser or a game using the SDK asks its game's server for relays. It gets each
-  live node's URLs and a short-lived credential for each. Both players of a pair pick the same
+  live node's URLs and a short-lived ticket, with a password for each node. Both players of a pair pick the same
   node, and their WebRTC traffic goes through it, DTLS end to end.
-- **The control plane.** It holds the registry (nodes, regions, statuses, key versions) and the
-  master key. It mints node keys and players' credentials, and it watches the nodes. GameRelay is
+- **The control plane.** It holds the registry (nodes, regions, statuses, sealing keys) and the
+  master key its issuer key is derived from. It signs players' tickets, tells nodes whose tickets
+  to take, and watches the nodes. GameRelay is
   the first one; the API is open, so another can be run (see "Where it's going" below).
 - **Nodes.** A node is one binary on a small VM. It relays for players, reports to the control
-  plane, and measures its peers. It holds its own ed25519 identity and a key that is good for
-  this node only.
+  plane, and measures its peers. It holds its own ed25519 identity, which its sealing key is
+  derived from.
+- **Issuers.** Anyone with an ed25519 key whose tickets a node trusts: a control plane, or a
+  game's own server. Tickets let several control planes, and self-hosted games, share nodes with
+  no secret in common (PROTOCOL.md, "Tickets").
 
 ## Trust
 
 | If this leaks | What it allows | What it doesn't |
 |---|---|---|
 | A player's credential | Relaying, for that room and player, on that node, until it expires | Any other room, player or node |
-| A node's TURN key | Minting credentials for that node | Any other node: each key is derived from the master and the node id |
-| A node's ed25519 key | Fetching that node's TURN key and heartbeating as it | Anything once the node is revoked in the admin |
-| The master | Everything | Lives only on the control plane |
+| A node's sealing secret | Computing the passwords for tickets sent to that node | Minting tickets: that takes an issuer's key |
+| An issuer's key | Minting tickets for its own games' rooms, on nodes that trust it | Any other issuer's rooms: rooms are scoped by issuer. Removing it from the trusted list ends its tickets |
+| A node's ed25519 key | Heartbeating as that node, and its sealing secret | Anything once the node is revoked in the admin |
+| The master | Minting tickets as the control plane's issuer | Lives only on the control plane |
 
 The design also holds the following:
 
@@ -103,11 +108,11 @@ read, handled and answered in one go.
 
 `control::Heartbeats` runs on its own thread and talks to the loop through two channels:
 
-- **To the loop**, `Control` messages: a new key, drain, revoke, the peer list.
+- **To the loop**, `Control` messages: drain, revoke, the peer list, the issuers to trust.
 - **From the loop**, a `Snapshot`: allocations, bytes, peer reports.
 
 Neither waits on the other. A control plane that is slow or down never stalls relaying; the node
-keeps its key and carries on. If it stays unreachable, the node raises its own alert.
+keeps its issuers and carries on. If it stays unreachable, the node raises its own alert.
 
 ### Settings
 
@@ -156,16 +161,27 @@ certificate rather than a test CA.
 
 ## Where it's going
 
-v0 is a relay network with one control plane. The order from here:
+The goal is resilience first: the network and its games keep working when any one control plane
+is down, and outlive any one operator. Fully open participation stays possible, but isn't the
+next step. The order from here:
 
 1. **Topology.** Nodes measure each other, and the network view shows it (done).
-2. **Private nodes.** A customer runs nodes for their own games, joined to the same control
+2. **Signed tickets from several issuers.** Any control plane, or a game's own server, mints
+   credentials that nodes check without a shared secret (done).
+3. **Node leases and several control planes.** A control plane signs each node a lease, valid for
+   days. Nodes and clients cache them and fail over between control planes, so the network
+   degrades slowly when all of them are down.
+4. **Gossip.** Nodes share who's alive and what they measure directly, not only through the
+   control plane.
+5. **Room homes.** Hashing a room id over the members picks a node both players reach without
+   asking anyone, and it carries their signaling. This is what lets games run with no control
    plane.
-3. **Gossip.** Nodes share what they measure directly, not only through the control plane.
-4. **Forwarding.** When players are far apart, a pair can relay over two nodes with a fast link
-   between them.
-5. **Distributed signaling.** If the control plane is down, the mesh keeps finding relays for
-   players on its own.
+6. **An embeddable module.** The sans-I/O core as a small library for apps: a client, an entry
+   point that helps nearby players find nodes, or a bridge from a LAN into the network.
+7. **Mesh mode.** No control plane at all.
+
+Later, if the network opens to anyone: trust earned from real traffic and peers' measurements,
+scored locally by each node rather than voted on, and credits for relaying.
 
 The control plane's API is versioned by date and changes additively within a version, so nodes
 from different releases keep working side by side throughout.

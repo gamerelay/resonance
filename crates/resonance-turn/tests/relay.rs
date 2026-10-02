@@ -6,8 +6,6 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use resonance_turn::auth::password;
-
 mod common;
 use common::*;
 use resonance_turn::stun::{Class, Message, Writer, attr, method};
@@ -46,7 +44,7 @@ fn a_retransmitted_allocate_gets_the_same_answer_and_another_gets_437() {
         method::ALLOCATE,
         tx,
         &name,
-        &password(KEY, &name),
+        &pass(&name),
         "gamerelay",
         &[transport()],
         None,
@@ -68,7 +66,7 @@ fn a_retransmitted_allocate_gets_the_same_answer_and_another_gets_437() {
         method::ALLOCATE,
         tx,
         &name,
-        &password(KEY, &name),
+        &pass(&name),
         "gamerelay",
         &[transport()],
         None,
@@ -98,7 +96,10 @@ fn bad_credentials_get_401_and_a_stale_nonce_438() {
         None,
     );
     assert_eq!(r.code(), 401, "wrong password");
-    let another_node = password("another-node-key-0123456789abcdef0123", &name);
+    let another_node = resonance_turn::ticket::parse(&name)
+        .unwrap()
+        .password(&resonance_turn::ticket::seal_secret(&[8; 32]))
+        .unwrap();
     assert_eq!(
         c.request_as(
             &mut s,
@@ -111,9 +112,9 @@ fn bad_credentials_get_401_and_a_stale_nonce_438() {
         )
         .code(),
         401,
-        "another node's key"
+        "another node's password for the same ticket"
     );
-    let expired = format!("{}:ins:g1:p_a", UNIX - 1);
+    let expired = ticket(UNIX - 1, "ins", "g1", "p_a");
     assert_eq!(
         c.request(&mut s, t, method::ALLOCATE, &expired, &[transport()])
             .code(),
@@ -136,7 +137,7 @@ fn bad_credentials_get_401_and_a_stale_nonce_438() {
         method::ALLOCATE,
         tx,
         &name,
-        &password(KEY, &name),
+        &pass(&name),
         "elsewhere",
         &[transport()],
         None,
@@ -148,8 +149,8 @@ fn bad_credentials_get_401_and_a_stale_nonce_438() {
     let req = c.build(
         method::ALLOCATE,
         tx,
-        &format!("{}:ins:g1:p_a", UNIX + 7200),
-        &password(KEY, &format!("{}:ins:g1:p_a", UNIX + 7200)),
+        &ticket(UNIX + 7200, "ins", "g1", "p_a"),
+        &pass(&ticket(UNIX + 7200, "ins", "g1", "p_a")),
         "gamerelay",
         &[transport()],
         None,
@@ -163,7 +164,7 @@ fn bad_credentials_get_401_and_a_stale_nonce_438() {
             &mut s,
             later,
             method::ALLOCATE,
-            &format!("{}:ins:g1:p_a", UNIX + 7200),
+            &ticket(UNIX + 7200, "ins", "g1", "p_a"),
             &[transport()]
         )
         .code(),
@@ -252,7 +253,7 @@ fn an_allocation_answers_only_to_its_room_and_player() {
     for name in [
         user("g2", "p_a"),
         user("g1", "p_b"),
-        format!("{}:other:g1:p_a", UNIX + 3600),
+        ticket(UNIX + 3600, "other", "g1", "p_a"),
     ] {
         assert_eq!(
             c.request(&mut s, t, method::REFRESH, &name, &[lifetime(600)])
@@ -279,7 +280,7 @@ fn an_allocation_answers_only_to_its_room_and_player() {
         401
     );
     // Its own room and player, even with a fresher credential, still work.
-    for name in [own.clone(), format!("{}:ins:g1:p_a", UNIX + 3660)] {
+    for name in [own.clone(), ticket(UNIX + 3660, "ins", "g1", "p_a")] {
         assert_eq!(
             c.request(&mut s, t, method::REFRESH, &name, &[lifetime(600)])
                 .code(),
@@ -298,7 +299,7 @@ fn no_refresh_succeeds_past_the_credentials_expiry() {
     let t = Instant::now();
     let mut s = server(t);
     let mut c = Client::new("198.51.100.1:5000");
-    let name = format!("{}:ins:g1:p_a", UNIX + 1);
+    let name = ticket(UNIX + 1, "ins", "g1", "p_a");
     c.allocate(&mut s, t, &name);
     let later = t + Duration::from_secs(2);
     assert_eq!(
@@ -386,7 +387,7 @@ fn quotas_per_player_ip_and_instance() {
             .code(),
         486
     );
-    let other_game = format!("{}:ins2:g1:p_a", UNIX + 3600);
+    let other_game = ticket(UNIX + 3600, "ins2", "g1", "p_a");
     Client::new("192.0.2.200:2").allocate(&mut s, t, &other_game);
     // A deletion gives its slot back.
     let mut first = Client::new("198.51.100.1:1");
@@ -793,53 +794,6 @@ fn junk_is_dropped_silently() {
     ] {
         assert!(c.send(&mut s, t, junk).is_empty(), "{junk:?}");
     }
-}
-
-#[test]
-fn a_rotated_key_takes_over_and_the_old_one_lasts_its_overlap() {
-    let t = Instant::now();
-    let mut s = server(t);
-    let name = user("g1", "p_a");
-    let new_key = "the-rotated-node-key-0123456789abcdef";
-    s.set_node_key(new_key.into(), t, Duration::from_secs(3600));
-    // Credentials minted with the old key still work for the overlap…
-    let mut old = Client::new("198.51.100.1:5000");
-    old.allocate(&mut s, t, &name);
-    // …and with the new one.
-    let mut fresh = Client::new("198.51.100.2:5000");
-    fresh.request(&mut s, t, method::REFRESH, &name, &[]);
-    let r = fresh.request_as(
-        &mut s,
-        t,
-        method::ALLOCATE,
-        &name,
-        &password(new_key, &name),
-        &[transport()],
-        None,
-    );
-    assert_eq!(r.code(), 0);
-    // After it, only the new key.
-    let later = t + Duration::from_secs(3601);
-    let mut late = Client::new("198.51.100.3:5000");
-    let other = format!("{}:ins:g1:p_b", UNIX + 7200);
-    assert_eq!(
-        late.request(&mut s, later, method::ALLOCATE, &other, &[transport()])
-            .code(),
-        401
-    );
-    assert_eq!(
-        late.request_as(
-            &mut s,
-            later,
-            method::ALLOCATE,
-            &other,
-            &password(new_key, &other),
-            &[transport()],
-            None
-        )
-        .code(),
-        0
-    );
 }
 
 #[test]
