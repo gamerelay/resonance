@@ -49,6 +49,10 @@
 //! - TURN_RATE_BYTES (131072) and TURN_BURST_BYTES (twice that): per allocation.
 //! - TURN_TICKET_CHECK_RATE (5000/s): ticket checks from all clients together, on top of each
 //!   IP's own budget (TURN_UNAUTH_RATE).
+//! - TURN_MEMORY_BYTES (64 MB) and TURN_MEMORY_PER_IP_BYTES (4 MB): what clients may make the
+//!   node hold (allocations, checked tickets, streams' queues and half-read messages), all
+//!   together and from one IP. Past it a charge is refused (an Allocate gets 508, a message
+//!   isn't queued), and past three quarters the streams holding the most are closed.
 
 use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
 use std::sync::mpsc;
@@ -305,7 +309,7 @@ fn run_node(s: Settings) {
         cfg.max_port
     );
     eprintln!(
-        "limits: {} allocations per player, {} per IP, {} per game, {} per issuer; {} B/s per allocation (burst {}); unauthenticated answers {}/s per IP (burst {}); ticket checks {}/s",
+        "limits: {} allocations per player, {} per IP, {} per game, {} per issuer; {} B/s per allocation (burst {}); unauthenticated answers {}/s per IP (burst {}); ticket checks {}/s; memory {} MB ({} KB per IP)",
         cfg.max_per_player,
         cfg.max_per_ip,
         cfg.max_per_instance,
@@ -314,7 +318,9 @@ fn run_node(s: Settings) {
         cfg.burst_bytes,
         cfg.unauth_rate,
         cfg.unauth_burst,
-        cfg.ticket_check_rate
+        cfg.ticket_check_rate,
+        cfg.memory_total / (1024 * 1024),
+        cfg.memory_per_ip / 1024
     );
     // It returns once the control plane revokes this node.
     relay::run(

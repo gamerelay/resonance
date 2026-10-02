@@ -6,6 +6,26 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
 
 ## 2026-10-02
 
+**One memory budget** (TECH_DEBT C1). Everything a client can make the node hold is charged to
+one budget, to the client's IP and to everyone's total, and a charge that doesn't fit is
+refused, never allocated (`resonance_turn::budget`).
+
+- What's charged: allocations (about 1.15 KB each, their channels' room reserved up front so
+  they never grow), the checked tickets kept (about 250 B each), and each stream's queue and
+  half-read message.
+- What's refused past it: an Allocate (508, as for no free port; a fresher, longer ticket on a
+  refresh too), keeping a checked ticket (it's still checked), queuing a message (dropped whole),
+  and a stream's read (the stream is closed).
+- `TURN_MEMORY_BYTES` (64 MB) and `TURN_MEMORY_PER_IP_BYTES` (4 MB). They replace the streams'
+  own totals (16 MB queued, 32 MB held): past three quarters of the budget, the streams holding
+  the most are closed until it's under half.
+- A full node's allocations take about 19 MB of it, one IP's 64 allocations about 75 KB.
+- Tests: the budget itself; an IP past its share and everyone past the total refused with 508,
+  and room again once one ends; what ends gives back exactly what it took (several rounds, and
+  expiry); queues stopping at an IP's share and the total; streams sitting on half a message
+  closed by the sweep while a reader stays, and new streams answered after (each fails without
+  its fix: the sweep, the refund on close).
+
 **v0.2.0.** The first release since tickets, which broke the control-plane API in place
 (2026-10-01): a build's `software` now says which side of that it's on. Everything below, as
 in production on both nodes (`afb2677`), plus the docs and dependency updates since (#12–#14),

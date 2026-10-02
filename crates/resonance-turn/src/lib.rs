@@ -3,6 +3,7 @@
 //! owns the sockets.
 
 pub mod auth;
+pub mod budget;
 pub mod counts;
 pub mod limiter;
 pub mod server;

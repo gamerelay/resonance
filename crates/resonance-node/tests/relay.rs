@@ -21,13 +21,24 @@ struct Node {
 
 /// A node on loopback with TCP, and its settings changed by `f`.
 fn start(network: Option<Network>, f: impl FnOnce(&mut Limits)) -> Node {
+    start_with(network, f, |_| {})
+}
+
+/// The same, with the core's settings changed by `g` too.
+fn start_with(
+    network: Option<Network>,
+    f: impl FnOnce(&mut Limits),
+    g: impl FnOnce(&mut Config),
+) -> Node {
     let ip = IpAddr::from([127, 0, 0, 1]);
     let udp = UdpSocket::bind((ip, 0)).unwrap();
     let tcp = TcpListener::bind((ip, 0)).unwrap();
     let (udp_addr, tcp_addr) = (udp.local_addr().unwrap(), tcp.local_addr().unwrap());
     let mut limits = Limits::default();
     f(&mut limits);
-    let server = Server::new(Config::new(ip, [7; 32]));
+    let mut cfg = Config::new(ip, [7; 32]);
+    g(&mut cfg);
+    let server = Server::new(cfg);
     let listeners = Listeners {
         udp,
         tcp: Some(tcp),
@@ -59,7 +70,10 @@ fn bind(s: &mut TcpStream) {
 
 /// Whether the node hangs up on `s` within `wait` (reading and discarding anything else).
 fn hung_up(s: &mut TcpStream, wait: Duration) -> bool {
-    s.set_read_timeout(Some(wait)).unwrap();
+    // macOS refuses socket options on a connection already reset.
+    if s.set_read_timeout(Some(wait)).is_err() {
+        return true;
+    }
     let mut buf = [0u8; 1500];
     loop {
         match s.read(&mut buf) {
@@ -118,12 +132,15 @@ fn flood(s: &mut TcpStream, n: usize) {
 #[test]
 fn streams_that_send_and_never_read_are_closed_and_a_reader_is_kept() {
     // The review of 2026-10-01: answers queued for clients that never read them filled the node.
-    // Small totals here, so a few streams are enough to pass them.
-    let node = start(None, |l| {
-        l.max_streams_per_ip = 16;
-        l.queued_total = 256 * 1024;
-        l.held_total = 256 * 1024;
-    });
+    // A small memory budget here (all of it this IP's), so a few streams are enough to fill it.
+    let node = start_with(
+        None,
+        |l| l.max_streams_per_ip = 16,
+        |c| {
+            c.memory_total = 512 * 1024;
+            c.memory_per_ip = 512 * 1024;
+        },
+    );
     let mut reader = TcpStream::connect(node.tcp).unwrap();
     bind(&mut reader);
     let mut hoarders: Vec<TcpStream> = (0..8).map(|_| small_reader(node.tcp)).collect();
@@ -142,6 +159,55 @@ fn streams_that_send_and_never_read_are_closed_and_a_reader_is_kept() {
         }
     }
     assert!(closed >= 4, "only {closed} of 8 hoarders were closed");
+    bind(&mut reader);
+    // What the closed streams held was given back: new ones are answered.
+    for _ in 0..4 {
+        let mut s = TcpStream::connect(node.tcp).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        bind(&mut s);
+    }
+}
+
+#[test]
+fn streams_sitting_on_half_a_message_are_closed_once_the_memory_budget_is_nearly_full() {
+    // TECH_DEBT C1: what a stream holds is charged to the memory budget, and past three quarters
+    // of it the streams holding the most are closed. These never read again, so only that sweep
+    // can close them.
+    let node = start_with(
+        None,
+        |l| {
+            l.max_streams_per_ip = 16;
+            l.first_message = Duration::from_secs(60);
+        },
+        |c| {
+            c.memory_total = 512 * 1024;
+            c.memory_per_ip = 512 * 1024;
+        },
+    );
+    let mut reader = TcpStream::connect(node.tcp).unwrap();
+    bind(&mut reader);
+    // A STUN header for a 60 KB message, and 56 KB of it: about 448 KB held, past 384 KB.
+    let mut half = vec![0x00, 0x01, 0xF0, 0x00, 0x21, 0x12, 0xA4, 0x42];
+    half.extend_from_slice(&[7; 12]);
+    half.resize(20 + 56 * 1024, 0);
+    let mut sitters: Vec<TcpStream> = (0..8)
+        .map(|_| {
+            let mut s = TcpStream::connect(node.tcp).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            bind(&mut s);
+            s.write_all(&half).unwrap();
+            s
+        })
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut closed = 0;
+    for s in &mut sitters {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if hung_up(s, left.max(Duration::from_millis(100))) {
+            closed += 1;
+        }
+    }
+    assert!((3..8).contains(&closed), "{closed} of 8 closed");
     bind(&mut reader);
 }
 

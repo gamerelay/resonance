@@ -6,18 +6,17 @@
 //! core sends it is queued on it, and when it closes its allocation goes with it. A slow stream
 //! drops what doesn't fit in its queue, whole messages at a time, as UDP would.
 
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr};
-use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mio::net::{TcpListener, TcpStream, UdpSocket};
 use mio::{Events, Interest, Poll, Registry, Token};
+use resonance_turn::budget::Budget;
 use resonance_turn::counts::Counts;
 use resonance_turn::stream::{Frame, Framer, padding};
 use resonance_turn::ticket::Issuer;
@@ -64,12 +63,6 @@ pub struct Limits {
     pub max_streams: usize,
     /// Open streams from one IP.
     pub max_streams_per_ip: usize,
-    /// What all streams' queues may hold together: past it, messages are dropped whole.
-    pub queued_total: usize,
-    /// What all streams may hold together (queues and messages being read), checked once a
-    /// second: past it, the streams holding the most are closed, so a client that sends and
-    /// never reads can't keep the memory.
-    pub held_total: usize,
     /// A stream that hasn't sent a whole message by then (its TLS handshake included) is closed.
     pub first_message: Duration,
     /// Silence after which a stream is closed: longer than any client leaves between refreshes.
@@ -83,8 +76,6 @@ impl Default for Limits {
         Limits {
             max_streams: 1024,
             max_streams_per_ip: 64,
-            queued_total: 16 * 1024 * 1024,
-            held_total: 32 * 1024 * 1024,
             first_message: Duration::from_secs(10),
             idle: Duration::from_secs(15 * 60),
             debug_streams: false,
@@ -92,59 +83,39 @@ impl Default for Limits {
     }
 }
 
-/// What all streams have queued, shared by their outboxes (one thread: a Cell will do).
-#[derive(Clone)]
-struct Queued {
-    now: Rc<Cell<usize>>,
-    cap: usize,
-}
+/// A stream holding less than this isn't one the sweep closes (`close_hoarders`): a client that
+/// reads what it's sent holds about a message.
+const HOARDING: usize = 16 * 1024;
 
 /// What a stream has waiting to go out: whole messages, each padded as a stream needs.
 struct Outbox {
     /// Plaintext not yet taken: by the socket (TCP), or by rustls (TLS, which takes more only once
     /// it has written what it has, so the two together stay near QUEUE_CAP).
     bytes: Vec<u8>,
-    total: Queued,
 }
 
 impl Outbox {
-    fn new(total: Queued) -> Self {
-        Outbox {
-            bytes: Vec::new(),
-            total,
-        }
+    fn new() -> Self {
+        Outbox { bytes: Vec::new() }
     }
 
-    /// One message, or false if it didn't fit in this stream's queue or in all streams' (dropped
-    /// whole, as UDP would).
-    fn push(&mut self, packet: &[u8]) -> bool {
+    /// One message, or false if it didn't fit in this stream's queue or in the memory budget
+    /// (`ip`'s share, or everyone's): dropped whole, as UDP would. What's queued is charged to
+    /// `ip` here; the stream gives it back as it's sent (`Stream::settle_charge`).
+    fn push(&mut self, packet: &[u8], memory: &mut Budget, ip: IpAddr) -> bool {
         let pad = padding(packet);
         let n = packet.len() + pad.len();
-        let all = self.total.now.get();
-        if self.bytes.len() + n > QUEUE_CAP || all + n > self.total.cap {
+        if self.bytes.len() + n > QUEUE_CAP || !memory.charge(ip, n) {
             return false;
         }
         self.bytes.extend_from_slice(packet);
         self.bytes.extend_from_slice(pad);
-        self.total.now.set(all + n);
         true
     }
 
     /// The first `n` bytes went out.
     fn sent(&mut self, n: usize) {
         self.bytes.drain(..n);
-        self.total.now.set(self.total.now.get() - n);
-    }
-
-    /// What it holds in memory: what's waiting, and room it kept.
-    fn held(&self) -> usize {
-        self.bytes.capacity()
-    }
-}
-
-impl Drop for Outbox {
-    fn drop(&mut self) {
-        self.total.now.set(self.total.now.get() - self.bytes.len());
     }
 }
 
@@ -154,6 +125,8 @@ struct Stream {
     tls: Option<ServerConnection>,
     framer: Framer,
     queue: Outbox,
+    /// What it's charged in the memory budget: its queue as pushed, and its framer's room.
+    charged: usize,
     opened: Instant,
     heard: Instant,
     spoke: bool,
@@ -164,6 +137,31 @@ struct Stream {
 impl Stream {
     fn token(&self) -> Token {
         Token(self.client.conn as usize + STREAMS)
+    }
+
+    /// What it holds now: what waits in its queue, and its framer's room.
+    fn holds(&self) -> usize {
+        self.queue.bytes.len() + self.framer.held()
+    }
+
+    /// Brings its charge to what it holds now. False (and nothing changed) if it grew past the
+    /// budget; shrinking always works.
+    fn settle_charge(&mut self, memory: &mut Budget) -> bool {
+        let (had, now) = (self.charged, self.holds());
+        if !memory.recharge(self.client.addr.ip(), had, now) {
+            return false;
+        }
+        self.charged = now;
+        true
+    }
+
+    /// One message on its queue, charged.
+    fn push(&mut self, packet: &[u8], memory: &mut Budget) -> bool {
+        let ok = self.queue.push(packet, memory, self.client.addr.ip());
+        if ok {
+            self.charged += packet.len() + padding(packet).len();
+        }
+        ok
     }
 
     /// Writes what it can without blocking. Err: the stream is broken.
@@ -200,9 +198,14 @@ impl Stream {
         }
     }
 
-    /// Flushes, then asks for WRITABLE while something still waits, READABLE alone otherwise.
-    fn settle(&mut self, registry: &Registry) -> io::Result<()> {
-        self.flush()?;
+    /// Flushes (giving back what went out), then asks for WRITABLE while something still waits,
+    /// READABLE alone otherwise.
+    fn settle(&mut self, registry: &Registry, memory: &mut Budget) -> io::Result<()> {
+        let flushed = self.flush();
+        if self.holds() < self.charged {
+            self.settle_charge(memory);
+        }
+        flushed?;
         let want =
             !self.queue.bytes.is_empty() || self.tls.as_ref().is_some_and(|t| t.wants_write());
         if want != self.waiting {
@@ -276,8 +279,10 @@ enum Why {
     /// No whole message by `first_message`.
     Silent,
     Idle,
-    /// Among the streams holding the most when all of them held past `held_total`.
+    /// Among the streams holding the most when the memory budget was nearly full.
     Hoarding,
+    /// What it read wouldn't fit in the memory budget.
+    OverBudget,
     Error(io::Error),
 }
 
@@ -289,6 +294,7 @@ impl fmt::Display for Why {
             Why::Silent => write!(f, "no message in time"),
             Why::Idle => write!(f, "idle"),
             Why::Hoarding => write!(f, "held too much (sent and didn't read)"),
+            Why::OverBudget => write!(f, "past the memory budget"),
             Why::Error(e) => write!(f, "{e}"),
         }
     }
@@ -298,7 +304,6 @@ impl fmt::Display for Why {
 struct Links {
     udp: UdpSocket,
     streams: HashMap<u32, Stream>,
-    queued: Queued,
     /// Streams something was just queued on, written after each piece of work.
     touched: Vec<u32>,
     bytes_in: u64,
@@ -306,12 +311,12 @@ struct Links {
 }
 
 impl Links {
-    fn send(&mut self, to: Client, packet: &[u8]) {
+    fn send(&mut self, to: Client, packet: &[u8], memory: &mut Budget) {
         let sent = if to.conn == Client::UDP {
             // A full send buffer or an unreachable client is a lost packet, as UDP allows.
             self.udp.send_to(packet, to.addr).is_ok()
         } else if let Some(s) = self.streams.get_mut(&to.conn) {
-            let ok = s.queue.push(packet);
+            let ok = s.push(packet, memory);
             if ok {
                 self.touched.push(to.conn);
             }
@@ -397,10 +402,6 @@ impl Relay {
             links: Links {
                 udp,
                 streams: HashMap::new(),
-                queued: Queued {
-                    now: Rc::new(Cell::new(0)),
-                    cap: limits.queued_total,
-                },
                 touched: Vec::new(),
                 bytes_in: 0,
                 bytes_out: 0,
@@ -481,7 +482,7 @@ impl Relay {
                     self.out.clear();
                     self.server.handle(now, from, &self.buf[..n], &mut self.out);
                     for (to, packet) in self.out.sends() {
-                        self.links.send(to, packet);
+                        self.links.send(to, packet, self.server.memory_mut());
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
@@ -544,7 +545,8 @@ impl Relay {
             },
             tls: tls_conn,
             framer: Framer::default(),
-            queue: Outbox::new(self.links.queued.clone()),
+            queue: Outbox::new(),
+            charged: 0,
             opened: now,
             heard: now,
             spoke: false,
@@ -601,6 +603,10 @@ impl Relay {
             let mut budget = STREAM_BUDGET;
             loop {
                 let fill = s.fill_some(&mut self.buf);
+                // A message half read is held too: past the budget, the stream goes.
+                if !s.settle_charge(self.server.memory_mut()) {
+                    return Err(Why::OverBudget);
+                }
                 // What arrived before an end or an error still counts (a last Refresh).
                 self.take_messages(s, now)?;
                 match fill.map_err(Why::Error)? {
@@ -616,7 +622,8 @@ impl Relay {
                 }
             }
         }
-        s.settle(self.poll.registry()).map_err(Why::Error)
+        s.settle(self.poll.registry(), self.server.memory_mut())
+            .map_err(Why::Error)
     }
 
     /// Hands each whole message to the core and routes its answers.
@@ -631,8 +638,8 @@ impl Relay {
             for (to, packet) in self.out.sends() {
                 // This stream is out of the map: its own answers go straight on its queue.
                 if to.conn != s.client.conn {
-                    self.links.send(to, packet);
-                } else if s.queue.push(packet) {
+                    self.links.send(to, packet, self.server.memory_mut());
+                } else if s.push(packet, self.server.memory_mut()) {
                     self.links.bytes_out += packet.len() as u64;
                 }
             }
@@ -651,7 +658,7 @@ impl Relay {
             let Some(s) = self.links.streams.get_mut(conn) else {
                 continue;
             };
-            if let Err(e) = s.settle(self.poll.registry()) {
+            if let Err(e) = s.settle(self.poll.registry(), self.server.memory_mut()) {
                 if let Some(s) = self.links.streams.remove(conn) {
                     self.close(s, Why::Error(e));
                 }
@@ -666,6 +673,9 @@ impl Relay {
             eprintln!("stream {}: {why}", s.client.conn);
         }
         let _ = self.poll.registry().deregister(&mut s.socket);
+        self.server
+            .memory_mut()
+            .refund(s.client.addr.ip(), s.charged);
         self.server.closed(s.client);
         self.per_ip.release(&s.client.addr.ip());
     }
@@ -724,30 +734,30 @@ impl Relay {
         true
     }
 
-    /// Past `held_total` for all streams together, closes the ones holding the most until they're
-    /// back under three quarters of it. A client that reads what it's sent holds next to nothing,
-    /// so these are the ones sending and not reading, or sitting on half a message.
+    /// Past three quarters of the memory budget, closes the streams holding the most until it's
+    /// back under half, so new players have room. A client that reads what it's sent holds about
+    /// a message, so these are the ones sending and not reading, or sitting on half a message;
+    /// streams holding less than HOARDING are left alone.
     fn close_hoarders(&mut self) {
-        let held = |s: &Stream| s.queue.held() + s.framer.held();
-        let total: usize = self.links.streams.values().map(held).sum();
-        if total <= self.limits.held_total {
+        let m = self.server.memory();
+        if m.used() <= m.total() / 4 * 3 {
             return;
         }
+        let target = m.total() / 2;
         let mut by_size: Vec<(usize, u32)> = self
             .links
             .streams
             .iter()
-            .map(|(&c, s)| (held(s), c))
+            .map(|(&c, s)| (s.charged, c))
+            .filter(|&(size, _)| size >= HOARDING)
             .collect();
         by_size.sort_unstable_by(|a, b| b.cmp(a));
-        let (mut left, target) = (total, self.limits.held_total / 4 * 3);
-        for (size, conn) in by_size {
-            if left <= target {
+        for (_, conn) in by_size {
+            if self.server.memory().used() <= target {
                 break;
             }
             if let Some(s) = self.links.streams.remove(&conn) {
                 self.close(s, Why::Hoarding);
-                left -= size;
             }
         }
     }
@@ -777,38 +787,42 @@ impl Relay {
 mod tests {
     use super::*;
 
-    fn total(cap: usize) -> Queued {
-        Queued {
-            now: Rc::new(Cell::new(0)),
-            cap,
-        }
+    fn ip(n: u8) -> IpAddr {
+        IpAddr::from([192, 0, 2, n])
     }
 
     #[test]
-    fn a_queue_drops_past_its_own_cap_and_frees_what_it_sends() {
-        let all = total(usize::MAX);
-        let mut q = Outbox::new(all.clone());
+    fn a_queue_drops_past_its_own_cap_and_charges_what_it_takes() {
+        let mut memory = Budget::new(usize::MAX, usize::MAX);
+        let mut q = Outbox::new();
         let m = [0u8; 1000];
         let fits = QUEUE_CAP / 1000;
         for _ in 0..fits {
-            assert!(q.push(&m));
+            assert!(q.push(&m, &mut memory, ip(1)));
         }
-        assert!(!q.push(&m), "past QUEUE_CAP: dropped whole");
-        assert_eq!(all.now.get(), fits * 1000);
-        q.sent(500);
-        assert_eq!(all.now.get(), fits * 1000 - 500);
-        drop(q);
-        assert_eq!(all.now.get(), 0, "a closed stream's queue is given back");
+        assert!(
+            !q.push(&m, &mut memory, ip(1)),
+            "past QUEUE_CAP: dropped whole"
+        );
+        assert_eq!(memory.of(ip(1)), fits * 1000, "and not charged");
     }
 
     #[test]
-    fn all_queues_together_stop_at_the_total() {
-        let all = total(3000);
-        let (mut a, mut b) = (Outbox::new(all.clone()), Outbox::new(all.clone()));
+    fn queues_stop_at_their_ips_share_and_at_everyones_total() {
+        let mut memory = Budget::new(3000, 2000);
+        let (mut a, mut b, mut c) = (Outbox::new(), Outbox::new(), Outbox::new());
         let m = [0u8; 1000];
-        assert!(a.push(&m) && a.push(&m) && b.push(&m));
-        assert!(!b.push(&m), "the total is reached, whichever stream it is");
-        a.sent(1000);
-        assert!(b.push(&m), "and there's room once some goes out");
+        assert!(a.push(&m, &mut memory, ip(1)) && b.push(&m, &mut memory, ip(1)));
+        assert!(
+            !b.push(&m, &mut memory, ip(1)),
+            "its IP's share, whichever stream it is"
+        );
+        assert!(c.push(&m, &mut memory, ip(2)));
+        assert!(!c.push(&m, &mut memory, ip(2)), "everyone's total");
+        memory.refund(ip(1), 1000);
+        assert!(
+            c.push(&m, &mut memory, ip(2)),
+            "room once some is given back"
+        );
     }
 }
