@@ -4,14 +4,13 @@
 //
 //	go run ./cmd/bench -relay ../target/release/resonance-node -pairs 200 -rate 60 -size 200
 //
-// Both relays read the same variables (TURN_SECRET, TURN_PUBLIC_IP, TURN_PORT, TURN_MIN_PORT,
-// TURN_MAX_PORT), so any build of either can be measured the same way.
+// Players hold tickets (docs/PROTOCOL.md, "Tickets"), so it measures builds that take them: a
+// node with a state directory of the test seed, trusting the test issuer (interop/ticket). Builds
+// from before tickets (v0.1.0, and gamerelay.io's Go relay) take the shared-key credentials of
+// this file at v0.1.0.
 package main
 
 import (
-	"crypto/hmac"
-	"crypto/sha1"
-	"encoding/base64"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -27,16 +26,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gamerelay/resonance/interop/ticket"
 	"github.com/pion/turn/v4"
 )
 
-const nodeKey = "fiahLYMg85YkiFJQ0Xp3Bl0x3pXkUhI4nMU8jj6QRio"
-
 func credentials(room, player string) (string, string) {
-	user := fmt.Sprintf("%d:ins_bench:%s:%s", time.Now().Add(time.Hour).Unix(), room, player)
-	mac := hmac.New(sha1.New, []byte(nodeKey))
-	mac.Write([]byte(user))
-	return user, base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	return ticket.Mint(ticket.Issuer, time.Now().Add(time.Hour).Unix(), "ins_bench", room, player, ticket.SealPublic(ticket.NodeSeed))
 }
 
 type side struct {
@@ -133,8 +128,13 @@ func main() {
 	lim.Cur = min(lim.Max, 65536)
 	_ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &lim)
 
+	state, err := ticket.StateDir("")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer os.RemoveAll(state)
 	cmd := exec.Command(*bin)
-	cmd.Env = []string{"TURN_SECRET=" + nodeKey, "TURN_PUBLIC_IP=127.0.0.1", fmt.Sprintf("TURN_PORT=%d", *port), "TURN_MIN_PORT=40000", "TURN_MAX_PORT=59999"}
+	cmd.Env = []string{"RESONANCE_STATE_DIR=" + state, "RESONANCE_ISSUERS=" + ticket.IssuerPublic(), "TURN_PUBLIC_IP=127.0.0.1", fmt.Sprintf("TURN_PORT=%d", *port), "TURN_MIN_PORT=40000", "TURN_MAX_PORT=59999"}
 	if err := cmd.Start(); err != nil {
 		log.Fatal(err)
 	}

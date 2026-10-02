@@ -11,9 +11,13 @@ control-plane side.
 ## Where things stand
 
 - **v0's node is done and in production.** The room-scoped TURN relay (UDP, and TCP and TLS),
-  joined to GameRelay's registry: join, key, heartbeats, drain, revoke, key rotation. Both
-  nodes run `f7e553f` (2026-09-30): they measure each other (about 62 ms between SF and NYC,
+  joined to GameRelay's registry: join, heartbeats, drain, revoke. Both nodes run `f7e553f`
+  (2026-09-30), from before tickets: they measure each other (about 62 ms between SF and NYC,
   in GameRelay's Admin → Network), and both have `RESONANCE_ALERT_WEBHOOK` set.
+- **Players' credentials are tickets** since 2026-10-01 (PR #7; docs/PROTOCOL.md, "Tickets"):
+  the shared-key credentials are gone. A control plane that mints only tickets doesn't hand out
+  a node that hasn't sent its sealing key, so deploy the control plane, then redeploy each node
+  (no env change: a leftover `TURN_SECRET` is ignored, and said to be).
 - **GameRelay is the only control plane** (`https://gamerelay.io/resonance/v0/…`, API
   `2026-09-29`). Nodes are minted, drained and revoked in its Admin → Nodes tab.
 - CI (`.github/workflows/ci.yml`) is green: the core's tests and a fuzz run, pion's and coturn's

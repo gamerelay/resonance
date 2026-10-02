@@ -5,8 +5,8 @@ A node speaks two protocols:
 1. **TURN to players** (RFC 8656 on RFC 8489's STUN): players' browsers and SDKs reach each other
    through it. It's the standard protocol with one rule added: an allocation can only reach
    another allocation of the same room on the same node.
-2. **HTTP to the control plane**: the node joins the network, fetches its key and sends a
-   heartbeat every 15 s. Requests are signed with the node's ed25519 key. The wire types are in
+2. **HTTP to the control plane**: the node joins the network and sends a heartbeat every 15 s;
+   the answer says whose tickets to take. Requests are signed with the node's ed25519 key. The wire types are in
    [`resonance-proto`](../crates/resonance-proto/src/lib.rs).
 
 The design and the reasons behind it are in [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -45,16 +45,12 @@ when it closes.
 | Send / Data | indication | |
 | ChannelData | | Over UDP, TCP and TLS |
 
-### Credentials
+### Credentials: tickets
 
-A node takes two kinds of credential: **tickets**, which any issuer it trusts can mint, and the
-control plane's own **HMAC credentials**, which only work on one node.
-
-#### Tickets
-
-An issuer is an ed25519 key: a control plane, or a game's own server. A ticket names a room and
-a player, and is signed by its issuer. The password comes from key agreement with the node, so
-the node checks a ticket without sharing any secret with whoever minted it.
+A player's credential is a **ticket**. An issuer is an ed25519 key: a control plane, or a game's
+own server. A ticket names a room and a player, and is signed by its issuer. The password comes
+from key agreement with the node, so the node checks a ticket without sharing any secret with
+whoever minted it.
 
 ```
 username = t1:<expiry>:<instance>:<room>:<player>:<kid>:<eph>:<sig>
@@ -63,6 +59,7 @@ eph      = base64url( a fresh X25519 public key, one per ticket )
 sig      = base64url( ed25519(issuer, "resonance/ticket/v1\n" + everything before ":<sig>") )
 password = base64url( HMAC-SHA256( X25519(eph secret, node sealing key),
                                    "resonance/ticket/v1\n" + everything before ":<sig>" ) )
+key      = MD5( username ":" realm ":" password )        # RFC 8489 §9.2.2, realm "gamerelay"
 ```
 
 - **One ticket for every node.** Each node gets its own password from the same username: the
@@ -71,54 +68,33 @@ password = base64url( HMAC-SHA256( X25519(eph secret, node sealing key),
   use without its password.
 - **The sealing key** is X25519, derived from the node's ed25519 seed:
   `HMAC-SHA256(seed, "resonance/seal/v1")`. Its public half goes with the join and every
-  heartbeat (`seal_key`), and `resonance-node status` prints it.
-- **Rooms are scoped by issuer.** On the node, a ticket's game is `<kid>/<instance>`, so one
-  issuer can't mint a ticket into another issuer's rooms. The exception is the control plane's
-  own issuer, which it marks `home`. Its tickets name rooms as its HMAC credentials do, so while
-  a node switches from HMAC to tickets, players in one room holding different kinds still reach
-  each other.
+  heartbeat (`seal_key`). `resonance-node seal-key` and `status` print it.
+- **Rooms are scoped.** The instance, room and player must be non-empty and colon-free. On the
+  node, a ticket's game is `<kid>/<instance>`, so two games' rooms never collide and one issuer
+  can't mint a ticket into another issuer's rooms. An allocation answers only to the room and
+  player it was made for.
 - **Limits.** A ticket lasts at most a day (plus 5 minutes for an issuer's clock running ahead).
   A node refuses tickets from issuers it doesn't trust, and an issuer it stops trusting is
   refused at its allocations' next request.
 - **Cost.** Checking a ticket (a signature and a key agreement, about 40 µs) is budgeted per IP,
   on every transport, like unsigned answers. A ticket that checked out is remembered, so a
   player's other allocations, and a ticket replayed with a wrong password, cost a hash.
-- **The sealing key goes with every heartbeat.** A heartbeat without one (a node rolled back to a
-  build without tickets) tells the control plane to stop minting tickets for it. A control plane
-  refuses a key that gives no shared secret (a low-order point).
+- **The sealing key goes with every heartbeat.** A heartbeat without one (a build from before
+  tickets) tells the control plane to stop handing the node out. A control plane refuses a key
+  that gives no shared secret (a low-order point).
 - **Whom a node trusts.** Its own `RESONANCE_ISSUERS` (ed25519 public keys, base64url,
   comma-separated), and the issuers its control plane lists in each heartbeat's answer. It saves
   the control plane's last list (`issuers.json` in its state directory; its own come from
-  `RESONANCE_ISSUERS` at each start). If it restarts while its control plane
-  is out of reach, it relays ticket holders from that list until the control plane is back,
-  even before it has its own HMAC key.
-- **Fixture.** `crates/resonance-turn/src/ticket.rs` and GameRelay's `test/turn.test.ts` mint
-  the same ticket and password from the same keys.
+  `RESONANCE_ISSUERS` at each start), so a node restarted while its control plane is out of
+  reach still relays ticket holders.
+- **A minimal issuer.** `resonance-node issuer <file>` makes an issuer key (or reads it) and
+  prints its public key. `resonance-node mint <file> <seal key> <instance> <room> <player>
+  [seconds]` prints a ticket's username and password for one node.
+- **Fixture.** `crates/resonance-turn/src/ticket.rs`, `interop/ticket` (Go) and GameRelay's
+  `test/turn.test.ts` mint the same ticket and password from the same keys.
 
-#### HMAC credentials
-
-TURN REST credentials (draft-uberti-behave-turn-rest), minted by the control plane for one node.
-GameRelay's control plane mints them for nodes that haven't sent a sealing key:
-
-```
-username = <expiry unix s>:<instance>:<room>:<player>
-password = base64( HMAC-SHA1( node_key, username ) )
-key      = MD5( username ":" realm ":" password )        # RFC 8489 §9.2.2, realm "gamerelay"
-```
-
-- Every part of either kind of username must be non-empty. The room and the player are scoped
-  to the instance, so two games' rooms never collide.
-- An allocation answers only to the room and player it was made for.
-- Each node has its own key, derived on the control plane:
-
-  ```
-  node_key = base64url( HMAC-SHA256( master, "resonance/turn/v<key_version>/<node_id>" ) )
-  ```
-
-  The master never leaves the control plane, and a node only ever sees its own key. A credential
-  for one node is therefore worthless on any other, and a leaked node can't forge access to the
-  rest of the network. A rotated key takes over at the node's next heartbeat, and the old one is
-  still accepted for an hour.
+Before 2026-10-01, the control plane minted TURN REST credentials instead (HMAC-SHA1 with a key
+per node, derived from its master). Tickets replaced them.
 
 ### Nonces
 
@@ -210,7 +186,7 @@ The same fixture is tested on both sides: `resonance-proto`'s tests and GameRela
 
 ### Endpoints
 
-All three endpoints are `POST`.
+Both endpoints are `POST`.
 
 **`/nodes/join`**: once, with a join token from the control plane's admin. A token is valid for an
 hour and can be used once; it carries the node's region.
@@ -218,12 +194,6 @@ hour and can be used once; it carries the node's region.
 ```json
 → { "token": "rjt_…", "pubkey": "<base64url>", "urls": ["turn:203.0.113.7:3478"], "software": "resonance-node 0.1.0", "seal_key": "<base64url>" }
 ← { "node_id": "rn_…", "region": "nyc", "heartbeat_s": 15 }
-```
-
-**`/nodes/key`**: at startup, and again whenever `key_version` changes.
-
-```json
-← { "node_key": "<base64url>", "key_version": 0 }
 ```
 
 **`/nodes/heartbeat`**: every `heartbeat_s` seconds.
@@ -237,10 +207,10 @@ hour and can be used once; it carries the node's region.
     "seal_key": "<base64url>"
   }
 ← {
-    "status": "active", "key_version": 0,
+    "status": "active",
     "latest_version": "2026-09-29", "min_version": "2026-09-29",
     "peers": [{ "node_id": "rn_b…", "addr": "198.51.100.2:3478" }],
-    "issuers": [{ "pubkey": "<base64url>", "home": true }]
+    "issuers": [{ "pubkey": "<base64url>" }]
   }
 ```
 
@@ -252,7 +222,7 @@ In the request:
   passwords with it.
 
 In the answer, `issuers` lists the ed25519 public keys whose tickets the node should accept,
-besides its own `RESONANCE_ISSUERS`. The control plane's own carries `"home": true`.
+besides its own `RESONANCE_ISSUERS`.
 
 ### Statuses
 
@@ -264,7 +234,7 @@ besides its own `RESONANCE_ISSUERS`. The control plane's own carries `"home": tr
 | `upgrade_required` | its API version is below `min_version`, so it takes no new allocations |
 | anything else | carries on as before (a newer control plane, see Versioning) |
 
-A node the control plane can't reach keeps relaying with the key it has. The control plane stops
+A node the control plane can't reach keeps relaying for the issuers it was last told about. The control plane stops
 handing out a node it hasn't heard from in 45 s.
 
 ### Errors

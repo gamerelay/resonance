@@ -4,30 +4,68 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
-use resonance_turn::auth::password;
+use ed25519_dalek::SigningKey;
 use resonance_turn::stun::{self, Class, Message, Writer, attr, method};
+use resonance_turn::ticket::{self, Issuer};
 use resonance_turn::{Config, Output, Server};
+use sha2::{Digest, Sha256};
 
-pub const KEY: &str = "fiahLYMg85YkiFJQ0Xp3Bl0x3pXkUhI4nMU8jj6QRio";
 pub const UNIX: u64 = 1_790_000_000;
 pub const PUBLIC: &str = "192.0.2.1";
+/// The node's ed25519 seed, which its sealing key comes from.
+pub const SEED: [u8; 32] = [7; 32];
 
 pub fn public() -> IpAddr {
     PUBLIC.parse().unwrap()
 }
 
+/// The issuer the test server trusts.
+pub fn issuer() -> SigningKey {
+    SigningKey::from_bytes(&[1; 32])
+}
+
+pub fn seal() -> [u8; 32] {
+    ticket::seal_secret(&SEED)
+}
+
+/// A config that takes `issuer()`'s tickets.
+pub fn config() -> Config {
+    let mut cfg = Config::new(public(), [7; 32]);
+    cfg.seal = Some(seal());
+    cfg.issuers = vec![Issuer::new(&issuer().verifying_key().to_bytes()).unwrap()];
+    cfg
+}
+
 pub fn server(t: Instant) -> Server {
-    Server::with_clock(Config::new(KEY, public(), [7; 32]), t, UNIX)
+    Server::with_clock(config(), t, UNIX)
 }
 
 pub fn server_with(t: Instant, f: impl FnOnce(&mut Config)) -> Server {
-    let mut cfg = Config::new(KEY, public(), [7; 32]);
+    let mut cfg = config();
     f(&mut cfg);
     Server::with_clock(cfg, t, UNIX)
 }
 
+/// A ticket from `by`, the same username for the same parts (its key comes from them).
+pub fn ticket_by(by: &SigningKey, expiry: u64, instance: &str, room: &str, player: &str) -> String {
+    let eph: [u8; 32] = Sha256::digest(format!("{expiry}:{instance}:{room}:{player}")).into();
+    ticket::mint(by, eph, expiry, instance, room, player).username
+}
+
+pub fn ticket(expiry: u64, instance: &str, room: &str, player: &str) -> String {
+    ticket_by(&issuer(), expiry, instance, room, player)
+}
+
+/// A ticket for a room and player of game "ins", for an hour.
 pub fn user(room: &str, player: &str) -> String {
-    format!("{}:ins:{room}:{player}", UNIX + 3600)
+    ticket(UNIX + 3600, "ins", room, player)
+}
+
+/// The password this node derives for a ticket (as its issuer did); "x" for anything else.
+pub fn pass(username: &str) -> String {
+    ticket::parse(username)
+        .and_then(|t| t.password(&seal()))
+        .unwrap_or_else(|| "x".into())
 }
 
 pub fn addr(s: &str) -> SocketAddr {
@@ -190,7 +228,7 @@ impl Client {
         attrs: Attrs,
         peer: Option<SocketAddr>,
     ) -> Reply {
-        self.request_as(s, now, m, username, &password(KEY, username), attrs, peer)
+        self.request_as(s, now, m, username, &pass(username), attrs, peer)
     }
 
     pub fn request_as(
@@ -241,7 +279,7 @@ impl Client {
         assert!(m.integrity_ok(&resonance_turn::auth::long_term_key(
             username,
             "gamerelay",
-            &password(KEY, username)
+            &pass(username)
         )));
         assert_eq!(
             m.xor_address(attr::XOR_MAPPED_ADDRESS),

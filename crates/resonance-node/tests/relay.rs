@@ -13,8 +13,6 @@ use resonance_node::control::{Control, Snapshot};
 use resonance_node::relay::{self, Limits, Listeners, Network};
 use resonance_turn::{Config, Server};
 
-const KEY: &str = "fiahLYMg85YkiFJQ0Xp3Bl0x3pXkUhI4nMU8jj6QRio";
-
 struct Node {
     udp: SocketAddr,
     tcp: SocketAddr,
@@ -29,7 +27,7 @@ fn start(network: Option<Network>, f: impl FnOnce(&mut Limits)) -> Node {
     let (udp_addr, tcp_addr) = (udp.local_addr().unwrap(), tcp.local_addr().unwrap());
     let mut limits = Limits::default();
     f(&mut limits);
-    let server = Server::new(Config::new(KEY, ip, [7; 32]));
+    let server = Server::new(Config::new(ip, [7; 32]));
     let listeners = Listeners {
         udp,
         tcp: Some(tcp),

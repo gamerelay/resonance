@@ -28,9 +28,6 @@ pub struct Settings {
     pub heartbeat: Duration,
     /// The control plane to join.
     pub control: String,
-    /// The key to run by hand with (not joined): RESONANCE_NODE_KEY, or TURN_SECRET as the Go
-    /// relay called it.
-    pub node_key: Option<String>,
     /// A Discord or Slack incoming webhook this node says the control plane is out of reach on
     /// (RESONANCE_ALERT_WEBHOOK), after `alert_after` in a row.
     pub alert_webhook: Option<String>,
@@ -39,7 +36,7 @@ pub struct Settings {
     /// (RESONANCE_ISSUERS: ed25519 public keys, base64url, comma-separated). Also in `turn`.
     pub issuers: Vec<String>,
     /// Settings that mean nothing any more and are set, to say so at startup.
-    pub ignored: Vec<&'static str>,
+    pub ignored: Vec<(&'static str, &'static str)>,
 }
 
 pub struct TlsSettings {
@@ -108,7 +105,7 @@ impl Settings {
             _ => return Err("TURN_TLS_CERT and TURN_TLS_KEY go together".into()),
         };
 
-        let mut turn = Config::new(String::new(), public_ip, [0; 32]);
+        let mut turn = Config::new(public_ip, [0; 32]);
         turn.min_port = env.port("TURN_MIN_PORT", turn.min_port)?;
         turn.max_port = env.port("TURN_MAX_PORT", turn.max_port)?;
         if turn.min_port > turn.max_port {
@@ -162,16 +159,23 @@ impl Settings {
             control: env
                 .get("RESONANCE_CONTROL")
                 .unwrap_or_else(|| "https://gamerelay.io".into()),
-            node_key: env
-                .get("RESONANCE_NODE_KEY")
-                .or_else(|| env.get("TURN_SECRET")),
             alert_webhook: env.get("RESONANCE_ALERT_WEBHOOK"),
             alert_after: Duration::from_secs(env.num("RESONANCE_ALERT_AFTER_S", 120)?),
             issuers,
-            ignored: ["TURN_PEER_IPS"]
-                .into_iter()
-                .filter(|k| env.get(k).is_some())
-                .collect(),
+            ignored: [
+                ("TURN_PEER_IPS", "pairs of players share one relay"),
+                (
+                    "TURN_SECRET",
+                    "players' credentials are tickets (RESONANCE_ISSUERS)",
+                ),
+                (
+                    "RESONANCE_NODE_KEY",
+                    "players' credentials are tickets (RESONANCE_ISSUERS)",
+                ),
+            ]
+            .into_iter()
+            .filter(|(k, _)| env.get(k).is_some())
+            .collect(),
         })
     }
 
@@ -230,7 +234,7 @@ mod tests {
         );
         assert_eq!(s.heartbeat, HEARTBEAT);
         assert_eq!(s.control, "https://gamerelay.io");
-        assert!(s.node_key.is_none() && s.ignored.is_empty());
+        assert!(s.ignored.is_empty());
         assert!(s.alert_webhook.is_none());
         assert_eq!(s.alert_after, Duration::from_secs(120));
     }
@@ -274,22 +278,17 @@ mod tests {
     }
 
     #[test]
-    fn a_hand_run_key_and_old_settings() {
+    fn old_settings_are_ignored_and_said_to_be() {
         let s = settings(&[
             ("TURN_PUBLIC_IP", "192.0.2.1"),
             ("TURN_SECRET", "old"),
+            ("RESONANCE_NODE_KEY", "old"),
             ("TURN_PEER_IPS", "10.0.0.1"),
         ])
         .unwrap();
-        assert_eq!(s.node_key.as_deref(), Some("old"));
-        assert_eq!(s.ignored, ["TURN_PEER_IPS"]);
-        let s = settings(&[
-            ("TURN_PUBLIC_IP", "192.0.2.1"),
-            ("TURN_SECRET", "old"),
-            ("RESONANCE_NODE_KEY", "new"),
-        ])
-        .unwrap();
-        assert_eq!(s.node_key.as_deref(), Some("new"));
+        let keys: Vec<_> = s.ignored.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, ["TURN_PEER_IPS", "TURN_SECRET", "RESONANCE_NODE_KEY"]);
+        assert!(s.ignored[1].1.contains("tickets"));
     }
 
     #[test]

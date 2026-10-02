@@ -18,10 +18,6 @@ use crate::ticket::{self, Issuer};
 
 pub struct Config {
     pub realm: String,
-    /// This node's own key (Resonance v0 §1). It mints credentials for this node only. Empty: none
-    /// yet (a node that started on tickets while its control plane was out of reach), and no
-    /// credential checks against it.
-    pub node_key: String,
     /// The address players reach this relay at, and the one relay addresses are named on.
     pub public_ip: IpAddr,
     /// Relay addresses are this IP with a port from here.
@@ -57,11 +53,10 @@ pub struct Config {
 
 impl Config {
     /// The Go relay's limits (deploy/turn/main.go).
-    pub fn new(node_key: impl Into<String>, public_ip: IpAddr, nonce_key: [u8; 32]) -> Self {
+    pub fn new(public_ip: IpAddr, nonce_key: [u8; 32]) -> Self {
         let max_per_ip = 64;
         Config {
             realm: "gamerelay".into(),
-            node_key: node_key.into(),
             public_ip: public_ip.to_canonical(),
             min_port: 49152,
             max_port: 65535,
@@ -205,7 +200,6 @@ pub struct Server {
     stats: Stats,
     clock: (Instant, u64),
     /// The key before the last rotation, and until when it's still accepted.
-    previous_key: Option<(String, Instant)>,
     /// False while draining: no new allocations, existing ones carry on.
     accepting: bool,
 }
@@ -261,7 +255,6 @@ impl Server {
             per_instance: Counts::default(),
             stats: Stats::default(),
             clock: (base, unix),
-            previous_key: None,
             accepting: true,
             cfg,
         }
@@ -272,16 +265,6 @@ impl Server {
             unauthenticated_dropped: self.limiter.dropped,
             ..self.stats.clone()
         }
-    }
-
-    /// A rotated node key (Resonance v0 §3): the old one is still accepted for `overlap`, as long
-    /// as credentials minted with it last.
-    pub fn set_node_key(&mut self, key: String, now: Instant, overlap: Duration) {
-        if key == self.cfg.node_key {
-            return;
-        }
-        let old = std::mem::replace(&mut self.cfg.node_key, key);
-        self.previous_key = (!old.is_empty()).then(|| (old, now + overlap));
     }
 
     /// Whose tickets are accepted from now on. An allocation made with another's is refused at
@@ -478,21 +461,19 @@ impl Server {
         if self.nonces.check(nonce, self.unix(now), from.addr) != NonceCheck::Ok {
             return Err(Refusal::unsigned(438));
         }
-        // A ticket (`t1:`, any trusted issuer's), else the control plane's own credential.
-        let ticket = ticket::parse(username);
-        let Some(user) = ticket
-            .as_ref()
-            .map(|t| t.user(self.cfg.issuers.iter().any(|i| i.home && i.kid == t.kid)))
-            .or_else(|| auth::parse_username(username))
-        else {
+        // A ticket (`t1:`) from an issuer this node trusts. One it no longer trusts ends at its
+        // allocations' next request, cached or not.
+        let Some(t) = ticket::parse(username) else {
             return Err(Refusal::unsigned(401));
         };
-        // No request succeeds past the credential's expiry, so an allocation outlives it by at
-        // most one lifetime. A ticket lasts a day at most.
+        if !self.cfg.issuers.iter().any(|i| i.kid == t.kid) {
+            return Err(Refusal::unsigned(401));
+        }
+        let user = t.user();
+        // No request succeeds past the ticket's expiry, so an allocation outlives it by at most
+        // one lifetime. A ticket lasts a day at most.
         let unix = self.unix(now);
-        if user.expiry <= unix
-            || (ticket.is_some() && user.expiry > unix + ticket::MAX_LIFETIME_S + ticket::SKEW_S)
-        {
+        if user.expiry <= unix || user.expiry > unix + ticket::MAX_LIFETIME_S + ticket::SKEW_S {
             return Err(Refusal::unsigned(401));
         }
         let existing = self.live_alloc(from, now);
@@ -500,59 +481,30 @@ impl Server {
             .map(|i| self.alloc(i))
             .filter(|a| a.username == username)
             .map(|a| a.key);
-        // The current node key, else (for an hour after a rotation) the previous one, since
-        // credentials minted just before it still arrive.
-        let derive = |node_key: &str| {
-            auth::long_term_key(
-                username,
-                &self.cfg.realm,
-                &auth::password(node_key, username),
-            )
-        };
-        let previous = self
-            .previous_key
-            .as_ref()
-            .filter(|(_, until)| *until > now)
-            .map(|(k, _)| k.as_str());
-        // A ticket: its issuer's signature, then the password from its key and this node's
-        // sealing secret. Checked only when nothing cached matches, so a refresh costs a hash.
-        let key = match &ticket {
-            // An issuer no longer trusted ends its tickets at their next request, cached or not.
-            Some(t) if !self.cfg.issuers.iter().any(|i| i.kid == t.kid) => None,
-            Some(t) => {
-                let known = cached.or_else(|| self.tickets.get(username).copied());
-                match known {
-                    Some(k) => msg.integrity_ok(&k).then_some(k),
-                    None if self.ticket_checks.allow(from.addr.ip(), now) => {
-                        let k = self.cfg.seal.as_ref().and_then(|seal| {
-                            t.verify(&self.cfg.issuers)
-                                .then(|| t.password(seal))
-                                .flatten()
-                                .map(|p| auth::long_term_key(username, &self.cfg.realm, &p))
-                        });
-                        // Only a ticket that checked out, and was used with its password, is
-                        // remembered.
-                        let k = k.filter(|k| msg.integrity_ok(k));
-                        if let Some(k) = k {
-                            if self.tickets.len() >= TICKETS_KEPT {
-                                self.tickets.clear();
-                            }
-                            self.tickets.insert(username.to_owned(), k);
-                        }
-                        k
+        // Its issuer's signature, then the password from its key and this node's sealing
+        // secret: only when nothing cached matches, so a refresh or a player's next allocation
+        // costs a hash, and only within the IP's budget.
+        let known = cached.or_else(|| self.tickets.get(username).copied());
+        let key = match known {
+            Some(k) => msg.integrity_ok(&k).then_some(k),
+            None if self.ticket_checks.allow(from.addr.ip(), now) => {
+                let k = self.cfg.seal.as_ref().and_then(|seal| {
+                    t.verify(&self.cfg.issuers)
+                        .then(|| t.password(seal))
+                        .flatten()
+                        .map(|p| auth::long_term_key(username, &self.cfg.realm, &p))
+                });
+                // Only a ticket that checked out, and was used with its password, is remembered.
+                let k = k.filter(|k| msg.integrity_ok(k));
+                if let Some(k) = k {
+                    if self.tickets.len() >= TICKETS_KEPT {
+                        self.tickets.clear();
                     }
-                    None => None,
+                    self.tickets.insert(username.to_owned(), k);
                 }
+                k
             }
-            // No key yet: nothing is signed with an empty one, which anyone could do.
-            None => [
-                cached,
-                (!self.cfg.node_key.is_empty()).then(|| derive(&self.cfg.node_key)),
-                previous.filter(|k| !k.is_empty()).map(derive),
-            ]
-            .into_iter()
-            .flatten()
-            .find(|k| msg.integrity_ok(k)),
+            None => None,
         };
         let Some(key) = key else {
             return Err(Refusal::unsigned(401));

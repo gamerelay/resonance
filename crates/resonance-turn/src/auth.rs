@@ -1,13 +1,10 @@
-//! Credentials: TURN REST style (draft-uberti-behave-turn-rest), minted by the control plane with
-//! this node's own key (Resonance v0 §3). Username `expiry:instance:roomGroup:player`, password
-//! base64(HMAC-SHA1(node key, username)).
+//! What credentials have in common: who one names, the long-term key RFC 8489 checks messages
+//! with, and the nonces. The credentials themselves are tickets (`ticket`).
 
 use std::net::{IpAddr, SocketAddr};
 
-use base64::Engine;
 use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
-use sha1::Sha1;
 use sha2::Sha256;
 
 /// Who a signed username names. The room and the player are scoped to the instance, so two games'
@@ -18,29 +15,6 @@ pub struct User {
     pub instance: String,
     pub room: String,
     pub player: String,
-}
-
-/// `expiry:instance:roomGroup:player`, every part non-empty (the control plane keeps colons out of
-/// each, apps/server/src/turn.ts). Same rule as the Go relay's parseUsername.
-pub fn parse_username(username: &str) -> Option<User> {
-    let mut p = username.split(':');
-    let (expiry, instance, room, player) = (p.next()?, p.next()?, p.next()?, p.next()?);
-    if p.next().is_some() || instance.is_empty() || room.is_empty() || player.is_empty() {
-        return None;
-    }
-    Some(User {
-        expiry: expiry.parse().ok()?,
-        instance: instance.to_owned(),
-        room: format!("{instance}:{room}"),
-        player: format!("{instance}:{player}"),
-    })
-}
-
-/// The password the control plane minted for username: base64(HMAC-SHA1(node key, username)).
-pub fn password(node_key: &str, username: &str) -> String {
-    let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(node_key.as_bytes()).expect("any key length");
-    mac.update(username.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
 
 /// The long-term credential key, MD5(username ":" realm ":" password) (RFC 8489 §9.2.2).
@@ -119,44 +93,6 @@ pub enum NonceCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // The same strings as apps/server/test/turn.test.ts and deploy/turn/cred_test.go
-    // TestNodeKeyFixture: the control plane and this node can't drift.
-    #[test]
-    fn password_fixture_shared_with_the_control_plane() {
-        let key = "fiahLYMg85YkiFJQ0Xp3Bl0x3pXkUhI4nMU8jj6QRio";
-        assert_eq!(
-            password(key, "1790000000:ins_x:2900f54a5bbdef76:be6f68eaf1fb826e"),
-            "yb01xn6ocyuqIri2RKNgzOKQ9QA="
-        );
-        assert_eq!(
-            password("test-secret-0123456789abcdef0123456789", "1790000000:p_abc"),
-            "jLQpVvRbo3RM7CTKVTkvHGEJnVM="
-        );
-    }
-
-    // The Go relay's TestParseUsername cases.
-    #[test]
-    fn usernames() {
-        let u = parse_username("1790000000:ins_x:2900f54a5bbdef76:be6f68eaf1fb826e").unwrap();
-        assert_eq!(u.expiry, 1790000000);
-        assert_eq!(u.instance, "ins_x");
-        assert_eq!(u.room, "ins_x:2900f54a5bbdef76");
-        assert_eq!(u.player, "ins_x:be6f68eaf1fb826e");
-        for bad in [
-            "",
-            "1:p_abc",
-            "1:ins:g1",
-            "1:ins:g1:p:x",
-            "1::g1:p",
-            "1:ins::p",
-            "1:ins:g1:",
-            "soon:ins:g1:p",
-            "-1:ins:g1:p",
-        ] {
-            assert!(parse_username(bad).is_none(), "{bad:?}");
-        }
-    }
 
     #[test]
     fn nonces() {

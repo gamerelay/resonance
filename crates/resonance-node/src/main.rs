@@ -3,22 +3,21 @@
 //! Two ways to run it:
 //!
 //! - **Joined** (the network): `resonance-node join <token>` once, with a token from the control
-//!   plane's admin, then `resonance-node run`. It fetches its own key at startup and sends a
-//!   heartbeat every 15 s; the control plane hands it out to players while it's active, and can
-//!   drain or revoke it. State lives in RESONANCE_STATE_DIR (default /var/lib/resonance);
-//!   RESONANCE_CONTROL is the control plane (default https://gamerelay.io).
+//!   plane's admin, then `resonance-node run`. It sends a heartbeat every 15 s; the control plane
+//!   hands it out to players while it's active, tells it whose tickets to take, and can drain or
+//!   revoke it. State lives in RESONANCE_STATE_DIR (default /var/lib/resonance); RESONANCE_CONTROL
+//!   is the control plane (default https://gamerelay.io).
 //!   A joined node measures the other nodes the control plane names (a STUN Binding every 2 s from
 //!   its relay socket, reported with each heartbeat), and with RESONANCE_ALERT_WEBHOOK (a Discord
 //!   or Slack incoming webhook) says there when the control plane has been out of reach for
 //!   RESONANCE_ALERT_AFTER_S (120) in a row, and when it's back.
-//! - **By hand**, like the Go relay it replaces, from the same /etc/gamerelay-turn.env:
-//!   `TURN_SECRET=<this node's key> TURN_PUBLIC_IP=192.0.2.1 resonance-node` (RESONANCE_NODE_KEY
-//!   is the same as TURN_SECRET), and the control plane lists it in RESONANCE_NODES.
+//! - **On its own** (self-hosted, no control plane): `RESONANCE_ISSUERS=<issuer public keys>
+//!   TURN_PUBLIC_IP=192.0.2.1 resonance-node`. Its issuers mint tickets for it with its sealing key
+//!   (`resonance-node seal-key`); `resonance-node issuer <file>` and `mint` are a minimal issuer.
 //!
-//! Tickets (docs/PROTOCOL.md, "Tickets"): signed credentials from issuers this node trusts, its
-//! control plane's and RESONANCE_ISSUERS's (ed25519 public keys, base64url, comma-separated).
-//! A joined node takes them always; one run by hand, with RESONANCE_ISSUERS, keeping a key in
-//! RESONANCE_STATE_DIR for its sealing key, which it prints at startup.
+//! Players' credentials are tickets (docs/PROTOCOL.md, "Tickets"): signed by an issuer this node
+//! trusts, its control plane's and RESONANCE_ISSUERS's (ed25519 public keys, base64url,
+//! comma-separated). The node's own key, in RESONANCE_STATE_DIR, gives its sealing key.
 //!
 //! TURN_PUBLIC_IP is always needed: where players reach it. One socket, UDP 3478 by default. Relay
 //! addresses are names on TURN_PUBLIC_IP, ports TURN_MIN_PORT–TURN_MAX_PORT, but nothing listens
@@ -50,7 +49,6 @@
 use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use base64::Engine;
 use resonance_node::control::{self, Client, Snapshot};
@@ -72,7 +70,9 @@ fn fail(msg: &str) -> ! {
 }
 
 fn usage() -> ! {
-    fail("usage: resonance-node [run] | join <token> | status | version")
+    fail(
+        "usage: resonance-node [run] | join <token> | status | seal-key | issuer <file> | mint <issuer file> <seal key> <instance> <room> <player> [seconds] | version",
+    )
 }
 
 fn main() {
@@ -81,6 +81,14 @@ fn main() {
         [] | ["run"] => run_node(settings()),
         ["join", token] => join(settings(), token),
         ["status"] => status(),
+        ["seal-key"] => println!("{}", seal_public(&state_key(&State::from_env()))),
+        ["issuer", file] => println!("{}", B64.encode(issuer(file).verifying_key().to_bytes())),
+        ["mint", file, seal, instance, room, player] => {
+            mint(file, seal, instance, room, player, "3600")
+        }
+        ["mint", file, seal, instance, room, player, secs] => {
+            mint(file, seal, instance, room, player, secs)
+        }
         ["version" | "--version"] => println!("{}", control::software()),
         _ => usage(),
     }
@@ -119,73 +127,98 @@ fn join(s: Settings, token: &str) {
     );
 }
 
+fn state_key(state: &State) -> ed25519_dalek::SigningKey {
+    state
+        .key()
+        .unwrap_or_else(|e| fail(&format!("key in {}: {e}", state.dir().display())))
+}
+
+/// What issuers derive this node's ticket passwords with, base64url.
+fn seal_public(key: &ed25519_dalek::SigningKey) -> String {
+    B64.encode(ticket::seal_public(&ticket::seal_secret(&key.to_bytes())))
+}
+
+/// `issuer <file>`: an issuer's ed25519 key, made in the file (32 bytes, mode 0600) if it isn't
+/// there.
+fn issuer(file: &str) -> ed25519_dalek::SigningKey {
+    let path = std::path::Path::new(file);
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    let state = State::new(dir.unwrap_or(std::path::Path::new(".")));
+    state
+        .key_at(path.file_name().and_then(|n| n.to_str()).unwrap_or(file))
+        .unwrap_or_else(|e| fail(&format!("issuer key {file}: {e}")))
+}
+
+/// `mint <issuer file> <seal key> <instance> <room> <player> [seconds]`: a ticket for one node,
+/// its username and password on two lines.
+fn mint(file: &str, seal: &str, instance: &str, room: &str, player: &str, secs: &str) {
+    let seal: [u8; 32] = base64::Engine::decode(&B64, seal)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .unwrap_or_else(|| fail("the seal key is 32 bytes, base64url"));
+    let secs: u64 = secs
+        .parse()
+        .ok()
+        .filter(|s| (1..=ticket::MAX_LIFETIME_S).contains(s))
+        .unwrap_or_else(|| fail("seconds: 1 to a day"));
+    if [instance, room, player]
+        .iter()
+        .any(|p| p.is_empty() || p.contains(':'))
+    {
+        fail("instance, room and player are non-empty and have no colons");
+    }
+    let mut eph = [0u8; 32];
+    getrandom::fill(&mut eph).unwrap_or_else(|e| fail(&format!("random: {e}")));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let m = ticket::mint(&issuer(file), eph, now + secs, instance, room, player);
+    println!("{}\n{}", m.username, m.password(&seal));
+}
+
 fn status() {
     let state = State::from_env();
     match state.joined() {
-        Ok(Some(j)) => {
-            println!(
-                "{} in {} (control plane {}, API {})",
-                j.node_id, j.region, j.control, j.api_version
-            );
-            if let Ok(k) = state.key() {
-                println!(
-                    "sealing key (for issuers): {}",
-                    B64.encode(ticket::seal_public(&ticket::seal_secret(&k.to_bytes())))
-                );
-            }
-        }
+        Ok(Some(j)) => println!(
+            "{} in {} (control plane {}, API {})",
+            j.node_id, j.region, j.control, j.api_version
+        ),
         Ok(None) => println!(
-            "not joined (state in {}): run by hand with TURN_SECRET, or join <token>",
+            "not joined (state in {}): run on its own with RESONANCE_ISSUERS, or join <token>",
             state.dir().display()
         ),
         Err(e) => fail(&format!("state in {}: {e}", state.dir().display())),
     }
+    println!(
+        "sealing key (for issuers): {}",
+        seal_public(&state_key(&state))
+    );
 }
 
-/// `run`: joined if there's a node.json, else by hand with TURN_SECRET.
+/// `run`: joined if there's a node.json, else on its own with RESONANCE_ISSUERS.
 fn run_node(s: Settings) {
     let state = State::from_env();
     let joined = state
         .joined()
         .unwrap_or_else(|e| fail(&format!("state in {}: {e}", state.dir().display())));
-    let mut seal = None;
-    let mut issuers = control::local(&s.issuers);
-    let (key, network) = match joined {
+    let signing = state_key(&state);
+    let seal = ticket::seal_secret(&signing.to_bytes());
+    let seal_key = seal_public(&signing);
+    let mut issuers = s.issuers.clone();
+    let network = match joined {
         Some(j) => {
-            let signing = state
-                .key()
-                .unwrap_or_else(|e| fail(&format!("key in {}: {e}", state.dir().display())));
-            seal = Some(ticket::seal_secret(&signing.to_bytes()));
             // The issuers it was last told to trust, so a restart while the control plane is
             // down still takes the tickets players hold.
             for k in state.issuers().unwrap_or_else(|e| {
                 eprintln!("the saved issuers in {}: {e}", state.dir().display());
                 Vec::new()
             }) {
-                if ticket::Issuer::parse(&k.pubkey).is_some() {
-                    control::add_issuer(&mut issuers, &k);
+                if !issuers.contains(&k) && ticket::Issuer::parse(&k).is_some() {
+                    issuers.push(k);
                 }
             }
             let client = Client::new(&j.control, signing, Some(j.node_id.clone()), &j.api_version);
-            // With issuers to trust, it can relay ticket holders before it has its own key: so it
-            // waits for the key a little, not until the control plane is back.
-            let k = if issuers.is_empty() {
-                fetch_key_patiently(&client)
-            } else {
-                fetch_key_briefly(&client).unwrap_or_else(|| {
-                    eprintln!(
-                        "the control plane is out of reach: relaying tickets from {} saved issuer{} until it's back",
-                        issuers.len(),
-                        if issuers.len() == 1 { "" } else { "s" }
-                    );
-                    // No key yet, and a version no control plane has: the first heartbeat
-                    // answered fetches it.
-                    resonance_proto::KeyResponse {
-                        node_key: String::new(),
-                        key_version: u32::MAX,
-                    }
-                })
-            };
             eprintln!("joined {} as {} in {}", j.control, j.node_id, j.region);
             let snapshot = Arc::new(Mutex::new(Snapshot::default()));
             let (tx, rx) = mpsc::channel();
@@ -193,7 +226,6 @@ fn run_node(s: Settings) {
                 client,
                 every: s.heartbeat,
                 snapshot: snapshot.clone(),
-                key_version: k.key_version,
                 urls: s.urls(),
                 controls: tx,
                 local_issuers: s.issuers.clone(),
@@ -211,54 +243,37 @@ fn run_node(s: Settings) {
                 .name("heartbeat".into())
                 .spawn(move || beats.run())
                 .expect("a thread");
-            (
-                k.node_key,
-                Some(relay::Network {
-                    controls: rx,
-                    snapshot,
-                }),
-            )
+            Some(relay::Network {
+                controls: rx,
+                snapshot,
+            })
         }
-        None => match &s.node_key {
-            Some(k) if k.len() >= 32 => {
-                // By hand with RESONANCE_ISSUERS: tickets need this node's sealing key, so its
-                // key is kept in the state directory as when joined.
-                if !s.issuers.is_empty() {
-                    let signing = state.key().unwrap_or_else(|e| {
-                        fail(&format!("key in {}: {e}", state.dir().display()))
-                    });
-                    let secret = ticket::seal_secret(&signing.to_bytes());
-                    eprintln!(
-                        "sealing key (for issuers): {}",
-                        B64.encode(ticket::seal_public(&secret))
-                    );
-                    seal = Some(secret);
-                }
-                (k.clone(), None)
-            }
-            _ => fail(
-                "not joined (resonance-node join <token>), and no TURN_SECRET (this node's key, 32+ chars) to run by hand",
-            ),
-        },
+        None if s.issuers.is_empty() => fail(
+            "not joined (resonance-node join <token>), and no RESONANCE_ISSUERS to run on its own",
+        ),
+        None => None,
     };
-    for k in &s.ignored {
-        eprintln!("{k} is ignored: pairs of players share one relay");
+    for (k, why) in &s.ignored {
+        eprintln!("{k} is ignored: {why}");
     }
+    eprintln!("sealing key (for issuers): {seal_key}");
     let mut cfg = s.turn;
-    cfg.node_key = key;
-    cfg.seal = seal;
+    cfg.seal = Some(seal);
     cfg.issuers = issuers
         .iter()
-        .filter_map(|k| ticket::Issuer::parse(&k.pubkey).map(|i| i.home(k.home)))
+        .filter_map(|k| ticket::Issuer::parse(k))
         .collect();
-    if seal.is_some() {
-        eprintln!(
-            "tickets: accepted from {} issuer{} so far ({} local), and the control plane's",
-            cfg.issuers.len(),
-            if cfg.issuers.len() == 1 { "" } else { "s" },
-            s.issuers.len()
-        );
-    }
+    eprintln!(
+        "tickets: from {} issuer{} so far ({} local){}",
+        cfg.issuers.len(),
+        if cfg.issuers.len() == 1 { "" } else { "s" },
+        s.issuers.len(),
+        if network.is_some() {
+            ", and the control plane's"
+        } else {
+            ""
+        }
+    );
     getrandom::fill(&mut cfg.nonce_key).unwrap_or_else(|e| fail(&format!("random: {e}")));
     let any = IpAddr::from([0, 0, 0, 0]);
     let socket = bind(SocketAddr::new(any, s.port));
@@ -319,46 +334,6 @@ fn listen_tcp(addr: SocketAddr) -> TcpListener {
     s.listen(1024)
         .unwrap_or_else(|e| fail(&format!("listen on tcp {addr}: {e}")));
     s.into()
-}
-
-/// Its key within a few seconds, or none (the control plane out of reach). A refusal is final,
-/// as when patient.
-fn fetch_key_briefly(client: &Client) -> Option<resonance_proto::KeyResponse> {
-    for wait in [1, 2, 4] {
-        match client.fetch_key() {
-            Ok(k) => return Some(k),
-            Err(e @ control::Error::Refused { .. }) => {
-                fail(&format!("the control plane refused this node its key: {e}"))
-            }
-            Err(e) => {
-                eprintln!("fetching this node's key: {e}");
-                std::thread::sleep(Duration::from_secs(wait));
-            }
-        }
-    }
-    None
-}
-
-/// The key, retried until the control plane answers: a node that can't get its key, and has no
-/// issuers to relay tickets for, can't relay. A refusal (revoked, unknown) is final.
-fn fetch_key_patiently(client: &Client) -> resonance_proto::KeyResponse {
-    let mut wait = Duration::from_secs(1);
-    loop {
-        match client.fetch_key() {
-            Ok(k) => return k,
-            Err(e @ control::Error::Refused { .. }) => {
-                fail(&format!("the control plane refused this node its key: {e}"))
-            }
-            Err(e) => {
-                eprintln!(
-                    "fetching this node's key: {e}; again in {}s",
-                    wait.as_secs()
-                );
-                std::thread::sleep(wait);
-                wait = (wait * 2).min(Duration::from_secs(30));
-            }
-        }
-    }
 }
 
 fn bind(addr: SocketAddr) -> UdpSocket {

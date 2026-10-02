@@ -15,14 +15,12 @@
 // In the Playwright image (browsers included), with the node built for Linux:
 //   docker run --rm -v "$PWD":/w -w /w/interop/browsers mcr.microsoft.com/playwright:v1.63.0-noble \
 //     sh -c 'npm i -s playwright@1.63.0 && NODE_BIN=/w/target/release/resonance-node node relay.mjs'
-import { createHmac } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 import { appendFileSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { chromium, firefox, webkit } from 'playwright';
 
-const KEY = 'fiahLYMg85YkiFJQ0Xp3Bl0x3pXkUhI4nMU8jj6QRio';
 const PORT = 34810;
 const TLS_PORT = 34811;
 const HOST = 'turn.test';
@@ -32,7 +30,22 @@ let firefoxProfile = null;
 const ip = Object.values(networkInterfaces()).flat().find((a) => a && a.family === 'IPv4' && !a.internal)?.address;
 if (!ip) throw new Error('no non-loopback IPv4 address');
 
-const env = { TURN_SECRET: KEY, TURN_PUBLIC_IP: ip, TURN_PORT: String(PORT), TURN_TCP: '1', TURN_DEBUG_STREAMS: process.env.TURN_DEBUG_STREAMS ?? '' };
+// Players hold tickets (docs/PROTOCOL.md, "Tickets"), minted by the node's own minimal issuer:
+// an issuer key the node trusts, and the node's sealing key from its state directory.
+const keys = mkdtempSync(join(tmpdir(), 'resonance-keys-'));
+const issuerFile = join(keys, 'issuer.key');
+const run = (args, extra = {}) => execFileSync(process.env.NODE_BIN, args, { env: { ...process.env, ...extra }, encoding: 'utf8' }).trim();
+const state = join(keys, 'state');
+const issuers = run(['issuer', issuerFile]);
+const seal = run(['seal-key'], { RESONANCE_STATE_DIR: state });
+const env = {
+  RESONANCE_STATE_DIR: state,
+  RESONANCE_ISSUERS: issuers,
+  TURN_PUBLIC_IP: ip,
+  TURN_PORT: String(PORT),
+  TURN_TCP: '1',
+  TURN_DEBUG_STREAMS: process.env.TURN_DEBUG_STREAMS ?? '',
+};
 if (TRANSPORT === 'tls') {
   // A CA, and a certificate for HOST signed by it, as certbot's fullchain.pem and privkey.pem.
   const dir = mkdtempSync(join(tmpdir(), 'turn-tls-'));
@@ -62,10 +75,9 @@ await new Promise((r) => setTimeout(r, 300));
 const URL = { udp: `turn:${ip}:${PORT}`, tcp: `turn:${ip}:${PORT}?transport=tcp`, tls: `turns:${HOST}:${TLS_PORT}?transport=tcp` }[TRANSPORT];
 if (!URL) throw new Error(`TRANSPORT is udp, tcp or tls, not ${TRANSPORT}`);
 
-// The control plane's credentials (gamerelay.io apps/server/src/turn.ts).
+// A ticket for this node: `mint` prints its username and password.
 function ice(room, player) {
-  const username = `${Math.floor(Date.now() / 1000) + 3600}:ins:${room}:${player}`;
-  const credential = createHmac('sha1', KEY).update(username).digest('base64');
+  const [username, credential] = run(['mint', issuerFile, seal, 'ins', room, player]).split('\n');
   return [{ urls: [URL], username, credential }];
 }
 

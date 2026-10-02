@@ -11,8 +11,8 @@ use resonance_turn::ticket;
 use std::net::SocketAddr;
 
 use resonance_proto::{
-    self as proto, ErrorResponse, Heartbeat, HeartbeatResponse, IssuerKey, JoinRequest,
-    JoinResponse, KeyResponse, Peer, PeerReport, Status,
+    self as proto, ErrorResponse, Heartbeat, HeartbeatResponse, JoinRequest, JoinResponse, Peer,
+    PeerReport, Status,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -141,10 +141,6 @@ impl Client {
         self.post("/nodes/join", &req)
     }
 
-    pub fn fetch_key(&self) -> Result<KeyResponse, Error> {
-        self.post("/nodes/key", &serde_json::json!({}))
-    }
-
     pub fn heartbeat(&self, h: &Heartbeat) -> Result<HeartbeatResponse, Error> {
         self.post("/nodes/heartbeat", h)
     }
@@ -171,15 +167,13 @@ pub fn software() -> String {
 /// What the heartbeat thread tells the relay loop.
 #[derive(Debug, PartialEq)]
 pub enum Control {
-    /// A rotated key (the old one stays good for an hour).
-    Key(String),
     /// Take new allocations (true), or stop (false: draining, or told to upgrade).
     Accepting(bool),
     /// The other nodes to measure (`probe`).
     Peers(Vec<(String, SocketAddr)>),
-    /// Whose tickets to accept: this node's own `RESONANCE_ISSUERS` and the control plane's
-    /// (its own marked `home`), each a valid key.
-    Issuers(Vec<IssuerKey>),
+    /// Whose tickets to accept: this node's own `RESONANCE_ISSUERS` and the control plane's, as
+    /// base64url public keys, each one a valid key.
+    Issuers(Vec<String>),
     /// Revoked: stop now.
     Exit,
 }
@@ -209,14 +203,13 @@ pub struct Heartbeats {
     pub client: Client,
     pub every: Duration,
     pub snapshot: Arc<Mutex<Snapshot>>,
-    pub key_version: u32,
     pub urls: Vec<String>,
     pub controls: Sender<Control>,
     /// `RESONANCE_ISSUERS`: trusted whatever the control plane says.
     pub local_issuers: Vec<String>,
     /// The issuers the relay loop started with (the local ones and the control plane's last
     /// saved), and where to save the control plane's when they change.
-    pub issuers: Vec<IssuerKey>,
+    pub issuers: Vec<String>,
     pub state: crate::state::State,
     /// Where to say the control plane is out of reach (RESONANCE_ALERT_WEBHOOK), and who says it.
     pub alert: Option<(String, Watch)>,
@@ -230,7 +223,6 @@ impl Heartbeats {
         let (mut last_cpu, mut last_at) = (cpu_seconds(), Instant::now());
         let mut seen = Seen {
             accepting: true,
-            key_version: self.key_version,
             peers: Vec::new(),
             issuers: self.issuers.clone(),
         };
@@ -273,16 +265,13 @@ impl Heartbeats {
                     continue;
                 }
             };
-            for c in decide(&reply, &mut seen, &self.local_issuers, || {
-                self.client.fetch_key()
-            }) {
+            for c in decide(&reply, &mut seen, &self.local_issuers) {
                 // Only the control plane's: the node's own come from RESONANCE_ISSUERS at each
-                // start, so one taken out of it isn't kept trusted by the file. Its home one
-                // always, since that decides how its tickets name rooms.
+                // start, so one taken out of it isn't kept trusted by the file.
                 if let Control::Issuers(keys) = &c {
-                    let theirs: Vec<IssuerKey> = keys
+                    let theirs: Vec<String> = keys
                         .iter()
-                        .filter(|k| k.home || !self.local_issuers.contains(&k.pubkey))
+                        .filter(|k| !self.local_issuers.contains(k))
                         .cloned()
                         .collect();
                     if let Err(e) = self.state.save_issuers(&theirs) {
@@ -301,36 +290,12 @@ impl Heartbeats {
 /// What the relay loop was last told.
 struct Seen {
     accepting: bool,
-    key_version: u32,
     peers: Vec<Peer>,
-    issuers: Vec<IssuerKey>,
-}
-
-/// `RESONANCE_ISSUERS` as issuers: none of them home.
-pub fn local(keys: &[String]) -> Vec<IssuerKey> {
-    keys.iter()
-        .map(|k| IssuerKey {
-            pubkey: k.clone(),
-            home: false,
-        })
-        .collect()
-}
-
-/// Adds an issuer once: a key listed twice is home if either says so.
-pub fn add_issuer(list: &mut Vec<IssuerKey>, k: &IssuerKey) {
-    match list.iter_mut().find(|i| i.pubkey == k.pubkey) {
-        Some(i) => i.home |= k.home,
-        None => list.push(k.clone()),
-    }
+    issuers: Vec<String>,
 }
 
 /// What one heartbeat answer means for the relay loop.
-fn decide(
-    reply: &HeartbeatResponse,
-    seen: &mut Seen,
-    local_issuers: &[String],
-    fetch_key: impl FnOnce() -> Result<KeyResponse, Error>,
-) -> Vec<Control> {
+fn decide(reply: &HeartbeatResponse, seen: &mut Seen, local_issuers: &[String]) -> Vec<Control> {
     let mut out = Vec::new();
     let want = match reply.status {
         Status::Revoked => {
@@ -361,16 +326,6 @@ fn decide(
         seen.accepting = want;
         out.push(Control::Accepting(want));
     }
-    if reply.key_version != seen.key_version {
-        match fetch_key() {
-            Ok(k) => {
-                eprintln!("node key rotated to version {}", k.key_version);
-                seen.key_version = k.key_version;
-                out.push(Control::Key(k.node_key));
-            }
-            Err(e) => eprintln!("fetching the rotated key: {e}"),
-        }
-    }
     if reply.peers != seen.peers {
         seen.peers = reply.peers.clone();
         let peers = reply
@@ -385,15 +340,15 @@ fn decide(
         );
         out.push(Control::Peers(peers));
     }
-    let mut issuers = local(local_issuers);
+    let mut issuers = local_issuers.to_vec();
     for i in &reply.issuers {
         if ticket::Issuer::parse(&i.pubkey).is_none() {
             eprintln!(
                 "the control plane's issuer {:?} isn't an ed25519 key: ignored",
                 i.pubkey
             );
-        } else {
-            add_issuer(&mut issuers, i);
+        } else if !issuers.contains(&i.pubkey) {
+            issuers.push(i.pubkey.clone());
         }
     }
     if issuers != seen.issuers {
@@ -471,10 +426,9 @@ mod tests {
     use super::*;
     use resonance_proto::IssuerKey;
 
-    fn reply(status: Status, key_version: u32) -> HeartbeatResponse {
+    fn reply(status: Status) -> HeartbeatResponse {
         HeartbeatResponse {
             status,
-            key_version,
             latest_version: "2026-09-29".into(),
             min_version: "2026-09-29".into(),
             peers: Vec::new(),
@@ -484,69 +438,45 @@ mod tests {
     fn seen() -> Seen {
         Seen {
             accepting: true,
-            key_version: 0,
             peers: Vec::new(),
             issuers: Vec::new(),
         }
-    }
-    fn no_key() -> Result<KeyResponse, Error> {
-        panic!("no key fetch expected")
     }
 
     #[test]
     fn heartbeat_answers_become_controls() {
         let mut s = seen();
-        assert!(decide(&reply(Status::Active, 0), &mut s, &[], no_key).is_empty());
+        assert!(decide(&reply(Status::Active), &mut s, &[]).is_empty());
         assert_eq!(
-            decide(&reply(Status::Draining, 0), &mut s, &[], no_key),
+            decide(&reply(Status::Draining), &mut s, &[]),
             vec![Control::Accepting(false)]
         );
         assert!(
-            decide(&reply(Status::Draining, 0), &mut s, &[], no_key).is_empty(),
+            decide(&reply(Status::Draining), &mut s, &[]).is_empty(),
             "only changes are sent"
         );
         assert!(
-            decide(&reply(Status::Unknown, 0), &mut s, &[], no_key).is_empty(),
+            decide(&reply(Status::Unknown), &mut s, &[]).is_empty(),
             "unknown: as before"
         );
         assert_eq!(
-            decide(&reply(Status::Active, 0), &mut s, &[], no_key),
+            decide(&reply(Status::Active), &mut s, &[]),
             vec![Control::Accepting(true)]
         );
         assert_eq!(
-            decide(&reply(Status::UpgradeRequired, 0), &mut s, &[], no_key),
+            decide(&reply(Status::UpgradeRequired), &mut s, &[]),
             vec![Control::Accepting(false)]
         );
         assert_eq!(
-            decide(&reply(Status::Revoked, 0), &mut s, &[], no_key),
+            decide(&reply(Status::Revoked), &mut s, &[]),
             vec![Control::Exit]
         );
     }
 
     #[test]
-    fn a_new_key_version_fetches_the_key_once() {
-        let mut s = seen();
-        let got = decide(&reply(Status::Active, 1), &mut s, &[], || {
-            Ok(KeyResponse {
-                node_key: "k1".into(),
-                key_version: 1,
-            })
-        });
-        assert_eq!(got, vec![Control::Key("k1".into())]);
-        assert_eq!(s.key_version, 1);
-        assert!(decide(&reply(Status::Active, 1), &mut s, &[], no_key).is_empty());
-        // A failed fetch is tried again at the next heartbeat.
-        let got = decide(&reply(Status::Active, 2), &mut s, &[], || {
-            Err(Error::Transport("down".into()))
-        });
-        assert!(got.is_empty());
-        assert_eq!(s.key_version, 1);
-    }
-
-    #[test]
     fn new_peers_are_passed_on_once() {
         let mut s = seen();
-        let mut r = reply(Status::Active, 0);
+        let mut r = reply(Status::Active);
         r.peers = vec![
             Peer {
                 node_id: "rn_b".into(),
@@ -558,56 +488,42 @@ mod tests {
             },
         ];
         assert_eq!(
-            decide(&r, &mut s, &[], no_key),
+            decide(&r, &mut s, &[]),
             vec![Control::Peers(vec![(
                 "rn_b".into(),
                 "198.51.100.2:3478".parse().unwrap()
             )])]
         );
-        assert!(decide(&r, &mut s, &[], no_key).is_empty(), "the same again");
+        assert!(decide(&r, &mut s, &[]).is_empty(), "the same again");
         r.peers.clear();
-        assert_eq!(
-            decide(&r, &mut s, &[], no_key),
-            vec![Control::Peers(vec![])]
-        );
+        assert_eq!(decide(&r, &mut s, &[]), vec![Control::Peers(vec![])]);
     }
 
     #[test]
     fn issuers_are_this_nodes_own_and_the_control_planes_passed_on_once() {
         const A: &str = "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w";
         const B: &str = "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw";
-        let key = |pubkey: &str, home| IssuerKey {
+        let key = |pubkey: &str| IssuerKey {
             pubkey: pubkey.into(),
-            home,
         };
         let local = vec![A.to_string()];
         let mut s = seen();
-        s.issuers = super::local(&local);
-        let mut r = reply(Status::Active, 0);
+        s.issuers = local.clone();
+        let mut r = reply(Status::Active);
         assert!(
-            decide(&r, &mut s, &local, no_key).is_empty(),
+            decide(&r, &mut s, &local).is_empty(),
             "the local ones from the start"
         );
-        r.issuers = vec![key(B, true), key(A, false), key("not a key", false)];
+        r.issuers = vec![key(B), key(A), key("not a key")];
         assert_eq!(
-            decide(&r, &mut s, &local, no_key),
-            vec![Control::Issuers(vec![key(A, false), key(B, true)])],
-            "the control plane's home issuer stays marked"
+            decide(&r, &mut s, &local),
+            vec![Control::Issuers(vec![A.into(), B.into()])]
         );
-        assert!(
-            decide(&r, &mut s, &local, no_key).is_empty(),
-            "the same again"
-        );
-        // The node's own key, named home by the control plane too: home.
-        r.issuers = vec![key(A, true)];
-        assert_eq!(
-            decide(&r, &mut s, &local, no_key),
-            vec![Control::Issuers(vec![key(A, true)])]
-        );
+        assert!(decide(&r, &mut s, &local).is_empty(), "the same again");
         r.issuers.clear();
         assert_eq!(
-            decide(&r, &mut s, &local, no_key),
-            vec![Control::Issuers(vec![key(A, false)])],
+            decide(&r, &mut s, &local),
+            vec![Control::Issuers(vec![A.into()])],
             "the control plane's gone; the node's own stay"
         );
     }

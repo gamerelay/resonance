@@ -6,37 +6,40 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
 
 ## 2026-10-01
 
-**Signed tickets from several issuers.** Additions within API `2026-09-29`.
+**Players' credentials are tickets, from any issuer the node trusts.** The shared-key
+credentials are gone.
 
-- A credential any trusted issuer mints, an ed25519 key: a control plane, or a game's own server
-  (`resonance_turn::ticket`). The username carries the issuer's signature. The password comes
-  from key agreement between a fresh X25519 key in the ticket and the node's sealing key, so the
-  node shares no secret with the issuer, and one ticket serves every node (docs/PROTOCOL.md,
-  "Tickets").
+- A ticket is signed by an issuer, an ed25519 key: a control plane, or a game's own server
+  (`resonance_turn::ticket`). The password comes from key agreement between a fresh X25519 key in
+  the ticket and the node's sealing key, so the node shares no secret with any issuer, and one
+  ticket serves every node (docs/PROTOCOL.md, "Tickets").
 - Rooms are scoped by issuer (`<kid>/<instance>`), so one issuer can't mint into another's rooms.
-  The control plane's own issuer (`home` in its list) is the exception: its tickets name rooms as
-  its HMAC credentials do, so players holding different kinds in one room, while a node switches
-  over, still reach each other (found in review: they were in different rooms).
   A ticket lasts a day at most (plus 5 minutes of clock skew). An issuer no longer trusted is
   refused at its allocations' next request.
 - Ticket checks (~40 µs each) are budgeted per IP on every transport, and a checked ticket is
-  remembered (8,192 of them), so a flood of tickets can't hold the loop up and a player's other
-  allocations cost a hash.
+  remembered (8,192 of them), so a flood can't hold the loop up and a player's other allocations
+  cost a hash.
 - The sealing key is derived from the node's ed25519 seed, so there's no new key file. It goes
-  with the join and each heartbeat (`seal_key`); `status` prints it.
+  with the join and each heartbeat (`seal_key`); `seal-key` and `status` print it.
 - Trusted issuers: `RESONANCE_ISSUERS`, and the control plane's list in each heartbeat's answer
-  (`issuers`); the control plane's are saved to `issuers.json`.
-- **A restart while the control plane is out of reach still relays.** With saved issuers, the
-  node waits a few seconds for its key, then relays ticket holders, and fetches the key with the
-  first heartbeat answered. Before, it waited for the control plane to come back. Nothing is
-  checked against an empty key meanwhile.
-- The control plane's HMAC credentials still work, for nodes and control planes that don't know
-  tickets yet. Any mix of old and new nodes and control planes works.
-- Tests: the fixture shared with the control plane (the same ticket and password minted by
-  GameRelay's `turn.test.ts`); untrusted, tampered, expired, over-long and wrongly keyed tickets;
-  rooms scoped by issuer; an issuer dropped mid-allocation; a node with no key yet (and an empty
-  key signing nothing); a flood of bad tickets over a stream spending only its IP's budget. In GameRelay's e2e: Chrome players relaying through a joined node with
-  tickets, and through the same node restarted with its control plane out of reach.
+  (`issuers`). The control plane's are saved to `issuers.json`, so a node restarted while its
+  control plane is out of reach still relays ticket holders. Before, a node started then waited
+  for the control plane, since it couldn't fetch its key.
+- **Gone:** the HMAC credentials, a node key per node (`/nodes/key`, `key_version`, rotation),
+  and running by hand with `TURN_SECRET`. A leftover `TURN_SECRET` or `RESONANCE_NODE_KEY` is
+  ignored, and said to be. Removing `/nodes/key` and `key_version` breaks API `2026-09-29` for
+  builds from before: done within it because nothing else speaks it (GameRelay's control plane
+  changes with this, and its two nodes are redeployed).
+- **On its own** (no control plane): `RESONANCE_ISSUERS` alone. `resonance-node issuer <file>`
+  and `mint` are a minimal issuer.
+- Tests: the fixture shared with the control plane, in three implementations (Rust, GameRelay's
+  TypeScript, and Go in `interop/ticket`); untrusted, tampered, expired, over-long and wrongly
+  keyed tickets; rooms scoped by issuer; an issuer dropped mid-allocation; a flood of bad
+  tickets over a stream spending only its IP's budget. The interop tests (pion over UDP, TCP and
+  TLS; coturn in six modes; the browsers) and the benchmark mint tickets. In GameRelay's e2e:
+  Chrome players relaying through a joined node, and through it again restarted with its control
+  plane cut off.
+- The benchmark measures builds that take tickets; v0.1.0 and the Go relay need it as of v0.1.0.
 
 **v0.1.0**, the first tagged release: everything below, as in production on both nodes since
 2026-09-30, with these docs.

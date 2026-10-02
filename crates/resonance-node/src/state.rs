@@ -10,7 +10,6 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::SigningKey;
-use resonance_proto::IssuerKey;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -47,7 +46,17 @@ impl State {
 
     /// This node's key, made on first use.
     pub fn key(&self) -> std::io::Result<SigningKey> {
-        let path = self.dir.join("key");
+        self.make_key("key", true)
+    }
+
+    /// An ed25519 key in this directory, made on first use: 32 bytes, mode 0600. The directory is
+    /// left as it is, unless it's made for the key.
+    pub fn key_at(&self, name: &str) -> std::io::Result<SigningKey> {
+        self.make_key(name, false)
+    }
+
+    fn make_key(&self, name: &str, private_dir: bool) -> std::io::Result<SigningKey> {
+        let path = self.dir.join(name);
         match fs::read(&path) {
             Ok(b) if b.len() == 32 => Ok(SigningKey::from_bytes(
                 b.as_slice().try_into().expect("32 bytes"),
@@ -57,8 +66,12 @@ impl State {
                 path.display()
             ))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // The node's state directory is private; another directory only if made for it.
+                let made = !self.dir.exists();
                 fs::create_dir_all(&self.dir)?;
-                fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))?;
+                if private_dir || made {
+                    fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))?;
+                }
                 let mut seed = [0u8; 32];
                 getrandom::fill(&mut seed).map_err(|e| std::io::Error::other(e.to_string()))?;
                 let mut f = fs::OpenOptions::new()
@@ -94,8 +107,9 @@ impl State {
         fs::rename(tmp, self.dir.join("node.json"))
     }
 
-    /// The issuers last saved; none if there's no file yet.
-    pub fn issuers(&self) -> std::io::Result<Vec<IssuerKey>> {
+    /// The control plane's issuers last saved (base64url public keys); none if there's no file
+    /// yet.
+    pub fn issuers(&self) -> std::io::Result<Vec<String>> {
         match fs::read(self.dir.join("issuers.json")) {
             Ok(b) => serde_json::from_slice(&b).map_err(std::io::Error::other),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -103,7 +117,7 @@ impl State {
         }
     }
 
-    pub fn save_issuers(&self, keys: &[IssuerKey]) -> std::io::Result<()> {
+    pub fn save_issuers(&self, keys: &[String]) -> std::io::Result<()> {
         fs::create_dir_all(&self.dir)?;
         let tmp = self.dir.join("issuers.json.tmp");
         fs::write(
@@ -148,19 +162,9 @@ mod tests {
     #[test]
     fn issuers_round_trip() {
         let s = State::new(tmp());
-        assert_eq!(s.issuers().unwrap(), Vec::new());
-        let keys = vec![
-            IssuerKey {
-                pubkey: "a".into(),
-                home: true,
-            },
-            IssuerKey {
-                pubkey: "b".into(),
-                home: false,
-            },
-        ];
-        s.save_issuers(&keys).unwrap();
-        assert_eq!(s.issuers().unwrap(), keys);
+        assert_eq!(s.issuers().unwrap(), Vec::<String>::new());
+        s.save_issuers(&["a".into(), "b".into()]).unwrap();
+        assert_eq!(s.issuers().unwrap(), vec!["a".to_string(), "b".to_string()]);
         fs::remove_dir_all(s.dir()).unwrap();
     }
 

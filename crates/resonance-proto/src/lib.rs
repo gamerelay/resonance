@@ -74,13 +74,6 @@ pub struct JoinResponse {
     pub heartbeat_s: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct KeyResponse {
-    /// This node's own key: it mints credentials for this node only.
-    pub node_key: String,
-    pub key_version: u32,
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Heartbeat {
     pub allocations: u64,
@@ -141,7 +134,6 @@ pub enum Status {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct HeartbeatResponse {
     pub status: Status,
-    pub key_version: u32,
     pub latest_version: String,
     pub min_version: String,
     /// The other nodes to measure. An addition within 2026-09-29: a control plane that doesn't
@@ -158,11 +150,6 @@ pub struct HeartbeatResponse {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IssuerKey {
     pub pubkey: String,
-    /// The control plane's own issuer: its tickets name rooms as its HMAC credentials do, so a
-    /// room's players relay to each other whichever kind each holds. Others' rooms are scoped by
-    /// their key id. An addition within 2026-09-29.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub home: bool,
 }
 
 /// An error answer: `{ error, message }`.
@@ -249,6 +236,10 @@ mod tests {
         let r: HeartbeatResponse = serde_json::from_str(r#"{"status":"paused","key_version":0,"latest_version":"2027-01-01","min_version":"2026-09-29","extra":1}"#).unwrap();
         assert_eq!(r.status, Status::Unknown);
         let r: HeartbeatResponse = serde_json::from_str(r#"{"status":"upgrade_required","key_version":2,"latest_version":"x","min_version":"y"}"#).unwrap();
-        assert_eq!((r.status, r.key_version), (Status::UpgradeRequired, 2));
+        assert_eq!(
+            r.status,
+            Status::UpgradeRequired,
+            "a key_version from an older control plane is ignored"
+        );
     }
 }
