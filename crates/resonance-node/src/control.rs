@@ -50,6 +50,13 @@ impl Error {
     }
 }
 
+impl Error {
+    /// The control plane says it has no such node (`unknown_node`).
+    pub fn unknown_node(&self) -> bool {
+        matches!(self, Error::Refused { status: 401, error, .. } if error == "unknown_node")
+    }
+}
+
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -262,6 +269,11 @@ impl Heartbeats {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("heartbeat: {e}");
+                    if let Some(c) = decide_error(&e, &mut seen) {
+                        if self.controls.send(c).is_err() {
+                            return;
+                        }
+                    }
                     continue;
                 }
             };
@@ -287,11 +299,34 @@ impl Heartbeats {
     }
 }
 
+/// The most other nodes a node measures.
+pub const MAX_PEERS: usize = 64;
+
+/// An address a peer node could have: not unspecified, multicast or broadcast, and with a port.
+fn probeable(ip: std::net::IpAddr) -> bool {
+    !ip.is_unspecified()
+        && !ip.is_multicast()
+        && !matches!(ip, std::net::IpAddr::V4(v4) if v4.is_broadcast())
+}
+
 /// What the relay loop was last told.
 struct Seen {
     accepting: bool,
     peers: Vec<Peer>,
     issuers: Vec<String>,
+}
+
+/// What a refused heartbeat means for the relay loop. Deleted from the registry (while offline,
+/// so it never heard it was revoked): no new allocations until the control plane knows it again,
+/// and the ones in use carry on. Not an exit: a control plane that lost its registry would
+/// otherwise stop every node.
+fn decide_error(e: &Error, seen: &mut Seen) -> Option<Control> {
+    if !e.unknown_node() || !seen.accepting {
+        return None;
+    }
+    eprintln!("the control plane doesn't know this node: no new allocations");
+    seen.accepting = false;
+    Some(Control::Accepting(false))
 }
 
 /// What one heartbeat answer means for the relay loop.
@@ -328,10 +363,14 @@ fn decide(reply: &HeartbeatResponse, seen: &mut Seen, local_issuers: &[String]) 
     }
     if reply.peers != seen.peers {
         seen.peers = reply.peers.clone();
+        // Probes go every 2 s to each: so at most MAX_PEERS of them, and only to addresses a
+        // node could have, whatever the control plane says.
         let peers = reply
             .peers
             .iter()
-            .filter_map(|p| Some((p.node_id.clone(), p.addr.parse().ok()?)))
+            .filter_map(|p| Some((p.node_id.clone(), p.addr.parse::<SocketAddr>().ok()?)))
+            .filter(|(_, a)| probeable(a.ip()))
+            .take(MAX_PEERS)
             .collect::<Vec<_>>();
         eprintln!(
             "measuring {} other node{}",
@@ -497,6 +536,78 @@ mod tests {
         assert!(decide(&r, &mut s, &[]).is_empty(), "the same again");
         r.peers.clear();
         assert_eq!(decide(&r, &mut s, &[]), vec![Control::Peers(vec![])]);
+    }
+
+    #[test]
+    fn peers_are_capped_and_only_addresses_a_node_could_have() {
+        // The review of 2026-10-01: the peer list makes the node send probes every 2 s, so a
+        // control plane (or someone between) can't aim it at a crowd or a broadcast address.
+        let mut s = Seen {
+            accepting: true,
+            peers: Vec::new(),
+            issuers: Vec::new(),
+        };
+        let mut r = reply(Status::Active);
+        r.peers = [
+            "0.0.0.0:3478",
+            "224.0.0.1:3478",
+            "255.255.255.255:3478",
+            "[ff02::1]:3478",
+        ]
+        .iter()
+        .map(|a| Peer {
+            node_id: "rn_bad".into(),
+            addr: (*a).into(),
+        })
+        .chain((0..100).map(|i| Peer {
+            node_id: format!("rn_{i}"),
+            addr: format!("198.51.100.{}:3478", i + 1),
+        }))
+        .collect();
+        let out = decide(&r, &mut s, &[]);
+        let [Control::Peers(peers)] = &out[..] else {
+            panic!("{out:?}")
+        };
+        assert_eq!(peers.len(), MAX_PEERS);
+        assert!(peers.iter().all(|(id, _)| id != "rn_bad"));
+    }
+
+    #[test]
+    fn unknown_node_is_told_apart_from_other_refusals() {
+        let e = |status, error: &str| Error::Refused {
+            status,
+            error: error.into(),
+            message: String::new(),
+        };
+        assert!(e(401, "unknown_node").unknown_node());
+        assert!(!e(401, "replayed").unknown_node());
+        assert!(!e(503, "unknown_node").unknown_node());
+        assert!(!Error::Transport("down".into()).unknown_node());
+    }
+
+    #[test]
+    fn a_node_the_control_plane_forgot_drains_once_and_comes_back_when_it_knows_it_again() {
+        let mut s = Seen {
+            accepting: true,
+            peers: Vec::new(),
+            issuers: Vec::new(),
+        };
+        let unknown = Error::Refused {
+            status: 401,
+            error: "unknown_node".into(),
+            message: String::new(),
+        };
+        assert_eq!(
+            decide_error(&unknown, &mut s),
+            Some(Control::Accepting(false))
+        );
+        assert_eq!(decide_error(&unknown, &mut s), None, "once");
+        assert_eq!(decide_error(&Error::Transport("down".into()), &mut s), None);
+        assert_eq!(
+            decide(&reply(Status::Active), &mut s, &[]),
+            vec![Control::Accepting(true)],
+            "known again: taking allocations"
+        );
     }
 
     #[test]

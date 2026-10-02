@@ -32,9 +32,13 @@ fn ticket_server(t: Instant) -> Server {
 }
 
 fn mint(by: &SigningKey, expiry: u64, room: &str, player: &str) -> Minted {
+    mint_in(by, "ins", expiry, room, player)
+}
+
+fn mint_in(by: &SigningKey, instance: &str, expiry: u64, room: &str, player: &str) -> Minted {
     static EPH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
     let eph = [EPH.fetch_add(1, std::sync::atomic::Ordering::Relaxed); 32];
-    ticket::mint(by, eph, expiry, "ins", room, player)
+    ticket::mint(by, eph, expiry, instance, room, player)
 }
 
 fn password(m: &Minted) -> String {
@@ -317,5 +321,68 @@ fn ticket_checks_are_budgeted_per_ip_on_every_transport_and_a_checked_ticket_is_
     assert_eq!(
         allocate(&mut Client::new("198.51.100.1:5003"), &mut s, later, &other),
         0
+    );
+}
+
+#[test]
+fn ticket_checks_from_everyone_together_are_budgeted_too() {
+    // The review of 2026-10-01: a per-IP budget alone let many IPs fill the loop with checks.
+    let t = Instant::now();
+    let mut s = server_with(t, |c| {
+        c.seal = Some(ticket::seal_secret(&SEED));
+        c.issuers = trusted(&[&issuer(1)]);
+        c.ticket_check_rate = 3.0;
+    });
+    let codes: Vec<u16> = (0..6)
+        .map(|i| {
+            let m = mint(&issuer(1), UNIX + 3600, "g1", &format!("p_{i}"));
+            allocate(
+                &mut Client::new(&format!("198.51.100.{}:5000", i + 1)),
+                &mut s,
+                t,
+                &m,
+            )
+        })
+        .collect();
+    assert_eq!(
+        codes,
+        [0, 0, 0, 401, 401, 401],
+        "three checks, whichever IPs"
+    );
+    let later = t + std::time::Duration::from_secs(1);
+    let m = mint(&issuer(1), UNIX + 3600, "g1", "p_late");
+    assert_eq!(
+        allocate(&mut Client::new("198.51.100.9:5000"), &mut s, later, &m),
+        0,
+        "and it refills"
+    );
+}
+
+#[test]
+fn one_issuer_cant_take_more_than_its_cap_whatever_its_instances() {
+    // The review of 2026-10-01: an issuer names its own instances, so only a cap on the issuer
+    // bounds it.
+    let t = Instant::now();
+    let mut s = server_with(t, |c| {
+        c.seal = Some(ticket::seal_secret(&SEED));
+        c.issuers = trusted(&[&issuer(1), &issuer(2)]);
+        c.max_per_issuer = 2;
+    });
+    let mut codes = Vec::new();
+    for (i, instance) in ["a", "b", "c"].into_iter().enumerate() {
+        let m = mint_in(&issuer(1), instance, UNIX + 3600, "g1", "p");
+        codes.push(allocate(
+            &mut Client::new(&format!("198.51.100.{}:5000", i + 1)),
+            &mut s,
+            t,
+            &m,
+        ));
+    }
+    assert_eq!(codes, [0, 0, 486]);
+    let theirs = mint_in(&issuer(2), "a", UNIX + 3600, "g1", "p");
+    assert_eq!(
+        allocate(&mut Client::new("198.51.100.9:5000"), &mut s, t, &theirs),
+        0,
+        "another issuer has its own"
     );
 }

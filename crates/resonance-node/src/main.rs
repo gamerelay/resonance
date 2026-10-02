@@ -301,14 +301,16 @@ fn run_node(s: Settings) {
         cfg.max_port
     );
     eprintln!(
-        "limits: {} allocations per player, {} per IP, {} per game; {} B/s per allocation (burst {}); unauthenticated answers {}/s per IP (burst {})",
+        "limits: {} allocations per player, {} per IP, {} per game, {} per issuer; {} B/s per allocation (burst {}); unauthenticated answers {}/s per IP (burst {}); ticket checks {}/s",
         cfg.max_per_player,
         cfg.max_per_ip,
         cfg.max_per_instance,
+        cfg.max_per_issuer,
         cfg.rate_bytes,
         cfg.burst_bytes,
         cfg.unauth_rate,
-        cfg.unauth_burst
+        cfg.unauth_burst,
+        cfg.ticket_check_rate
     );
     // It returns once the control plane revokes this node.
     relay::run(

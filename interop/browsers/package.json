@@ -1,0 +1,8 @@
+{
+  "name": "resonance-browsers",
+  "private": true,
+  "description": "The browsers' own TURN clients through the node (relay.mjs). Playwright matches the CI container image (mcr.microsoft.com/playwright:v1.63.0-noble): bump both together.",
+  "dependencies": {
+    "playwright": "1.63.0"
+  }
+}

@@ -113,7 +113,7 @@ export TURN_PUBLIC_IP=<its public IP>        # where players reach it
 
 The node's ed25519 key and registration stay in `RESONANCE_STATE_DIR` (default
 `/var/lib/resonance`); the key never leaves the box. `RESONANCE_CONTROL` is the control plane
-(default `https://gamerelay.io`). While it's active and heard from, the control plane hands it out
+(default `https://gamerelay.io`; https only, except on localhost). While it's active and heard from, the control plane hands it out
 to players with tickets it signs, and tells it whose tickets to take; draining it stops new
 allocations, and revoking it stops the node.
 

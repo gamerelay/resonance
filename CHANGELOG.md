@@ -6,6 +6,22 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
 
 ## 2026-10-02
 
+**The review's other security items.** Each has a test that fails without it.
+
+- **Ticket checks are budgeted for everyone together too** (`TURN_TICKET_CHECK_RATE`, 5,000/s),
+  not only per IP, so many IPs can't fill the loop with them.
+- **An issuer has its own cap** (`TURN_MAX_PER_ISSUER`, 8,192, half the relay ports): it names
+  its own instances, so the per-instance cap alone didn't bound it.
+- **The control plane is reached over https only** (`http://` only for localhost): its answers
+  say whose tickets to take.
+- **At most 64 peers are measured**, and only addresses a node could have (not unspecified,
+  multicast or broadcast), whatever the control plane's list says.
+- **A node the control plane no longer knows stops taking new allocations** (a 401
+  `unknown_node`, as when it was deleted while offline) and starts again once it's known; it
+  doesn't exit, so a control plane that lost its registry can't stop every node.
+- CI's actions are pinned to commits, and the browser test installs Playwright from a committed
+  lockfile (`npm ci`).
+
 **A node's memory stays bounded whatever its clients do.** The review of 2026-10-01 (TECH_DEBT.md)
 found two ways for clients to fill a node past its memory cap; both are closed.
 

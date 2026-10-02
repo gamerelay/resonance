@@ -1,6 +1,7 @@
 //! How many of something each key holds, forgetting a key at zero: so a map of them only ever
 //! holds what's in use (allocations per player, per IP, per game; streams per IP).
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::Hash;
 
@@ -13,7 +14,10 @@ impl<K: Hash + Eq> Default for Counts<K> {
 }
 
 impl<K: Hash + Eq> Counts<K> {
-    pub fn get(&self, k: &K) -> u32 {
+    pub fn get<Q: Hash + Eq + ?Sized>(&self, k: &Q) -> u32
+    where
+        K: Borrow<Q>,
+    {
         self.0.get(k).copied().unwrap_or(0)
     }
 
@@ -22,7 +26,10 @@ impl<K: Hash + Eq> Counts<K> {
     }
 
     /// One fewer; the key is gone at zero. Releasing a key that holds nothing does nothing.
-    pub fn release(&mut self, k: &K) {
+    pub fn release<Q: Hash + Eq + ?Sized>(&mut self, k: &Q)
+    where
+        K: Borrow<Q>,
+    {
         if let Some(n) = self.0.get_mut(k) {
             *n -= 1;
             if *n == 0 {
