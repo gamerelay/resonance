@@ -3,7 +3,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest, Md5};
 use sha2::Sha256;
 
@@ -46,7 +46,7 @@ impl Nonces {
     }
 
     fn mac(&self, expiry: u64, client: SocketAddr) -> String {
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.key).expect("any key length");
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&self.key).expect("any key length");
         mac.update(&expiry.to_be_bytes());
         match client.ip().to_canonical() {
             IpAddr::V4(ip) => mac.update(&ip.octets()),
