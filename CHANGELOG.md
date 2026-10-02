@@ -6,6 +6,17 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
 
 ## 2026-10-02
 
+**v0.2.0.** The first release since tickets, which broke the control-plane API in place
+(2026-10-01): a build's `software` now says which side of that it's on. Everything below, as
+in production on both nodes (`afb2677`), plus the docs and dependency updates since (#12–#14),
+and:
+
+- **An IPv6 `TURN_PUBLIC_IP` is refused at startup.** The node listens on IPv4 only, so it
+  would have handed out `turn:[v6]` URLs that nothing answers. Serving IPv6 is TECH_DEBT 27.
+- **CI checks overflow and the minimum Rust version.** The tests and the 2M fuzz run also run in
+  a debug build, which checks integer overflow (release builds wrap silently), and a job builds
+  with Rust 1.85, the crates' `rust-version`.
+
 **Dependencies up to date, together.** The RustCrypto and dalek crates move as one set, so the
 build has one copy of each: ed25519-dalek and x25519-dalek 3 (curve25519-dalek 5), hmac 0.13,
 sha1, sha2 and md-5 0.11 (digest 0.11), base64 0.23, getrandom 0.4; actions/checkout 7 and

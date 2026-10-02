@@ -91,6 +91,13 @@ impl Settings {
             .get("TURN_PUBLIC_IP")
             .and_then(|v| v.parse().ok())
             .ok_or("TURN_PUBLIC_IP (where players reach this node) is required")?;
+        // The node listens on IPv4 only, so it would advertise URLs it doesn't answer.
+        if public_ip.is_ipv6() {
+            return Err(format!(
+                "TURN_PUBLIC_IP {public_ip}: IPv6 isn't served yet (the node listens on IPv4 \
+                 only); give the node's IPv4 address"
+            ));
+        }
 
         let tls = match (env.get("TURN_TLS_CERT"), env.get("TURN_TLS_KEY")) {
             (Some(cert), Some(key)) => Some(TlsSettings {
@@ -312,7 +319,7 @@ mod tests {
     #[test]
     fn urls_are_udp_first_then_tcp_then_tls_by_name() {
         let s = settings(&[
-            ("TURN_PUBLIC_IP", "2001:db8::1"),
+            ("TURN_PUBLIC_IP", "192.0.2.1"),
             ("TURN_PORT", "3479"),
             ("TURN_TCP", "1"),
             ("TURN_TLS_CERT", "/c"),
@@ -324,11 +331,20 @@ mod tests {
         assert_eq!(
             s.urls(),
             [
-                "turn:[2001:db8::1]:3479",
-                "turn:[2001:db8::1]:3479?transport=tcp",
+                "turn:192.0.2.1:3479",
+                "turn:192.0.2.1:3479?transport=tcp",
                 "turns:turn.example.com:443?transport=tcp",
             ]
         );
+    }
+
+    #[test]
+    fn an_ipv6_public_ip_is_refused_until_its_served() {
+        // The node binds 0.0.0.0, so it would hand out turn:[v6] URLs nothing answers.
+        for ip in ["2001:db8::1", "::1"] {
+            assert!(error(&[("TURN_PUBLIC_IP", ip)]).contains("IPv6 isn't served yet"));
+        }
+        assert!(error(&[("TURN_PUBLIC_IP", "nope")]).contains("is required"));
     }
 
     #[test]

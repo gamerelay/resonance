@@ -106,7 +106,7 @@ flowchart LR
 
 ```sh
 cargo build --release
-export TURN_PUBLIC_IP=<its public IP>        # where players reach it
+export TURN_PUBLIC_IP=<its public IPv4>      # where players reach it (IPv6 isn't served yet)
 ./target/release/resonance-node join <token> # once: makes its key, registers it
 ./target/release/resonance-node run          # a heartbeat every 15 s
 ./target/release/resonance-node status
@@ -122,7 +122,7 @@ allocations, and revoking it stops the node.
 
 ```sh
 ./target/release/resonance-node issuer issuer.key   # makes an issuer key, prints its public key
-RESONANCE_ISSUERS=<that public key> TURN_PUBLIC_IP=<its public IP> ./target/release/resonance-node
+RESONANCE_ISSUERS=<that public key> TURN_PUBLIC_IP=<its public IPv4> ./target/release/resonance-node
 ./target/release/resonance-node seal-key            # what tickets for this node are minted with
 ./target/release/resonance-node mint issuer.key <seal key> <instance> <room> <player> [seconds]  # username, password; 3600 s by default, at most a day
 ```

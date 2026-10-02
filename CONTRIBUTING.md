@@ -20,7 +20,7 @@ all of it on every pull request.
 ## Before you open a pull request
 
 - **Lint and format.** `cargo fmt` and `cargo clippy --all-targets -- -D warnings` must pass.
-- **The minimum Rust version is 1.85** (`rust-version` in `Cargo.toml`). Let-chains
+- **The minimum Rust version is 1.85** (`rust-version` in `Cargo.toml`; CI builds with it). Let-chains
   (`if let … && …`) aren't stable there; use nested `if`.
 - **Rules go in the core.** A TURN rule belongs in `resonance-turn`, which never touches sockets
   or the clock, and it gets a test there. `resonance-node` only moves bytes and time in and out.

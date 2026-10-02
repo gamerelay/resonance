@@ -17,7 +17,10 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --release
-      - run: FUZZ_ITERS=2000000 cargo test --release --test fuzz
+      # A debug build checks integer overflow, which release builds wrap silently: the tests and
+      # the fuzz run again with it on, so "nothing panics" covers overflow too.
+      - run: cargo test
+      - run: FUZZ_ITERS=2000000 cargo test --test fuzz
       - run: cargo build --release -p resonance-node
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -26,6 +29,16 @@ jobs:
         run: cd interop && go test -count=1 ./...
       - name: interop with coturn's TURN client
         run: sudo apt-get update -qq && sudo apt-get install -y -qq coturn && interop/coturn.sh
+
+  msrv:
+    # rust-version in Cargo.toml: what the crates promise to build with.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: "1.85"
+      - run: cargo check --workspace --all-targets --locked
 
   browsers:
     # Chromium, Firefox and WebKit's own TURN clients through the node, every pairing, relay only:

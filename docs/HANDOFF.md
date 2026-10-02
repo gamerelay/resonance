@@ -14,8 +14,9 @@ control-plane side.
   joined to GameRelay's registry: join, heartbeats, drain, revoke. Both nodes, `sfo-1` and
   `nyc-1`, run `afb2677` (2026-10-02: tickets, plus every security fix from the review), each on
   its own droplet with TLS on 443; they measure each other in GameRelay's Admin → Network, and
-  both have `RESONANCE_ALERT_WEBHOOK` set. `main` is ahead only by docs and dependency updates
-  (#12, #13: no change on the wire), so there's nothing to redeploy until the next node change.
+  both have `RESONANCE_ALERT_WEBHOOK` set. `main` is v0.2.0: that, plus docs and dependency
+  updates and refusing an IPv6 `TURN_PUBLIC_IP` (both nodes are IPv4), so nothing changes for
+  them until the next install.
 - **Players' credentials are tickets** since 2026-10-01 (PR #7; docs/PROTOCOL.md, "Tickets"):
   the shared-key credentials are gone. A control plane that mints only tickets doesn't hand out
   a node that hasn't sent its sealing key.
@@ -76,10 +77,8 @@ The README's "Tests" has the commands. Locally on a Mac:
 
 ## Next
 
-- **The 0.2.0 release** (TECH_DEBT 12): the crates still say 0.1.0 after tickets' breaking
-  change. A version bump, a CHANGELOG line and a tag.
-- **IPv6** (TECH_DEBT 11): a v6 `TURN_PUBLIC_IP` is accepted but never served. Bind `[::]`, or
-  refuse it until then.
+- **Serving IPv6** (TECH_DEBT 27): a v6 `TURN_PUBLIC_IP` is refused since v0.2.0. Serving it
+  needs a v6 socket, core tests with a v6 public IP, and care with probes across families.
 - **C1 and C2** from "Classes of bug to rule out": one memory budget for everything a client can
   make the node hold, and signed heartbeat answers. C3 (lints against panics and overflow) is
   cheap insurance.
