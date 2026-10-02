@@ -93,6 +93,50 @@ fn a_silent_stream_is_closed_once_idle() {
     assert!(hung_up(&mut s, Duration::from_secs(3)));
 }
 
+/// Binding requests back to back, `n` of them, never reading the answers.
+fn flood(s: &mut TcpStream, n: usize) {
+    let many: Vec<u8> = BINDING
+        .iter()
+        .copied()
+        .cycle()
+        .take(BINDING.len() * n)
+        .collect();
+    s.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+    let _ = s.write_all(&many);
+}
+
+#[test]
+fn streams_that_send_and_never_read_are_closed_and_a_reader_is_kept() {
+    // The review of 2026-10-01: answers queued for clients that never read them filled the node.
+    // Small totals here, so a few streams are enough to pass them.
+    let node = start(None, |l| {
+        l.max_streams_per_ip = 16;
+        l.queued_total = 256 * 1024;
+        l.held_total = 256 * 1024;
+    });
+    let mut reader = TcpStream::connect(node.tcp).unwrap();
+    bind(&mut reader);
+    let mut hoarders: Vec<TcpStream> = (0..8)
+        .map(|_| TcpStream::connect(node.tcp).unwrap())
+        .collect();
+    for h in &mut hoarders {
+        // About 1.3 MB of answers each: past the kernel's buffers and the stream's queue.
+        flood(h, 20_000);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut closed = 0;
+    for h in &mut hoarders {
+        let left = deadline.saturating_duration_since(Instant::now());
+        // Each was sent far more than it read, so the node hangs up (the reads here come
+        // after the fact; they drain what was already sent).
+        if hung_up(h, left.max(Duration::from_millis(100))) {
+            closed += 1;
+        }
+    }
+    assert!(closed >= 4, "only {closed} of 8 hoarders were closed");
+    bind(&mut reader);
+}
+
 #[test]
 fn streams_from_one_ip_are_capped() {
     let node = start(None, |l| l.max_streams_per_ip = 2);

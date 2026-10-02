@@ -40,6 +40,9 @@ pub struct Config {
     pub max_lifetime_s: u32,
     pub permission_lifetime: Duration,
     pub channel_lifetime: Duration,
+    /// Channels one allocation may have at once: one per peer it talks to, so a room's worth.
+    /// Each is a few bytes, but without a cap one allocation could bind all 16,384.
+    pub max_channels: usize,
     /// How long past its lifetime an allocation is kept: a refresh that's late by a lost packet
     /// or two (Firefox refreshes only 10 s before the end) still finds it.
     pub grace: Duration,
@@ -72,6 +75,7 @@ impl Config {
             max_lifetime_s: 3600,
             permission_lifetime: Duration::from_secs(300),
             channel_lifetime: Duration::from_secs(600),
+            max_channels: 16,
             grace: Duration::from_secs(60),
             nonce_key,
             seal: None,
@@ -801,8 +805,11 @@ impl Server {
         if let Some(r) = self.peer_refusal(peer, key) {
             return Err(r);
         }
-        let (channel_life, permission_life) =
-            (self.cfg.channel_lifetime, self.cfg.permission_lifetime);
+        let (channel_life, permission_life, max_channels) = (
+            self.cfg.channel_lifetime,
+            self.cfg.permission_lifetime,
+            self.cfg.max_channels,
+        );
         let a = self.alloc_mut(i);
         // A channel names one peer and a peer one channel, for the channel's life (RFC 8656 §11).
         let clash = a
@@ -812,8 +819,11 @@ impl Server {
         if clash {
             return Err(bad());
         }
+        let full = a.channels.len() >= max_channels;
         match a.channels.iter_mut().find(|c| c.number == number) {
             Some(c) => c.expires = now + channel_life,
+            // A new one past the cap: 508, as for an allocation past its caps.
+            None if full => return Err(Refusal::signed(508, key)),
             None => a.channels.push(Channel {
                 number,
                 peer_port: peer.port(),

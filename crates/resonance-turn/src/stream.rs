@@ -35,6 +35,12 @@ impl Framer {
         self.buf.extend_from_slice(bytes);
     }
 
+    /// Bytes it holds (its buffer's capacity): at most about one message plus what one read
+    /// brought.
+    pub fn held(&self) -> usize {
+        self.buf.capacity()
+    }
+
     /// The next whole message, `Junk`, or None until more bytes arrive.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<Frame<'_>> {

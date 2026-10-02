@@ -98,9 +98,14 @@ read, handled and answered in one go.
 
 - **Fairness.** Each turn of the loop reads at most 1,024 datagrams from UDP and 256 KB from any
   one stream, so a busy client can't starve the rest.
-- **Back-pressure.** Each stream has its own outgoing queue (`Outbox`), capped at 256 KB. Past
+- **Back-pressure.** Each stream has its own outgoing queue (`Outbox`), capped at 64 KB, and
+  16 MB for all of them together; the kernel's send buffer for a stream is fixed at 64 KB. Past
   that, whole messages are dropped and the connection stays open. Games prefer a lost frame to a
   dropped player.
+- **Memory.** Once a second the loop adds up what all streams hold (queues, and messages half
+  read). Past 32 MB it closes the streams holding the most: a client that reads what it's sent
+  holds next to nothing, so those are clients sending and never reading. With 1,024 streams at
+  most, the node's memory stays bounded whatever its clients do.
 - **Timers.** Once a second the loop expires allocations, permissions and stream deadlines, and
   sends due probes. Once a minute it logs a stats line.
 
