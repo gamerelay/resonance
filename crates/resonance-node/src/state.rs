@@ -20,6 +20,10 @@ pub struct Joined {
     pub control: String,
     /// The API version it joined with (§5): its requests default to it.
     pub api_version: String,
+    /// The control plane's ed25519 key, base64url: only answers it signed are believed. From the
+    /// join's answer, or the first heartbeat's for a node that joined before signed answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_key: Option<String>,
 }
 
 pub struct State {
@@ -107,6 +111,15 @@ impl State {
         fs::rename(tmp, self.dir.join("node.json"))
     }
 
+    /// Keeps the control plane's key in `node.json`, learnt after joining.
+    pub fn save_control_key(&self, key: &str) -> std::io::Result<()> {
+        let mut j = self
+            .joined()?
+            .ok_or_else(|| std::io::Error::other("not joined"))?;
+        j.control_key = Some(key.to_owned());
+        self.save_joined(&j)
+    }
+
     /// The control plane's issuers last saved (base64url public keys); none if there's no file
     /// yet.
     pub fn issuers(&self) -> std::io::Result<Vec<String>> {
@@ -169,6 +182,14 @@ mod tests {
     }
 
     #[test]
+    fn a_key_isnt_saved_for_a_node_that_hasnt_joined() {
+        let s = State::new(tmp());
+        assert!(s.save_control_key("k").is_err());
+        assert_eq!(s.joined().unwrap(), None);
+        let _ = fs::remove_dir_all(s.dir());
+    }
+
+    #[test]
     fn joined_round_trips() {
         let s = State::new(tmp());
         assert_eq!(s.joined().unwrap(), None);
@@ -177,9 +198,24 @@ mod tests {
             region: "iad".into(),
             control: "https://gamerelay.io".into(),
             api_version: "2026-09-29".into(),
+            control_key: Some("_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg".into()),
         };
         s.save_joined(&j).unwrap();
         assert_eq!(s.joined().unwrap(), Some(j));
+        // A node.json from before signed answers has no key.
+        fs::write(
+            s.dir().join("node.json"),
+            r#"{"node_id":"rn_x","region":"iad","control":"https://gamerelay.io","api_version":"2026-09-29"}"#,
+        )
+        .unwrap();
+        assert_eq!(s.joined().unwrap().unwrap().control_key, None);
+        // A key learnt later is kept with the rest as it was.
+        s.save_control_key("k").unwrap();
+        let j = s.joined().unwrap().unwrap();
+        assert_eq!(
+            (j.node_id.as_str(), j.control_key.as_deref()),
+            ("rn_x", Some("k"))
+        );
         fs::remove_dir_all(s.dir()).unwrap();
     }
 }

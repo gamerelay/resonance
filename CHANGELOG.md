@@ -33,6 +33,36 @@ refused, never allocated (`resonance_turn::budget`).
   total, and giving their room back once drained; a framer giving back a burst's room but
   keeping half a big message's; streams sitting on half a message closed by the sweep while a
   reader stays, and new streams answered after. Each fails without its fix.
+**The control plane's answers are signed** (TECH_DEBT C2). Additions within API `2026-09-29`.
+
+- Every answer, refusals included, carries `Resonance-Answer-Sig`: the control plane's ed25519
+  signature over the status, the whole request it answers (its node, its signing string and its
+  signature) and the body (PROTOCOL.md, "Signed answers"), so an answer can't be forged, replayed
+  against another request, or got by asking the control plane with this node's signature and
+  another node's id, path or body.
+- The key comes with the join's answer and every heartbeat's (`control_key`), and the node keeps
+  it in `node.json`. A node that joined before keeps the key from its first signed heartbeat
+  answer.
+- Once a node has the key, an answer it didn't sign is no answer: the node carries on as it was,
+  and alerts if that lasts. For the alert, any refusal but `unknown_node` counts as out of reach
+  now (before, a 4xx was an answer): a node fed refusals is as cut off as one that hears nothing.
+- `RESONANCE_CONTROL_KEY` gives the key out of band, so nothing between a node and its control
+  plane can choose it; one that doesn't match `node.json`'s stops the node from starting. Before, anyone between a node and its control plane (or holding its
+  DNS, or a certificate for its name) could tell it whose tickets to take, what to probe, or to
+  drain or stop.
+- Deploy the control plane first: a node from before ignores the signatures, and a node from
+  after believes an unsigned control plane until it has the key. A control plane rolled back
+  after nodes have the key looks out of reach to them (they keep relaying, and alert).
+- Tests: the fixture shared with GameRelay; the client against a control plane on loopback:
+  answers unsigned, signed by another key, with another status or body, in another spelling, and
+  refusals signed for a request made up with this node's signature (another node, path, body,
+  signature), all refused; refusals signed for this request believed, so `unknown_node` still
+  works; the key pinned at join, from a heartbeat, or given beforehand, never replaced by one an
+  answer names, and not pinned from an answer it didn't sign or from something that isn't a key;
+  only an answer or `unknown_node` keeps the alert quiet. In GameRelay's tests: every kind of
+  refusal signed for its request, and none for a made-up one. In its e2e: a node told it's
+  revoked by answers another key signed carries on, and one given a key that isn't its pinned
+  one won't start.
 
 **v0.2.0.** The first release since tickets, which broke the control-plane API in place
 (2026-10-01): a build's `software` now says which side of that it's on. Everything below, as
