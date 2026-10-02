@@ -5,6 +5,12 @@
 //! Every request, `join` included, is signed with the node's ed25519 key: `Resonance-Sig`
 //! (base64url) over [`signing_string`], with `Resonance-Ts` (unix ms) and `Resonance-Version`, and
 //! `Resonance-Node` after `join`.
+//!
+//! Every answer, refusals included, is signed by the control plane's own ed25519 key:
+//! `Resonance-Answer-Sig` over [`answer_signing_string`], which names the whole request it answers
+//! (its node, its signing string and its signature), so an answer can't be replayed against another
+//! request, or got by asking with another node's id, path or body. The key comes with the join's answer (and
+//! the heartbeat's, for nodes that joined before), and the node keeps it (`control_key`).
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,6 +25,8 @@ pub mod header {
     pub const TS: &str = "resonance-ts";
     pub const SIG: &str = "resonance-sig";
     pub const VERSION: &str = "resonance-version";
+    /// On every answer: the control plane's signature over [`super::answer_signing_string`].
+    pub const ANSWER_SIG: &str = "resonance-answer-sig";
 }
 
 const B32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
@@ -53,6 +61,38 @@ pub fn signing_string(method: &str, path: &str, version: &str, ts: &str, body: &
     format!("{method}\n{path}\n{version}\n{ts}\n{hex}")
 }
 
+/// The request an answer is for, as sent: its `Resonance-Node` ("" at join), its signing string
+/// ([`signing_string`], from its method, path, `Resonance-Version`, `Resonance-Ts` and body as
+/// sent), and its `Resonance-Sig`.
+pub struct Asked<'a> {
+    pub node: &'a str,
+    pub signing: &'a str,
+    pub sig: &'a str,
+}
+
+/// What the control plane signs on an answer: `resonance/answer/v1 \n status \n node \n
+/// hex(sha256(request signing string)) \n request sig \n hex(sha256(body))`. Each answer belongs
+/// to one request, all of it: a refusal the control plane gives a request someone else made up
+/// (another node's id with this one's signature, another path, another body) doesn't check out for
+/// the request this node sent.
+pub fn answer_signing_string(status: u16, asked: &Asked, body: &[u8]) -> String {
+    format!(
+        "resonance/answer/v1\n{status}\n{}\n{}\n{}\n{}",
+        asked.node,
+        hex_sha256(asked.signing.as_bytes()),
+        asked.sig,
+        hex_sha256(body)
+    )
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(64);
+    for b in Sha256::digest(bytes) {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    hex
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct JoinRequest {
     pub token: String,
@@ -72,6 +112,10 @@ pub struct JoinResponse {
     pub node_id: String,
     pub region: String,
     pub heartbeat_s: u64,
+    /// The control plane's ed25519 public key, base64url: it signs every answer, and the node
+    /// keeps it. An addition within 2026-09-29.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -144,6 +188,10 @@ pub struct HeartbeatResponse {
     /// 2026-09-29: none sent means none.
     #[serde(default)]
     pub issuers: Vec<IssuerKey>,
+    /// As in the join's answer, so a node that joined before signed answers learns it. An
+    /// addition within 2026-09-29.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_key: Option<String>,
 }
 
 /// An issuer's ed25519 public key, base64url (no padding).
@@ -192,6 +240,39 @@ mod tests {
         assert_eq!(
             B64.encode(key.sign(s.as_bytes()).to_bytes()),
             "4ouzZqtxvtuhwCVpoFdbIPlXyqwSQibcBU0iJUVZIS9U6-454Juxtd9lAfd5pSrSVOwXx4N60C_qPwuzXlWNCA"
+        );
+    }
+
+    // The same values as gamerelay.io test/resonance.test.ts: an answer the control plane signs
+    // with its key (here from the seed [9; 32]) is one the node checks.
+    #[test]
+    fn answer_fixture_shared_with_the_control_plane() {
+        let key = SigningKey::from_bytes(&[9; 32]);
+        assert_eq!(
+            B64.encode(key.verifying_key().to_bytes()),
+            "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg"
+        );
+        // The request of the fixture above, from node rn_72asyextvngonlc5w2nmguxzay.
+        let signing = signing_string(
+            "POST",
+            "/nodes/heartbeat",
+            "2026-09-29",
+            "1790000000000",
+            br#"{"allocations":1}"#,
+        );
+        let asked = Asked {
+            node: "rn_72asyextvngonlc5w2nmguxzay",
+            signing: &signing,
+            sig: "4ouzZqtxvtuhwCVpoFdbIPlXyqwSQibcBU0iJUVZIS9U6-454Juxtd9lAfd5pSrSVOwXx4N60C_qPwuzXlWNCA",
+        };
+        let s = answer_signing_string(200, &asked, br#"{"status":"active"}"#);
+        assert_eq!(
+            s,
+            "resonance/answer/v1\n200\nrn_72asyextvngonlc5w2nmguxzay\na05c3e6d54aeb6f6005967b87d96b97bd01ca4af5c3141e8dbe9b04dd696f29b\n4ouzZqtxvtuhwCVpoFdbIPlXyqwSQibcBU0iJUVZIS9U6-454Juxtd9lAfd5pSrSVOwXx4N60C_qPwuzXlWNCA\nffcc9870a751a0241f5f2bdac8e6646c40b92bb226e8efc4af2e29cc242fc176"
+        );
+        assert_eq!(
+            B64.encode(key.sign(s.as_bytes()).to_bytes()),
+            "ONhZUk49L7ZGJriqZzrNUAwwwT_VJXsPshgKGO_kGfcg8BfzTd4glET5WevXFoHNBnz9wqXyH9u7ZfgWXY5YDQ"
         );
     }
 

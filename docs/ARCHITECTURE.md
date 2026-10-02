@@ -48,7 +48,8 @@ The network has four roles:
 | A node's sealing secret | Computing the passwords for tickets sent to that node | Minting tickets: that takes an issuer's key |
 | An issuer's key | Minting tickets for its own games' rooms, on nodes that trust it | Any other issuer's rooms: rooms are scoped by issuer. Removing it from the trusted list ends its tickets |
 | A node's ed25519 key | Heartbeating as that node, and its sealing secret | Anything once the node is revoked in the admin |
-| The master | Minting tickets as the control plane's issuer | Lives only on the control plane |
+| The control plane's answer key | Telling nodes whose tickets to take, what to probe, to drain or stop | Minting tickets, or anything players see |
+| The master | Minting tickets as the control plane's issuer, and its answer key | Lives only on the control plane |
 
 The design also holds the following:
 
@@ -59,11 +60,14 @@ The design also holds the following:
 - **The node is safe to point at the internet.** The answers it sends to sources it doesn't know
   are rate-limited per IP, so it can't be used to reflect traffic at a third party. Nonces are
   bound to the client's address, and every allocation limit is per player, per IP, per game and per issuer.
-- **Control requests can't be forged or replayed.** Each one is signed, timestamped within 30 s,
-  and remembered. A node reaches its control plane over https only.
+- **Control requests can't be forged or replayed, nor can their answers.** Each request is
+  signed, timestamped within 30 s, and remembered. Each answer is signed by the control plane's
+  key, which the node pinned at join, and names the request it answers. A node reaches its
+  control plane over https only.
 - **A control plane can't push a node around much.** It can't make a node probe more than 64
   peers, or any address a node couldn't have. A node it no longer knows stops taking new
-  allocations but doesn't exit. Its answers are trusted on TLS alone for now (TECH_DEBT.md, C2).
+  allocations but doesn't exit. Someone between the two can only cut the node off: an answer
+  the control plane's key didn't sign is no answer.
 
 ## Inside a node
 
