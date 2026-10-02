@@ -1,5 +1,5 @@
-//! The control plane, as a node talks to it (v0 §2): join once, then fetch the key and send a
-//! heartbeat every 15 s. Signed requests over HTTPS; the relay loop never waits on any of it.
+//! The control plane, as a node talks to it (v0 §2): join once, then send a heartbeat every
+//! 15 s. Signed requests over HTTPS; the relay loop never waits on any of it.
 
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};

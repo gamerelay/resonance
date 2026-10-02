@@ -22,6 +22,7 @@
   <a href="CHANGELOG.md">Changelog</a> ·
   <a href="docs/BENCH-2026-09-29.md">Benchmark</a> ·
   <a href="docs/HANDOFF.md">Handoff</a> ·
+  <a href="TECH_DEBT.md">Tech debt</a> ·
   <a href="CONTRIBUTING.md">Contributing</a> ·
   <a href="SECURITY.md">Security</a>
 </p>
@@ -29,8 +30,8 @@
 An easy-to-deploy relay network for real-time games. [GameRelay](https://gamerelay.io) is its
 first customer.
 
-This repo is the **node**: a room-scoped TURN relay in Rust. It replaces GameRelay's Go relay,
-rule for rule, and is the base for the network's later roles.
+This repo is the **node**: a room-scoped TURN relay in Rust. It replaced GameRelay's Go relay
+in production, and is the base for the network's later roles.
 
 **Status: v0, in production.** GameRelay's relays (San Francisco and New York) run it, joined
 to GameRelay's registry (heartbeats, drain, revoke, tickets), measuring each other every
@@ -67,7 +68,7 @@ flowchart LR
   players <== "TURN · UDP / TCP / TLS" ==> N
   N <-. "STUN probes · 2 s" .-> P
   N <-- "signed heartbeat · 15 s" --> CP
-  CP -. "credentials per node" .-> players
+  CP -. "tickets" .-> players
 ```
 
 ## What it relays, and to whom
@@ -77,8 +78,9 @@ flowchart LR
   allocation to another in memory: relay addresses are names, not sockets. It is never an open
   proxy, and nothing else on the machine is reachable through it.
 - **It can't read what it relays.** Players' WebRTC traffic is DTLS end to end.
-- **Credentials are its own.** A node's key is derived from the control plane's master key, and
-  mints credentials for that node only. A leaked node can't forge access to any other.
+- **No shared secret.** Players hold tickets signed by an issuer the node trusts, each with a
+  password for this node only (docs/PROTOCOL.md, "Tickets"). A leaked node can compute passwords
+  for tickets sent to it, but can't mint any.
 - **Limits:** 8 allocations per player, 64 per client IP, 4,096 per game, and 128 KB/s per
   allocation (256 KB burst). Unsigned answers to unknown clients are capped at 20 a second per IP
   (burst: the per-IP cap), since a spoofed source could otherwise aim them at someone. All of
@@ -93,8 +95,8 @@ flowchart LR
 | Crate | What it does |
 |---|---|
 | [`resonance-turn`](crates/resonance-turn) | The TURN relay, sans-I/O: `handle(now, from, packet) → packets`. Every rule lives here, testable without sockets. Its own STUN codec: parsed in place, nothing allocated per packet. Stream framing for TCP and TLS. |
-| [`resonance-proto`](crates/resonance-proto) | The control plane's wire types: node ids, signed requests, join, key, heartbeat. Fixtures shared with the control plane. |
-| [`resonance-node`](crates/resonance-node) | The node: a library (the event loop over the UDP socket and the TCP and TLS listeners; joining, the key, heartbeats) and a thin binary that reads the settings and runs it. |
+| [`resonance-proto`](crates/resonance-proto) | The control plane's wire types: node ids, signed requests, join, heartbeat (with the sealing key and the issuers to trust). Fixtures shared with the control plane. |
+| [`resonance-node`](crates/resonance-node) | The node: a library (the event loop over the UDP socket and the TCP and TLS listeners; joining, heartbeats, the issuers it trusts) and a thin binary that reads the settings and runs it. |
 | [`interop`](interop) | Other clients against the built node: pion's over UDP, TCP and TLS (`go test`), coturn's (`coturn.sh`), and Chromium, Firefox and WebKit's own (`browsers/relay.mjs`, every pairing, `TRANSPORT=udp\|tcp\|tls`). Also the benchmark (`cmd/bench`). |
 
 ## Running a node
@@ -121,7 +123,7 @@ allocations, and revoking it stops the node.
 ./target/release/resonance-node issuer issuer.key   # makes an issuer key, prints its public key
 RESONANCE_ISSUERS=<that public key> TURN_PUBLIC_IP=<its public IP> ./target/release/resonance-node
 ./target/release/resonance-node seal-key            # what tickets for this node are minted with
-./target/release/resonance-node mint issuer.key <seal key> <game> <room> <player>  # username, password
+./target/release/resonance-node mint issuer.key <seal key> <instance> <room> <player> [seconds]  # username, password; 3600 s by default, at most a day
 ```
 
 Your game's server mints tickets the same way (docs/PROTOCOL.md, "Tickets"); `mint` is the

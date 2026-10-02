@@ -2,9 +2,9 @@
 //! gamerelay.io `apps/server/src/resonance.ts`; the fixtures in the tests below are checked there
 //! too (`test/resonance.test.ts`), so the two can't drift.
 //!
-//! Every request after `join` is signed with the node's ed25519 key: `Resonance-Sig` (base64url)
-//! over [`signing_string`], with `Resonance-Node`, `Resonance-Ts` (unix ms) and
-//! `Resonance-Version`.
+//! Every request, `join` included, is signed with the node's ed25519 key: `Resonance-Sig`
+//! (base64url) over [`signing_string`], with `Resonance-Ts` (unix ms) and `Resonance-Version`, and
+//! `Resonance-Node` after `join`.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

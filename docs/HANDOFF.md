@@ -11,46 +11,26 @@ control-plane side.
 ## Where things stand
 
 - **v0's node is done and in production.** The room-scoped TURN relay (UDP, and TCP and TLS),
-  joined to GameRelay's registry: join, heartbeats, drain, revoke. Both nodes run `f7e553f`
-  (2026-09-30), from before tickets: they measure each other (about 62 ms between SF and NYC,
-  in GameRelay's Admin → Network), and both have `RESONANCE_ALERT_WEBHOOK` set.
+  joined to GameRelay's registry: join, heartbeats, drain, revoke. Both nodes, `sfo-1` and
+  `nyc-1`, run the ticket build (`cdea8f1`, 2026-10-01), each on its own droplet with TLS on
+  443; they measure each other in GameRelay's Admin → Network, and both have
+  `RESONANCE_ALERT_WEBHOOK` set.
 - **Players' credentials are tickets** since 2026-10-01 (PR #7; docs/PROTOCOL.md, "Tickets"):
   the shared-key credentials are gone. A control plane that mints only tickets doesn't hand out
-  a node that hasn't sent its sealing key, so deploy the control plane, then redeploy each node
-  (no env change: a leftover `TURN_SECRET` is ignored, and said to be).
+  a node that hasn't sent its sealing key (deployed 2026-10-01: control plane first, then each
+  node; a leftover `TURN_SECRET` is ignored, and said to be).
+- **Known debt:** [TECH_DEBT.md](../TECH_DEBT.md), from the 2026-10-01 review.
 - **GameRelay is the only control plane** (`https://gamerelay.io/resonance/v0/…`, API
   `2026-09-29`). Nodes are minted, drained and revoked in its Admin → Nodes tab.
 - CI (`.github/workflows/ci.yml`) is green: the core's tests and a fuzz run, pion's and coturn's
   clients, and Chromium, Firefox and WebKit over UDP, TCP and TLS.
 
-## The nodes
+## The nodes and deploying
 
-Two nodes, `sfo-1` and `nyc-1`, run as the systemd unit `gamerelay-turn` (a dynamic user,
-`StateDirectory=resonance`, `TURN_MAX_PER_IP=256`), from `/etc/gamerelay-turn.env`. NYC also
-serves TLS on 443 (`turns:turn-nyc.gamerelay.io:443?transport=tcp`, Let's Encrypt, RSA). Logs:
-`journalctl -u gamerelay-turn`, with a stats line each minute (`allocations N, streams N, …`).
-
-The hosts, their node ids, firewalls and certificates are in GameRelay's (private)
-`docs/INFRASTRUCTURE.md`, "TURN relays": this repo is public, so it doesn't map them.
-
-## Deploying
-
-The scripts live in GameRelay's repo, `deploy/turn/`, with this repo cloned next to it at
-`../resonance`:
-
-- `TURN_PUBLIC_IP=<ip> bash deploy/turn/install-resonance.sh root@<host>`: builds this repo for
-  linux/amd64 in Docker and installs it (a new host: the env file, buffer caps, and the node
-  left stopped until it joins). Re-run to update a node: it restarts it, so check the stats line
-  for `allocations 0` first.
-- `RESONANCE_ALERT_WEBHOOK=<GameRelay's OPS_WEBHOOK_URL>` in `/etc/gamerelay-turn.env` (not a
-  secret: the worst it allows is a post to the ops channel, so it can be copied over from the
-  game server's `.env` by script): the node says there when it can't reach the control plane.
-  The same webhook as the control plane's, so rotating it means updating every node too.
-- `bash deploy/turn/join-resonance.sh root@<host> rjt_…`: joins it with a token from Admin →
-  Nodes (a person mints and pastes it).
-- `bash deploy/turn/tls-resonance.sh root@<host> <name>`: TLS on 443. It agrees to Let's
-  Encrypt's terms, so a person says yes first. Needs the name's A record, and TCP 80 and 443
-  open.
+How the nodes run (the systemd unit, its env file and sandbox, logs), the hosts, and the deploy
+scripts (install, join, TLS) are in GameRelay's private `docs/INFRASTRUCTURE.md`, "TURN relays".
+The scripts live in GameRelay's `deploy/turn/`, with this repo cloned next to it at
+`../resonance`. This repo is public, so it doesn't map the hosts.
 
 ## Testing
 
@@ -90,8 +70,8 @@ The README's "Tests" has the commands. Locally on a Mac:
 - **Safari over TLS:** check it against NYC. If it refuses Let's Encrypt too, Safari players on
   networks that block UDP just play through the game server (nothing breaks); a certificate
   from a CA in libwebrtc's list would be the fix.
-- **The SF relay onto its own droplet** (GameRelay's HANDOFF, "Next, in order"), and then TLS
-  there too.
+- **The open security items** from the 2026-10-01 review (kept privately until fixed): two
+  are high and small.
 - **Capacity with load from another machine**: on one box the load generator runs out first.
 - **Later in the design:** receipts and credits for node operators, community-run nodes, and the
   room "home" role (the envelope and receipts are drafted in the spec's appendices).

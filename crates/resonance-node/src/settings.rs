@@ -22,7 +22,7 @@ pub struct Settings {
     pub port: u16,
     pub tcp: bool,
     pub tls: Option<TlsSettings>,
-    /// The core's settings. Its node key and nonce key are placeholders: filled in when it runs.
+    /// The core's settings. Its nonce key and sealing secret are filled in when it runs.
     pub turn: Config,
     pub limits: Limits,
     pub heartbeat: Duration,

@@ -17,7 +17,7 @@ flowchart TB
     N2((NYC))
     N1 <-. "STUN probes · 2 s" .-> N2
   end
-  CP -- "relays + credentials" --> players
+  CP -- "relays + tickets" --> players
   CP <-- "signed heartbeats · 15 s" --> nodes
   players <== "TURN · UDP / TCP / TLS" ==> nodes
   CP -- "alerts" --> OPS
@@ -69,7 +69,7 @@ flowchart TB
   MAIN["main.rs<br/>settings → wiring"] --> CTRL & RELAY
   CTRL["control::Heartbeats<br/>own thread · signed HTTP"] <-- "Control ⇄ Snapshot" --> RELAY["relay::Relay<br/>mio loop · UDP, TCP, TLS"]
   CTRL --> PROTO["resonance-proto<br/>wire types, signing"]
-  CTRL --> STATE["state<br/>key + registration"]
+  CTRL --> STATE["state<br/>key · registration · issuers"]
   RELAY --> PROBE["probe::Prober<br/>peer probes"]
   RELAY --> TLS["tls<br/>rustls, cert reload"]
   RELAY --> CORE["resonance-turn · sans-I/O<br/>Server::handle(now, from, packet) → packets"]
@@ -148,12 +148,12 @@ relay (pion/turn):
 
 ## Compatibility
 
-The node is checked against the clients that real players use, in CI on every push:
+The node is checked against the clients that real players use, in CI on every pull request and every push to main:
 
 | Client | Transports |
 |---|---|
 | pion/turn (Go) | UDP, TCP, TLS |
-| coturn's `turnutils_uclient`, six modes | UDP, TCP |
+| coturn's `turnutils_uclient`, six modes | UDP |
 | Chromium, Firefox, WebKit (every pairing, relay-only ICE) | UDP, TCP; TLS for Chromium and Firefox |
 
 WebKit's TURN client trusts only its built-in roots, so TLS for WebKit is checked against a real

@@ -52,7 +52,7 @@ pub struct Config {
 }
 
 impl Config {
-    /// The Go relay's limits (deploy/turn/main.go).
+    /// The Go relay's limits (gamerelay.io deploy/turn/main.go, before f9e9334).
     pub fn new(public_ip: IpAddr, nonce_key: [u8; 32]) -> Self {
         let max_per_ip = 64;
         Config {
@@ -199,7 +199,6 @@ pub struct Server {
     per_instance: Counts<String>,
     stats: Stats,
     clock: (Instant, u64),
-    /// The key before the last rotation, and until when it's still accepted.
     /// False while draining: no new allocations, existing ones carry on.
     accepting: bool,
 }

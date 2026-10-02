@@ -1,4 +1,4 @@
-//! The Go relay's tests (gamerelay.io deploy/turn/*_test.go), ported to the sans-I/O core, plus the
+//! The Go relay's tests (gamerelay.io deploy/turn/*_test.go, before f9e9334), ported to the sans-I/O core, plus the
 //! relay path itself. A few Go tests guard against pion creating and deleting allocations out of
 //! step with the relay's own bookkeeping (reservations, late deletions); here one state machine
 //! does both, so those cases become the invariants checked in `deleted_allocations_free_everything`.

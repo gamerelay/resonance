@@ -39,7 +39,8 @@ credentials are gone.
   TLS; coturn in six modes; the browsers) and the benchmark mint tickets. In GameRelay's e2e:
   Chrome players relaying through a joined node, and through it again restarted with its control
   plane cut off.
-- The benchmark measures builds that take tickets; v0.1.0 and the Go relay need it as of v0.1.0.
+- The benchmark measures builds that take tickets. To measure v0.1.0 or the Go relay, run
+  `cmd/bench` as of v0.1.0.
 
 **v0.1.0**, the first tagged release: everything below, as in production on both nodes since
 2026-09-30, with these docs.
