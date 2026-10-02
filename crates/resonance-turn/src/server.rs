@@ -284,13 +284,13 @@ impl Server {
         self.previous_key = (!old.is_empty()).then(|| (old, now + overlap));
     }
 
-    /// While false (draining, or told to upgrade), new allocations get 508; existing ones carry on.
     /// Whose tickets are accepted from now on. An allocation made with another's is refused at
     /// its next request, so it ends within a refresh.
     pub fn set_issuers(&mut self, issuers: Vec<Issuer>) {
         self.cfg.issuers = issuers;
     }
 
+    /// While false (draining, or told to upgrade), new allocations get 508; existing ones carry on.
     pub fn set_accepting(&mut self, accepting: bool) {
         self.accepting = accepting;
     }
