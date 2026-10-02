@@ -1,19 +1,44 @@
 # Tech debt
 
 What we know needs doing in the node, from the review of 2026-10-01 (main at `cdea8f1`): code
-organization, tests, docs and security. Items 1–10 are the security ones: the fixed ones are listed below, the rest kept privately until fixed. Ranked within each section. Size: S (an hour or two), M (a
+organization, tests, docs and security. Items 1–10 are the security ones, all fixed or informational as of 2026-10-02. Ranked within each section. Size: S (an hour or two), M (a
 day), L (more). Strike an item when it's fixed, with its commit or PR.
 
 ## Security
 
 Nothing critical was found: the ticket cryptography, the STUN parser, room isolation and the
-signed control-plane requests all held up. The items it did find are tracked privately until
-they're fixed (SECURITY.md), then listed here.
+signed control-plane requests all held up. What it did find was kept private until fixed
+(SECURITY.md); all of it is fixed and deployed on both nodes now.
 
 | # | Priority | Size | Item |
 |---|---|---|---|
-| 1 | ~~High~~ | S | ~~**Stream queues could exhaust a node's memory**: clients that sent over TCP or TLS and never read their answers piled them up, 256 KB a stream and 256 streams an IP.~~ Fixed in #9 (2026-10-02, deployed): 64 KB a stream, 16 MB in all, a fixed send buffer, streams holding the most closed past 32 MB, and their own caps (1,024; 64 per IP). |
-| 2 | ~~High~~ | S | ~~**Channel bindings per allocation were unlimited**: one allocation could bind 16,384.~~ Fixed in #9 (2026-10-02, deployed): 16 at once, then 508. |
+| 1 | ~~High~~ | S | ~~**Stream queues could exhaust a node's memory**: clients that sent over TCP or TLS and never read their answers piled them up, 256 KB a stream and 256 streams an IP.~~ Fixed in #9 (2026-10-02): 64 KB a stream, 16 MB in all, a fixed send buffer, streams holding the most closed past 32 MB, and their own caps (1,024; 64 per IP). |
+| 2 | ~~High~~ | S | ~~**Channel bindings per allocation were unlimited**: one allocation could bind 16,384.~~ Fixed in #9 (2026-10-02): 16 at once, then 508. |
+| 3 | ~~Medium~~ | S | ~~**Ticket checks were budgeted per IP only**: many IPs could fill the loop with them (~40 µs each).~~ Fixed in #11 (2026-10-02): 5,000/s from everyone too (`TURN_TICKET_CHECK_RATE`). |
+| 4 | ~~Medium~~ | S | ~~**The control plane's replay check keyed on the signature's text**: padding or the standard base64 alphabet gave a used signature a second spelling.~~ Fixed in GameRelay (2026-10-02): one spelling only. |
+| 5 | ~~Low~~ | M | ~~**The control plane's answers were trusted on TLS alone, `http://` was allowed, and the peer list was unbounded**~~ (it makes the node probe every 2 s). Fixed in #11: https only (except localhost), at most 64 peers, never unspecified, multicast or broadcast addresses. Signed answers: "Classes of bug to rule out", 3. |
+| 6 | ~~Low~~ | S | ~~**A joined node could set any URLs in a heartbeat**, sending players and other nodes' probes anywhere.~~ Fixed in GameRelay (2026-10-02): its URLs stay on the IP it joined with, and its TLS names must resolve to it. |
+| 7 | ~~Low~~ | S | ~~**Per-instance caps didn't bind an issuer**, which names its own instances.~~ Fixed in #11: 8,192 allocations per issuer, half the relay ports (`TURN_MAX_PER_ISSUER`). |
+| 8 | ~~Low~~ | S | ~~**A node deleted from the registry while offline never learned it was revoked**, and kept relaying.~~ Fixed in #11: on `unknown_node` it takes no new allocations until it's known again (not an exit: a control plane that lost its registry mustn't stop every node). |
+| 9 | ~~Low~~ | S | ~~**CI pinned actions by tag, and installed Playwright without a lockfile.**~~ Fixed in #11: commits, and `npm ci` from a committed lockfile. |
+| 10 | Info | — | The issuer kid is 64 bits; a 2^64 second preimage would let another issuer into the control plane's rooms. Use 16 bytes in a ticket v2. |
+
+## Classes of bug to rule out
+
+The fixes above each close one instance. These change the design so the whole class can't
+happen, best value first. Each names the items above it would have prevented.
+
+| # | Size | Change | What can no longer happen |
+|---|---|---|---|
+| C1 | M | **One memory budget for everything a client can make the node hold**: queues, half-read messages, channels, permissions, cached tickets, each charged to its client (per IP and per allocation) and to a global budget, with fixed-capacity tables instead of growable `Vec`s and maps. A charge that doesn't fit is refused, never allocated. | A client filling the node's memory, by any path (1, 2). Today each path has its own cap; a new one added without a cap is the next bug. |
+| C2 | S–M | **The control plane signs its heartbeat answers** with a key the node pins at join (`node.json`), and the node acts on an answer only if it checks out. | Anyone between the node and its control plane, or holding its DNS or a mis-issued certificate, telling the node whose tickets to take, what to probe, or to drain (5, 8). |
+| C3 | S | **Ban panics and silent overflow on the packet path by type and lint**: `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::arithmetic_side_effects)]` in the core (with the few invariant `expect`s allowed by name), and the fuzz run with `overflow-checks = true` (Tests, 14). | A packet crashing the node: with `panic = "abort"`, any reachable panic is an outage, and this makes one a compile error. |
+| C4 | M | **Unauthenticated answers no bigger than what was sent**, as QUIC does: a client's first request is padded to the size of the answer it wants. Needs checking against Chrome's, Firefox's and Safari's TURN clients first. | The node amplifying traffic at a third party, whatever the rates are set to. Today a per-IP budget bounds it (about 5x). |
+| C5 | S | **A sequence number per node instead of a cache of seen signatures**: each signed request carries a counter that must go up; the control plane keeps one number per node. With the next API version. | Replays, however a signature is spelled (4), and the cache to bound. |
+| C6 | S | **Newtypes for what's scoped**: `Room(kid, instance, room)`, `IssuerKid`, `NodeId`, instead of `String`s joined with `/` and `:` (Organization, 21). | One issuer's room or instance standing in for another's by string accident (7 was a missing count, the next would be a mixed-up key). |
+| C7 | S | **Narrower sandbox and dependency policy**: `SystemCallFilter=@system-service` and `RestrictAddressFamilies=AF_INET AF_INET6` on the unit, tried on a staging host first; `cargo deny` for sources, duplicate crypto crates and licenses next to `cargo audit`. | A compromised node process reaching beyond its sockets; an unexpected dependency source or a second copy of a crypto crate slipping in. |
+
+C1 and C2 first: they remove the two classes this review found most of. C3 is cheap insurance.
 
 ## Correctness
 
