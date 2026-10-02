@@ -142,8 +142,11 @@ Most are settings; the allocation and rate defaults are the Go relay's.
 | Allocations per player | 8 | `TURN_MAX_PER_PLAYER` |
 | Allocations per client IP | 64 | `TURN_MAX_PER_IP` |
 | Allocations per game (instance) | 4,096 | `TURN_MAX_PER_INSTANCE` |
+| Allocations per issuer | 8,192 (half the relay ports) | `TURN_MAX_PER_ISSUER` |
 | Relay rate per allocation | 128 KB/s, 256 KB burst | `TURN_RATE_BYTES`, `TURN_BURST_BYTES` |
 | Unsigned answers per IP | 20/s, burst = the per-IP cap | `TURN_UNAUTH_RATE`, `TURN_UNAUTH_BURST` |
+| Ticket checks | as unsigned answers, per IP; and 5,000/s from everyone | `TURN_TICKET_CHECK_RATE` |
+| Other nodes measured | 64, and only addresses a node could have | |
 | Channels per allocation | 16, then 508 | |
 | Open streams (TCP + TLS) | 1,024 | `TURN_MAX_STREAMS` |
 | Open streams per client IP | 64 | `TURN_MAX_STREAMS_PER_IP` |
@@ -152,7 +155,8 @@ Most are settings; the allocation and rate defaults are the Go relay's.
 
 ## 2. The control plane API
 
-The control plane serves the API at `<RESONANCE_CONTROL>/resonance/v0`, over HTTPS with JSON
+The control plane serves the API at `<RESONANCE_CONTROL>/resonance/v0`, over HTTPS (a node
+refuses `http://` except for localhost) with JSON
 bodies under 16 KB. GameRelay's is `https://gamerelay.io/resonance/v0`; its implementation is
 `apps/server/src/resonance.ts` in GameRelay's repo.
 

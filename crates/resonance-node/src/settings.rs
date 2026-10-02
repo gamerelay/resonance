@@ -117,6 +117,8 @@ impl Settings {
         turn.max_per_player = env.num("TURN_MAX_PER_PLAYER", turn.max_per_player)?;
         turn.max_per_ip = env.num("TURN_MAX_PER_IP", turn.max_per_ip)?;
         turn.max_per_instance = env.num("TURN_MAX_PER_INSTANCE", turn.max_per_instance)?;
+        turn.max_per_issuer = env.num("TURN_MAX_PER_ISSUER", turn.max_per_issuer)?;
+        turn.ticket_check_rate = env.num("TURN_TICKET_CHECK_RATE", turn.ticket_check_rate)?;
         turn.unauth_rate = env.num("TURN_UNAUTH_RATE", turn.unauth_rate)?;
         // A shared address can fill its allocation cap at once.
         turn.unauth_burst = env.num("TURN_UNAUTH_BURST", turn.max_per_ip as f64)?;
@@ -156,9 +158,7 @@ impl Settings {
             limits,
             // RESONANCE_HEARTBEAT_S: for tests; the control plane expects 15.
             heartbeat: Duration::from_secs(env.num("RESONANCE_HEARTBEAT_S", HEARTBEAT.as_secs())?),
-            control: env
-                .get("RESONANCE_CONTROL")
-                .unwrap_or_else(|| "https://gamerelay.io".into()),
+            control: control_url(env.get("RESONANCE_CONTROL"))?,
             alert_webhook: env.get("RESONANCE_ALERT_WEBHOOK"),
             alert_after: Duration::from_secs(env.num("RESONANCE_ALERT_AFTER_S", 120)?),
             issuers,
@@ -195,6 +195,27 @@ impl Settings {
             urls.push(format!("turns:{}:{}?transport=tcp", t.host, t.port));
         }
         urls
+    }
+}
+
+/// The control plane's address: https, except on this machine (tests, a control plane run
+/// next to the node). Its answers say whose tickets to take, so they mustn't go over plain HTTP.
+fn control_url(v: Option<String>) -> Result<String, String> {
+    let url = v.unwrap_or_else(|| "https://gamerelay.io".into());
+    let host = url
+        .strip_prefix("http://")
+        .map(|rest| rest.split(['/', '?']).next().unwrap_or(""))
+        .map(|h| {
+            h.rsplit_once(':')
+                .filter(|(_, p)| p.parse::<u16>().is_ok())
+                .map_or(h, |(h, _)| h)
+        });
+    match host {
+        None if url.starts_with("https://") => Ok(url),
+        Some("localhost" | "127.0.0.1" | "[::1]") => Ok(url),
+        _ => Err(format!(
+            "RESONANCE_CONTROL: {url:?} isn't https:// (plain http:// only for localhost)"
+        )),
     }
 }
 
@@ -237,6 +258,31 @@ mod tests {
         assert!(s.ignored.is_empty());
         assert!(s.alert_webhook.is_none());
         assert_eq!(s.alert_after, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn the_control_plane_is_reached_over_https_or_on_this_machine() {
+        let control = |v: &str| {
+            settings(&[("TURN_PUBLIC_IP", "192.0.2.1"), ("RESONANCE_CONTROL", v)])
+                .map(|s| s.control)
+        };
+        assert_eq!(control("https://cp.example").unwrap(), "https://cp.example");
+        for ok in [
+            "http://localhost:8787",
+            "http://127.0.0.1:8787/",
+            "http://[::1]:1",
+        ] {
+            assert!(control(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://cp.example",
+            "http://localhost.evil.example",
+            "http://127.0.0.1.nip.io",
+            "ftp://x",
+            "cp.example",
+        ] {
+            assert!(control(bad).unwrap_err().contains("https"), "{bad}");
+        }
     }
 
     #[test]

@@ -9,16 +9,17 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
+          toolchain: stable
           components: clippy, rustfmt
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --release
       - run: FUZZ_ITERS=2000000 cargo test --release --test fuzz
       - run: cargo build --release -p resonance-node
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: interop/go.mod
       - name: interop with pion's TURN client
@@ -32,9 +33,11 @@ jobs:
     runs-on: ubuntu-latest
     container: mcr.microsoft.com/playwright:v1.63.0-noble
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: apt-get update -qq && apt-get install -y -qq build-essential libnss3-tools
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
       - run: cargo build --release -p resonance-node
       - name: every browser pairing through the node
         working-directory: interop/browsers
@@ -42,7 +45,7 @@ jobs:
         env:
           HOME: /root
         run: |
-          npm i --no-save playwright@1.63.0
+          npm ci --no-audit --no-fund
           export NODE_BIN=$GITHUB_WORKSPACE/target/release/resonance-node
           node relay.mjs
           TRANSPORT=tcp node relay.mjs

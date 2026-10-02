@@ -30,6 +30,12 @@ pub struct Config {
     pub max_per_ip: u32,
     /// One game, or one leaked game key, can't take the whole relay from the others.
     pub max_per_instance: u32,
+    /// One issuer: it names its own instances, so only this bounds what it can take. Half the
+    /// relay ports by default, so no issuer can fill a node on its own.
+    pub max_per_issuer: u32,
+    /// Ticket checks a second from all clients together, on top of each IP's budget: each is a
+    /// signature and a key agreement (~40 µs), so this keeps them to a fifth of the loop's time.
+    pub ticket_check_rate: f64,
     /// Per allocation: a player's copies to one peer (a game sends a few KB a second).
     pub rate_bytes: f64,
     pub burst_bytes: f64,
@@ -66,6 +72,8 @@ impl Config {
             max_per_player: 8,
             max_per_ip,
             max_per_instance: 4096,
+            max_per_issuer: 8192,
+            ticket_check_rate: 5000.0,
             rate_bytes: 128.0 * 1024.0,
             burst_bytes: 256.0 * 1024.0,
             unauth_rate: 20.0,
@@ -177,6 +185,11 @@ struct Allocation {
 }
 
 const NONE: u32 = u32::MAX;
+
+/// A ticket's instance is `<kid>/<instance>` (`Ticket::user`): its issuer is the part before.
+fn issuer_of(user: &User) -> &str {
+    user.instance.split_once('/').map_or("", |(kid, _)| kid)
+}
 /// Checked tickets remembered (`Server::tickets`): about a player each.
 const TICKETS_KEPT: usize = 8192;
 
@@ -187,6 +200,8 @@ pub struct Server {
     /// Ticket checks (a signature and a key agreement, ~40 µs) per IP, on every transport: a
     /// client reusing one nonce can't make the loop do them faster than this.
     ticket_checks: Reflection,
+    /// And from everyone together (`ticket_check_rate`), so many IPs can't fill the loop either.
+    all_ticket_checks: Bucket,
     /// Tickets already checked, username to key: a player's allocations share one ticket, and
     /// a replayed ticket costs a hash, not a check. Emptied when full.
     tickets: HashMap<String, [u8; 16]>,
@@ -201,6 +216,8 @@ pub struct Server {
     per_player: Counts<String>,
     per_ip: Counts<IpAddr>,
     per_instance: Counts<String>,
+    /// By issuer (its kid).
+    per_issuer: Counts<String>,
     stats: Stats,
     clock: (Instant, u64),
     /// False while draining: no new allocations, existing ones carry on.
@@ -245,6 +262,7 @@ impl Server {
             nonces: Nonces::new(cfg.nonce_key),
             limiter: Reflection::new(cfg.unauth_rate, cfg.unauth_burst, cfg.unauth_tracked),
             ticket_checks: Reflection::new(cfg.unauth_rate, cfg.unauth_burst, cfg.unauth_tracked),
+            all_ticket_checks: Bucket::full(cfg.ticket_check_rate, base),
             tickets: HashMap::new(),
             allocs: Vec::new(),
             free: Vec::new(),
@@ -256,6 +274,7 @@ impl Server {
             per_player: Counts::default(),
             per_ip: Counts::default(),
             per_instance: Counts::default(),
+            per_issuer: Counts::default(),
             stats: Stats::default(),
             clock: (base, unix),
             accepting: true,
@@ -490,7 +509,14 @@ impl Server {
         let known = cached.or_else(|| self.tickets.get(username).copied());
         let key = match known {
             Some(k) => msg.integrity_ok(&k).then_some(k),
-            None if self.ticket_checks.allow(from.addr.ip(), now) => {
+            None if self.ticket_checks.allow(from.addr.ip(), now)
+                && self.all_ticket_checks.spend(
+                    1.0,
+                    now,
+                    self.cfg.ticket_check_rate,
+                    self.cfg.ticket_check_rate,
+                ) =>
+            {
                 let k = self.cfg.seal.as_ref().and_then(|seal| {
                     t.verify(&self.cfg.issuers)
                         .then(|| t.password(seal))
@@ -568,6 +594,7 @@ impl Server {
         if self.per_player.get(&user.player) >= self.cfg.max_per_player
             || self.per_ip.get(&ip) >= self.cfg.max_per_ip
             || self.per_instance.get(&user.instance) >= self.cfg.max_per_instance
+            || self.per_issuer.get(issuer_of(&user)) >= self.cfg.max_per_issuer
         {
             return Err(refuse(486));
         }
@@ -580,6 +607,7 @@ impl Server {
         self.per_player.add(user.player.clone());
         self.per_ip.add(ip);
         self.per_instance.add(user.instance.clone());
+        self.per_issuer.add(issuer_of(&user).to_owned());
         let a = Allocation {
             client: from,
             port,
@@ -672,6 +700,7 @@ impl Server {
         self.per_player.release(&a.user.player);
         self.per_ip.release(&a.client.addr.ip());
         self.per_instance.release(&a.user.instance);
+        self.per_issuer.release(issuer_of(&a.user));
     }
 
     /// The allocation this request is for, after authenticating it; remembers a fresher username.
