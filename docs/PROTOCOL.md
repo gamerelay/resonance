@@ -135,7 +135,7 @@ traffic is DTLS end to end.
 
 ### Limits
 
-All of these are settings; the defaults are the Go relay's.
+Most are settings; the allocation and rate defaults are the Go relay's.
 
 | Limit | Default | Setting |
 |---|---|---|
@@ -144,8 +144,11 @@ All of these are settings; the defaults are the Go relay's.
 | Allocations per game (instance) | 4,096 | `TURN_MAX_PER_INSTANCE` |
 | Relay rate per allocation | 128 KB/s, 256 KB burst | `TURN_RATE_BYTES`, `TURN_BURST_BYTES` |
 | Unsigned answers per IP | 20/s, burst = the per-IP cap | `TURN_UNAUTH_RATE`, `TURN_UNAUTH_BURST` |
-| Open streams (TCP + TLS) | 4,096 | `TURN_MAX_STREAMS` |
-| A stream's outgoing queue | 256 KB, then whole messages are dropped | |
+| Channels per allocation | 16, then 508 | |
+| Open streams (TCP + TLS) | 1,024 | `TURN_MAX_STREAMS` |
+| Open streams per client IP | 64 | `TURN_MAX_STREAMS_PER_IP` |
+| A stream's outgoing queue | 64 KB, then whole messages are dropped; 16 MB for all streams together | |
+| What all streams hold (queues, messages being read) | 32 MB: past it, the streams holding the most are closed | |
 
 ## 2. The control plane API
 

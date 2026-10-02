@@ -141,8 +141,8 @@ impl Settings {
         }
 
         let limits = Limits {
-            max_streams: env.num("TURN_MAX_STREAMS", 4096)?,
-            max_streams_per_ip: turn.max_per_ip as usize,
+            max_streams: env.num("TURN_MAX_STREAMS", 1024)?,
+            max_streams_per_ip: env.num("TURN_MAX_STREAMS_PER_IP", 64)?,
             debug_streams: env.flag("TURN_DEBUG_STREAMS"),
             ..Limits::default()
         };
@@ -230,7 +230,7 @@ mod tests {
         assert_eq!((t.rate_bytes, t.burst_bytes), (131072.0, 262144.0));
         assert_eq!(
             (s.limits.max_streams, s.limits.max_streams_per_ip),
-            (4096, 64)
+            (1024, 64)
         );
         assert_eq!(s.heartbeat, HEARTBEAT);
         assert_eq!(s.control, "https://gamerelay.io");
@@ -240,10 +240,18 @@ mod tests {
     }
 
     #[test]
-    fn the_per_ip_cap_carries_the_burst_and_the_stream_cap_with_it() {
+    fn the_per_ip_cap_carries_the_burst_but_not_the_stream_cap() {
         let s = settings(&[("TURN_PUBLIC_IP", "192.0.2.1"), ("TURN_MAX_PER_IP", "256")]).unwrap();
         assert_eq!(s.turn.unauth_burst, 256.0);
-        assert_eq!(s.limits.max_streams_per_ip, 256);
+        // Streams hold far more memory than UDP allocations: their own cap (the review of
+        // 2026-10-01: 256 streams from one IP could fill a 128 MB node).
+        assert_eq!(s.limits.max_streams_per_ip, 64);
+        let s = settings(&[
+            ("TURN_PUBLIC_IP", "192.0.2.1"),
+            ("TURN_MAX_STREAMS_PER_IP", "16"),
+        ])
+        .unwrap();
+        assert_eq!(s.limits.max_streams_per_ip, 16);
         let s = settings(&[
             ("TURN_PUBLIC_IP", "192.0.2.1"),
             ("TURN_MAX_PER_IP", "256"),

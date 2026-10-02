@@ -548,6 +548,40 @@ fn channels_carry_channel_data_both_ways() {
 }
 
 #[test]
+fn an_allocation_has_at_most_max_channels_and_a_refresh_or_an_expiry_still_works() {
+    let t = Instant::now();
+    let mut s = server(t);
+    let max = config().max_channels;
+    assert_eq!(max, 16);
+    let (mut a, _, _, rb) = pair(&mut s, t, "g1");
+    let name = user("g1", "p_a");
+    let peer = |i: usize| SocketAddr::new(public(), rb.port().wrapping_add(i as u16));
+    for i in 0..max {
+        assert_eq!(a.bind(&mut s, t, &name, 0x4000 + i as u16, peer(i)), 0);
+    }
+    assert_eq!(
+        a.bind(&mut s, t, &name, 0x4000 + max as u16, peer(max)),
+        508,
+        "past the cap: no new channel"
+    );
+    assert_eq!(
+        a.bind(&mut s, t, &name, 0x4000, peer(0)),
+        0,
+        "a refresh still works"
+    );
+    // Once they expire, there's room again.
+    let soon = t + std::time::Duration::from_secs(500);
+    let r = a.request(&mut s, soon, method::REFRESH, &name, &[lifetime(3600)]);
+    assert_eq!(r.code(), 0);
+    let later = t + config().channel_lifetime + std::time::Duration::from_secs(1);
+    s.tick(later);
+    assert_eq!(
+        a.bind(&mut s, later, &name, 0x4000 + max as u16, peer(max)),
+        0
+    );
+}
+
+#[test]
 fn a_channel_names_one_peer_and_a_peer_one_channel() {
     let t = Instant::now();
     let mut s = server(t);

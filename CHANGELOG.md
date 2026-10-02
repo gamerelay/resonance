@@ -4,6 +4,24 @@ What changed in the node, newest first, by date, with the commits. Releases are 
 `v<version>` (the crates' version, `Cargo.toml`); an entry says where one was cut. The control plane's API is dated
 separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it changes.
 
+## 2026-10-02
+
+**A node's memory stays bounded whatever its clients do.** The review of 2026-10-01 (TECH_DEBT.md)
+found two ways for clients to fill a node past its memory cap; both are closed.
+
+- **Streams.** Clients that send over TCP or TLS and never read their answers could pile up
+  queued answers: 256 KB a stream, 256 streams an IP. Now a stream's queue is 64 KB, all queues
+  together 16 MB, and a stream's kernel send buffer fixed at 64 KB. Once a second, past 32 MB held
+  by all streams (queues and half-read messages), the loop closes the streams holding the most.
+  Streams have their own caps: `TURN_MAX_STREAMS` 1,024 (was 4,096), and
+  `TURN_MAX_STREAMS_PER_IP` 64 (it was the allocation cap, `TURN_MAX_PER_IP`, 256 in GameRelay's
+  production).
+- **Channels.** An allocation could bind a channel to every port of the node (16,384). Now 16 at
+  once; a new one past that gets 508, and a refresh still works.
+- Tests for both: the loop closes streams that never read while keeping one that does, and an
+  allocation stops at 16 channels and has room again once they expire. Each fails without its
+  fix.
+
 ## 2026-10-01
 
 **Players' credentials are tickets, from any issuer the node trusts.** The shared-key
