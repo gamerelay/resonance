@@ -3,7 +3,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 
 pub const MAGIC: u32 = 0x2112_A442;
@@ -244,7 +244,7 @@ impl<'a> Message<'a> {
         }
         let covered = &self.raw[..mi.offset];
         let fake_len = (mi.offset + 24 - HEADER) as u16;
-        let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(key).expect("any key length");
+        let mut mac = <Hmac<Sha1> as KeyInit>::new_from_slice(key).expect("any key length");
         mac.update(&covered[..2]);
         mac.update(&fake_len.to_be_bytes());
         mac.update(&covered[4..]);
@@ -432,7 +432,7 @@ impl<'b> Writer<'b> {
     pub fn integrity(&mut self, key: &[u8]) -> &mut Self {
         let len = (self.buf.len() - self.start - HEADER + 24) as u16;
         self.buf[self.start + 2..self.start + 4].copy_from_slice(&len.to_be_bytes());
-        let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(key).expect("any key length");
+        let mut mac = <Hmac<Sha1> as KeyInit>::new_from_slice(key).expect("any key length");
         mac.update(&self.buf[self.start..]);
         let sum = mac.finalize().into_bytes();
         self.attr(attr::MESSAGE_INTEGRITY, &sum)

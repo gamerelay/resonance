@@ -6,6 +6,12 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
 
 ## 2026-10-02
 
+**Dependencies up to date, together.** The RustCrypto and dalek crates move as one set, so the
+build has one copy of each: ed25519-dalek and x25519-dalek 3 (curve25519-dalek 5), hmac 0.13,
+sha1, sha2 and md-5 0.11 (digest 0.11), base64 0.23, getrandom 0.4; actions/checkout 7 and
+actions/setup-go 7 (pinned to commits). No change on the wire: the ticket, signing and RFC 5769
+vectors are byte-for-byte the same.
+
 **The review's other security items.** Each has a test that fails without it.
 
 - **Ticket checks are budgeted for everyone together too** (`TURN_TICKET_CHECK_RATE`, 5,000/s),

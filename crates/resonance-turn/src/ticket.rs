@@ -14,7 +14,7 @@
 
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -57,7 +57,7 @@ impl Issuer {
 /// A node's sealing secret, from its ed25519 seed: HMAC-SHA256(seed, "resonance/seal/v1"). A
 /// separate key, so no new file to keep.
 pub fn seal_secret(node_seed: &[u8; 32]) -> [u8; 32] {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(node_seed).expect("any key length");
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(node_seed).expect("any key length");
     mac.update(b"resonance/seal/v1");
     mac.finalize().into_bytes().into()
 }
@@ -144,7 +144,7 @@ fn message(signed: &str) -> Vec<u8> {
 }
 
 fn password_from(shared: &[u8; 32], signed: &str) -> String {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(shared).expect("any key length");
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(shared).expect("any key length");
     mac.update(&message(signed));
     B64.encode(mac.finalize().into_bytes())
 }
