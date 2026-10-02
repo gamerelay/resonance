@@ -12,17 +12,20 @@ control-plane side.
 
 - **v0's node is done and in production.** The room-scoped TURN relay (UDP, and TCP and TLS),
   joined to GameRelay's registry: join, heartbeats, drain, revoke. Both nodes, `sfo-1` and
-  `nyc-1`, run `afb2677` (2026-10-02: tickets, plus every security fix from the review), each on
-  its own droplet with TLS on 443; they measure each other in GameRelay's Admin → Network, and
-  both have `RESONANCE_ALERT_WEBHOOK` set. `main` is v0.2.0: that, plus docs and dependency
-  updates and refusing an IPv6 `TURN_PUBLIC_IP` (both nodes are IPv4), so nothing changes for
-  them until the next install.
+  `nyc-1`, run `d1820f2` (installed 2026-10-02: v0.2.0, with signed answers and the memory
+  budget), each on its own droplet with TLS on 443; they measure each other in GameRelay's
+  Admin → Network, and both have `RESONANCE_ALERT_WEBHOOK` set. Both have the control plane's
+  answer key pinned, given out of band (`RESONANCE_CONTROL_KEY`), and believe no other answer.
 - **Players' credentials are tickets** since 2026-10-01 (PR #7; docs/PROTOCOL.md, "Tickets"):
   the shared-key credentials are gone. A control plane that mints only tickets doesn't hand out
   a node that hasn't sent its sealing key.
 - **The 2026-10-01 review** ([TECH_DEBT.md](../TECH_DEBT.md)): every security item is fixed and
   deployed (#9, #11, and GameRelay's control plane), each with a test that fails without it. What's left
   is correctness, tests, organization and docs debt, and the "Classes of bug to rule out".
+- **The control plane's answers are signed** (#16; PROTOCOL.md, "Signed answers"; TECH_DEBT
+  C2): each names the whole request it answers, and a node believes only the key it pinned.
+  Once nodes have the key, the control plane can't be rolled back to a build that doesn't sign:
+  they'd treat it as out of reach. GameRelay's side is its `resonance.ts`.
 - **A node's memory is bounded** whatever its clients do: one budget (96 MB, 16 MB per IP) that
   allocations, kept tickets and streams all charge, streams per IP, and channels per allocation
   (PROTOCOL.md, "Limits"; TECH_DEBT C1). GameRelay's unit caps the process at 384 MB.
@@ -79,9 +82,11 @@ The README's "Tests" has the commands. Locally on a Mac:
 
 - **Serving IPv6** (TECH_DEBT 27): a v6 `TURN_PUBLIC_IP` is refused since v0.2.0. Serving it
   needs a v6 socket, core tests with a v6 public IP, and care with probes across families.
-- **C1 and C2** from "Classes of bug to rule out": one memory budget for everything a client can
-  make the node hold, and signed heartbeat answers. C3 (lints against panics and overflow) is
-  cheap insurance.
+- **C3** from "Classes of bug to rule out": lints against panics and silent overflow on the
+  packet path, cheap insurance (C1 and C2 are done: #17, #16). Then C5 (a sequence number per
+  node, with the next API version) and C6 (newtypes for scoped ids).
+- **The heartbeat thread's own tests** (TECH_DEBT 17): `Heartbeats::run` (saving a pinned key
+  and the control plane's issuers, the exit path) and `post_alert`.
 - **The UDP benchmark on a Linux host** for the new loop: in Docker on a Mac, 1,000 pairs were
   even and 200 pairs a little behind in most rounds, within that run's drift (CHANGELOG).
 - **Safari over TLS:** check it against NYC. If it refuses Let's Encrypt too, Safari players on
