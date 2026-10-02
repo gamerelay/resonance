@@ -38,7 +38,7 @@ happen, best value first. Each names the items above it would have prevented.
 | C6 | S | **Newtypes for what's scoped**: `Room(kid, instance, room)`, `IssuerKid`, `NodeId`, instead of `String`s joined with `/` and `:` (Organization, 21). | One issuer's room or instance standing in for another's by string accident (7 was a missing count, the next would be a mixed-up key). |
 | C7 | S | **Narrower sandbox and dependency policy**: `SystemCallFilter=@system-service` and `RestrictAddressFamilies=AF_INET AF_INET6` on the unit, tried on a staging host first; `cargo deny` for sources, duplicate crypto crates and licenses next to `cargo audit`. | A compromised node process reaching beyond its sockets; an unexpected dependency source or a second copy of a crypto crate slipping in. |
 
-C1 and C2 first: they remove the two classes this review found most of. C3 is cheap insurance.
+C1 and C2 are done (#17, #16, deployed 2026-10-02): they removed the two classes this review found most of. C3 is next, cheap insurance.
 
 ## Correctness
 
