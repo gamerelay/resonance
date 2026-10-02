@@ -6,6 +6,27 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
 
 ## 2026-10-02
 
+**The control plane's answers are signed** (TECH_DEBT C2). Additions within API `2026-09-29`.
+
+- Every answer, refusals included, carries `Resonance-Answer-Sig`: the control plane's ed25519
+  signature over the status, the request's own `Resonance-Sig` and the body (PROTOCOL.md, "Signed
+  answers"), so an answer can't be forged or replayed against another request.
+- The key comes with the join's answer and every heartbeat's (`control_key`), and the node keeps
+  it in `node.json`. A node that joined before keeps the key from its first signed heartbeat
+  answer.
+- Once a node has the key, an answer it didn't sign is no answer: the node carries on as it was,
+  and alerts if that lasts. Before, anyone between a node and its control plane (or holding its
+  DNS, or a certificate for its name) could tell it whose tickets to take, what to probe, or to
+  drain or stop.
+- Deploy the control plane first: a node from before ignores the signatures, and a node from
+  after believes an unsigned control plane until it has the key. A control plane rolled back
+  after nodes have the key looks out of reach to them (they keep relaying, and alert).
+- Tests: the fixture shared with GameRelay; the client against a control plane on loopback
+  (answers unsigned, signed by another key, for another request, with another status or body,
+  all refused; refusals signed by the key believed, so `unknown_node` still works; the key
+  pinned at join and from a heartbeat, and not pinned from an answer it didn't sign). In
+  GameRelay's e2e: a node told it's revoked by answers another key signed carries on.
+
 **v0.2.0.** The first release since tickets, which broke the control-plane API in place
 (2026-10-01): a build's `software` now says which side of that it's on. Everything below, as
 in production on both nodes (`afb2677`), plus the docs and dependency updates since (#12–#14),

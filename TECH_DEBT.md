@@ -16,7 +16,7 @@ signed control-plane requests all held up. What it did find was kept private unt
 | 2 | ~~High~~ | S | ~~**Channel bindings per allocation were unlimited**: one allocation could bind 16,384.~~ Fixed in #9 (2026-10-02): 16 at once, then 508. |
 | 3 | ~~Medium~~ | S | ~~**Ticket checks were budgeted per IP only**: many IPs could fill the loop with them (~40 µs each).~~ Fixed in #11 (2026-10-02): 5,000/s from everyone too (`TURN_TICKET_CHECK_RATE`). |
 | 4 | ~~Medium~~ | S | ~~**The control plane's replay check keyed on the signature's text**: padding or the standard base64 alphabet gave a used signature a second spelling.~~ Fixed in GameRelay (2026-10-02): one spelling only. |
-| 5 | ~~Low~~ | M | ~~**The control plane's answers were trusted on TLS alone, `http://` was allowed, and the peer list was unbounded**~~ (it makes the node probe every 2 s). Fixed in #11: https only (except localhost), at most 64 peers, never unspecified, multicast or broadcast addresses. Signed answers: "Classes of bug to rule out", 3. |
+| 5 | ~~Low~~ | M | ~~**The control plane's answers were trusted on TLS alone, `http://` was allowed, and the peer list was unbounded**~~ (it makes the node probe every 2 s). Fixed in #11: https only (except localhost), at most 64 peers, never unspecified, multicast or broadcast addresses. Answers are signed since C2. |
 | 6 | ~~Low~~ | S | ~~**A joined node could set any URLs in a heartbeat**, sending players and other nodes' probes anywhere.~~ Fixed in GameRelay (2026-10-02): its URLs stay on the IP it joined with, and its TLS names must resolve to it. |
 | 7 | ~~Low~~ | S | ~~**Per-instance caps didn't bind an issuer**, which names its own instances.~~ Fixed in #11: 8,192 allocations per issuer, half the relay ports (`TURN_MAX_PER_ISSUER`). |
 | 8 | ~~Low~~ | S | ~~**A node deleted from the registry while offline never learned it was revoked**, and kept relaying.~~ Fixed in #11: on `unknown_node` it takes no new allocations until it's known again (not an exit: a control plane that lost its registry mustn't stop every node). |
@@ -31,7 +31,7 @@ happen, best value first. Each names the items above it would have prevented.
 | # | Size | Change | What can no longer happen |
 |---|---|---|---|
 | C1 | M | **One memory budget for everything a client can make the node hold**: queues, half-read messages, channels, permissions, cached tickets, each charged to its client (per IP and per allocation) and to a global budget, with fixed-capacity tables instead of growable `Vec`s and maps. A charge that doesn't fit is refused, never allocated. | A client filling the node's memory, by any path (1, 2). Today each path has its own cap; a new one added without a cap is the next bug. |
-| C2 | S–M | **The control plane signs its heartbeat answers** with a key the node pins at join (`node.json`), and the node acts on an answer only if it checks out. | Anyone between the node and its control plane, or holding its DNS or a mis-issued certificate, telling the node whose tickets to take, what to probe, or to drain (5, 8). |
+| C2 | ~~S–M~~ | ~~**The control plane signs its heartbeat answers** with a key the node pins at join (`node.json`), and the node acts on an answer only if it checks out.~~ Done: every answer, refusals too, tied to its request (PROTOCOL.md, "Signed answers"). | Anyone between the node and its control plane, or holding its DNS or a mis-issued certificate, telling the node whose tickets to take, what to probe, or to drain (5, 8). |
 | C3 | S | **Ban panics and silent overflow on the packet path by type and lint**: `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::arithmetic_side_effects)]` in the core (with the few invariant `expect`s allowed by name), and the fuzz run with `overflow-checks = true` (Tests, 14). | A packet crashing the node: with `panic = "abort"`, any reachable panic is an outage, and this makes one a compile error. |
 | C4 | M | **Unauthenticated answers no bigger than what was sent**, as QUIC does: a client's first request is padded to the size of the answer it wants. Needs checking against Chrome's, Firefox's and Safari's TURN clients first. | The node amplifying traffic at a third party, whatever the rates are set to. Today a per-IP budget bounds it (about 5x). |
 | C5 | S | **A sequence number per node instead of a cache of seen signatures**: each signed request carries a counter that must go up; the control plane keeps one number per node. With the next API version. | Replays, however a signature is spelled (4), and the cache to bound. |
@@ -51,14 +51,14 @@ C1 and C2 first: they remove the two classes this review found most of. C3 is ch
 
 ## Tests
 
-`cargo test --workspace` passes (116 tests, about 4 s), clippy is clean, and MSRV 1.85 builds.
+`cargo test --workspace` passes (120 tests, about 4 s), clippy is clean, and MSRV 1.85 builds.
 
 | # | Priority | Size | Item |
 |---|---|---|---|
 | 14 | ~~Medium~~ | S | ~~**Overflow is never checked**: CI and the fuzz run use `--release`, which wraps integer overflow silently.~~ Fixed in v0.2.0: CI runs the tests and the 2M fuzz run in a debug build too. |
 | 15 | ~~Medium~~ | S | ~~**MSRV isn't enforced in CI** (stable only).~~ Fixed in v0.2.0: an `msrv` job checks with 1.85. |
 | 16 | Medium | S | **A conformance test now tests the old format**: `malformed_rest_usernames_are_refused_without_a_panic` (`tests/conformance.rs`) feeds `expiry:i:r:p` usernames, which all fail at the `t1:` prefix. Rewrite with malformed `t1:` tickets through the server (field counts, empty parts, bad base64, expiry overflow). |
-| 17 | Medium | M | **The control-plane client and heartbeat thread are untested**: `Client::post` (headers, the error fallback), `Heartbeats::run` (only control-plane issuers saved, the exit path, the first beat at once) and `post_alert`. Test against a tiny local HTTP server, checking the signature with proto's `signing_string`. |
+| 17 | Medium | M | **The heartbeat thread is untested**: `Heartbeats::run` (only control-plane issuers saved, the exit path, the first beat at once) and `post_alert`. (`Client`'s answers are tested against a control plane on loopback since C2.) |
 | 18 | Medium | M | **The node's own Rust tests can't relay**: `tests/relay.rs` builds a config with no sealing key or issuers, so no allocation succeeds. The data path, TLS and the `mint`/`seal-key`/`issuer` commands are covered only by interop and the browsers in CI. Add an allocate-and-relay test over UDP and TCP. |
 | 19 | Low | M | No tests for `tls.rs` (`reload_if_changed`, the certbot renewal path). (`relay.rs`'s outbox caps and the closing of streams that never read got tests in #9.) |
 | 20 | Low | S | Two node tests lean on wall-clock time (`elapsed < 2500ms`, an 8 s probe deadline in `tests/relay.rs`). Widen them or inject the tick. |

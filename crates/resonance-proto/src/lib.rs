@@ -5,6 +5,11 @@
 //! Every request, `join` included, is signed with the node's ed25519 key: `Resonance-Sig`
 //! (base64url) over [`signing_string`], with `Resonance-Ts` (unix ms) and `Resonance-Version`, and
 //! `Resonance-Node` after `join`.
+//!
+//! Every answer, refusals included, is signed by the control plane's own ed25519 key:
+//! `Resonance-Answer-Sig` over [`answer_signing_string`], which names the request's signature so an
+//! answer can't be replayed against another request. The key comes with the join's answer (and
+//! the heartbeat's, for nodes that joined before), and the node keeps it (`control_key`).
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,6 +24,8 @@ pub mod header {
     pub const TS: &str = "resonance-ts";
     pub const SIG: &str = "resonance-sig";
     pub const VERSION: &str = "resonance-version";
+    /// On every answer: the control plane's signature over [`super::answer_signing_string`].
+    pub const ANSWER_SIG: &str = "resonance-answer-sig";
 }
 
 const B32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
@@ -53,6 +60,18 @@ pub fn signing_string(method: &str, path: &str, version: &str, ts: &str, body: &
     format!("{method}\n{path}\n{version}\n{ts}\n{hex}")
 }
 
+/// What the control plane signs on an answer: `resonance/answer/v1 \n status \n request_sig \n
+/// hex(sha256(body))`. `request_sig` is the request's `Resonance-Sig` as sent, so each answer
+/// belongs to one request: an old answer can't be replayed against a new one.
+pub fn answer_signing_string(status: u16, request_sig: &str, body: &[u8]) -> String {
+    let digest = Sha256::digest(body);
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    format!("resonance/answer/v1\n{status}\n{request_sig}\n{hex}")
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct JoinRequest {
     pub token: String,
@@ -72,6 +91,10 @@ pub struct JoinResponse {
     pub node_id: String,
     pub region: String,
     pub heartbeat_s: u64,
+    /// The control plane's ed25519 public key, base64url: it signs every answer, and the node
+    /// keeps it. An addition within 2026-09-29.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -144,6 +167,10 @@ pub struct HeartbeatResponse {
     /// 2026-09-29: none sent means none.
     #[serde(default)]
     pub issuers: Vec<IssuerKey>,
+    /// As in the join's answer, so a node that joined before signed answers learns it. An
+    /// addition within 2026-09-29.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_key: Option<String>,
 }
 
 /// An issuer's ed25519 public key, base64url (no padding).
@@ -192,6 +219,30 @@ mod tests {
         assert_eq!(
             B64.encode(key.sign(s.as_bytes()).to_bytes()),
             "4ouzZqtxvtuhwCVpoFdbIPlXyqwSQibcBU0iJUVZIS9U6-454Juxtd9lAfd5pSrSVOwXx4N60C_qPwuzXlWNCA"
+        );
+    }
+
+    // The same values as gamerelay.io test/resonance.test.ts: an answer the control plane signs
+    // with its key (here from the seed [9; 32]) is one the node checks.
+    #[test]
+    fn answer_fixture_shared_with_the_control_plane() {
+        let key = SigningKey::from_bytes(&[9; 32]);
+        assert_eq!(
+            B64.encode(key.verifying_key().to_bytes()),
+            "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg"
+        );
+        let s = answer_signing_string(
+            200,
+            "4ouzZqtxvtuhwCVpoFdbIPlXyqwSQibcBU0iJUVZIS9U6-454Juxtd9lAfd5pSrSVOwXx4N60C_qPwuzXlWNCA",
+            br#"{"status":"active"}"#,
+        );
+        assert_eq!(
+            s,
+            "resonance/answer/v1\n200\n4ouzZqtxvtuhwCVpoFdbIPlXyqwSQibcBU0iJUVZIS9U6-454Juxtd9lAfd5pSrSVOwXx4N60C_qPwuzXlWNCA\nffcc9870a751a0241f5f2bdac8e6646c40b92bb226e8efc4af2e29cc242fc176"
+        );
+        assert_eq!(
+            B64.encode(key.sign(s.as_bytes()).to_bytes()),
+            "6jeCCK-pbDqjd1r43oH605BNEL6WhjBAvXx3-T0NHvYKzQ5KQFaTE0ObvKHF3ICjivrZzysgiE_0hmTzywsQAw"
         );
     }
 

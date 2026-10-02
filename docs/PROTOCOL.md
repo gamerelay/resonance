@@ -193,6 +193,31 @@ each signature until it can no longer be in time, so a replayed request gets 401
 The same fixture is tested on both sides: `resonance-proto`'s tests and GameRelay's
 `test/resonance.test.ts` sign the same key, path and body to the same bytes.
 
+### Signed answers
+
+Every answer, refusals included, is signed by the control plane's own ed25519 key:
+
+```
+Resonance-Answer-Sig = base64url( ed25519(control key, answer signing string) )
+answer signing string = "resonance/answer/v1" "\n" STATUS "\n" REQUEST-SIG "\n" hex( SHA-256(body) )
+```
+
+`REQUEST-SIG` is the request's `Resonance-Sig` as sent, so an answer belongs to one request: an
+old one can't be replayed against a new request, and no clock is needed.
+
+- **The key** (`control_key`, base64url) comes with the join's answer and each heartbeat's. The
+  node keeps it in `node.json`. A node that joined before signed answers keeps the key from the
+  first heartbeat answer that key signed, over TLS as its join was.
+- **Once it has the key, the node believes nothing else.** An answer without a signature, or
+  with any other, counts as no answer: the node carries on as it was, as if the control plane
+  were out of reach, and alerts if that lasts. So whoever stands between a node and its control
+  plane (or holds its DNS, or a certificate for its name) can't tell it whose tickets to take,
+  what to probe, or to drain or stop. They can only cut it off, which they could anyway.
+- **Rotating the key** means every node joins again (or has `control_key` changed in its
+  `node.json`). GameRelay derives it from its master, so rotating the master does too.
+- A fixture is shared with GameRelay's `test/resonance.test.ts` (`resonance-proto`'s
+  `answer_fixture_shared_with_the_control_plane`).
+
 ### Endpoints
 
 Both endpoints are `POST`.
@@ -202,7 +227,7 @@ hour and can be used once; it carries the node's region.
 
 ```json
 → { "token": "rjt_…", "pubkey": "<base64url>", "urls": ["turn:203.0.113.7:3478"], "software": "resonance-node 0.2.0", "seal_key": "<base64url>" }
-← { "node_id": "rn_…", "region": "nyc", "heartbeat_s": 15 }
+← { "node_id": "rn_…", "region": "nyc", "heartbeat_s": 15, "control_key": "<base64url>" }
 ```
 
 **`/nodes/heartbeat`**: every `heartbeat_s` seconds.
@@ -219,7 +244,8 @@ hour and can be used once; it carries the node's region.
     "status": "active",
     "latest_version": "2026-09-29", "min_version": "2026-09-29",
     "peers": [{ "node_id": "rn_b…", "addr": "198.51.100.2:3478" }],
-    "issuers": [{ "pubkey": "<base64url>" }]
+    "issuers": [{ "pubkey": "<base64url>" }],
+    "control_key": "<base64url>"
   }
 ```
 
@@ -269,8 +295,9 @@ Within a version, changes are additive only:
   doesn't know.
 - A status it doesn't know is `Unknown`, which changes nothing.
 
-`urls`, `peers` and `seal_key` on the heartbeat, `seal_key` on the join, and `peers` and
-`issuers` on the heartbeat's answer were added this way within `2026-09-29`.
+`urls`, `peers` and `seal_key` on the heartbeat, `seal_key` on the join, `peers`, `issuers` and
+`control_key` on the heartbeat's answer, `control_key` on the join's, and `Resonance-Answer-Sig`
+were added this way within `2026-09-29`.
 
 ## 3. Peer probes
 
