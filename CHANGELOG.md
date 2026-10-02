@@ -6,6 +6,33 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
 
 ## 2026-10-02
 
+**One memory budget** (TECH_DEBT C1). Everything a client can make the node hold is charged to
+one budget, to the client's IP and to everyone's total, and a charge that doesn't fit is
+refused, never allocated (`resonance_turn::budget`).
+
+- What's charged: allocations (about 1.15 KB each, their channels' room reserved up front so
+  they never grow), the checked tickets kept (about 250 B each, until they expire), and each
+  stream's queue and framer by the room they hold (a queue grows by doubling, charged first).
+- What's refused past it: an Allocate (508, as for no free port; a fresher, longer ticket on a
+  refresh too), keeping a checked ticket (it's still checked), queuing a message (dropped whole),
+  and a stream's read (the stream is closed).
+- A queue gives its room back once mostly drained, and a framer once a burst is handed out, so a
+  stream that keeps up holds a few KB rather than its biggest burst for life. Before, a framer
+  kept its peak (up to 64 KB) for good.
+- `TURN_MEMORY_BYTES` (96 MB) and `TURN_MEMORY_PER_IP_BYTES` (16 MB). One IP's share fits
+  everything its caps allow (64 allocations, 64 streams with full queues and half a message
+  each), so a busy NAT within its caps is never refused for memory; the total binds when many
+  IPs press at once. They replace the streams' own totals (16 MB queued, 32 MB held): past three
+  quarters of the budget, the streams holding the most are closed until it's under half.
+- A full node's allocations take about 19 MB of it, one IP's 64 allocations about 75 KB.
+- Tests: the budget itself, and any sequence of charges and refunds keeping its books; an IP
+  past its share and everyone past the total refused with 508, and room again once one ends; one
+  IP within its caps never refused for memory; what ends gives back exactly what it took
+  (several rounds, expiry, a stream closing, tickets expiring, a fresher ticket on a refresh);
+  queues charged their room and dropping past their cap, stopping at an IP's share and the
+  total, and giving their room back once drained; a framer giving back a burst's room but
+  keeping half a big message's; streams sitting on half a message closed by the sweep while a
+  reader stays, and new streams answered after. Each fails without its fix.
 **The control plane's answers are signed** (TECH_DEBT C2). Additions within API `2026-09-29`.
 
 - Every answer, refusals included, carries `Resonance-Answer-Sig`: the control plane's ed25519

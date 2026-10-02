@@ -6,6 +6,9 @@
 /// The largest message a stream carries: a STUN header and its 16-bit length.
 pub const MAX_MESSAGE: usize = 20 + 0xFFFF;
 
+/// The room a framer keeps once a burst is handed out (`Framer::trim`): a few messages.
+const KEEP: usize = 4096;
+
 /// Bytes read from one stream, cut into messages.
 #[derive(Default)]
 pub struct Framer {
@@ -69,6 +72,16 @@ impl Framer {
         self.at += used;
         self.started = true;
         Some(Frame::Message(&self.buf[start..start + whole]))
+    }
+
+    /// Gives back the room a burst left once it's been handed out: a stream that read 64 KB at
+    /// once and keeps up holds about a message again, not 64 KB for the rest of its life. Half a
+    /// message bigger than that keeps its room.
+    pub fn trim(&mut self) {
+        if self.buf.capacity() > KEEP && self.pending() <= KEEP {
+            self.compact();
+            self.buf.shrink_to(KEEP);
+        }
     }
 
     /// Bytes waiting for the rest of their message.
@@ -197,5 +210,32 @@ mod tests {
             assert_eq!(all(&mut f).len(), 1);
         }
         assert!(f.buf.capacity() < 4 * m.len(), "{}", f.buf.capacity());
+    }
+
+    #[test]
+    fn a_burst_handed_out_leaves_no_room_behind_and_half_a_big_message_keeps_its() {
+        let mut f = Framer::default();
+        let one = stun(96);
+        let burst: Vec<u8> = one.iter().copied().cycle().take(one.len() * 600).collect();
+        f.push(&burst);
+        assert_eq!(all(&mut f).len(), 600);
+        assert!(f.held() >= 60_000);
+        f.trim();
+        assert!(f.held() <= KEEP, "{}", f.held());
+        // Half of a 60 KB message: its room stays, and it still comes out whole.
+        let big = stun(60_000);
+        f.push(&big[..40_000]);
+        assert!(f.next().is_none());
+        f.trim();
+        assert!(f.held() >= 40_000);
+        f.push(&big[40_000..]);
+        assert_eq!(all(&mut f), vec![big]);
+        f.trim();
+        assert!(f.held() <= KEEP);
+        // And what's pending survives a trim.
+        f.push(&one[..10]);
+        f.trim();
+        f.push(&one[10..]);
+        assert_eq!(all(&mut f), vec![one]);
     }
 }

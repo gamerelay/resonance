@@ -30,7 +30,7 @@ happen, best value first. Each names the items above it would have prevented.
 
 | # | Size | Change | What can no longer happen |
 |---|---|---|---|
-| C1 | M | **One memory budget for everything a client can make the node hold**: queues, half-read messages, channels, permissions, cached tickets, each charged to its client (per IP and per allocation) and to a global budget, with fixed-capacity tables instead of growable `Vec`s and maps. A charge that doesn't fit is refused, never allocated. | A client filling the node's memory, by any path (1, 2). Today each path has its own cap; a new one added without a cap is the next bug. |
+| C1 | ~~M~~ | ~~**One memory budget for everything a client can make the node hold**: queues, half-read messages, channels, permissions, cached tickets, each charged to its client (per IP and per allocation) and to a global budget, with fixed-capacity tables instead of growable `Vec`s and maps. A charge that doesn't fit is refused, never allocated.~~ Done: `resonance_turn::budget`, charged by allocations (channels reserved up front), kept tickets (until they expire), and streams' queues and framers by the room they hold; 96 MB, 16 MB per IP. Not charged yet: rustls's own buffers (up to ~64 KB a TLS stream, bounded by the stream caps), and the reflection limiter's table (bounded by its size). | A client filling the node's memory, by any path (1, 2). Today each path has its own cap; a new one added without a cap is the next bug. |
 | C2 | ~~S–M~~ | ~~**The control plane signs its heartbeat answers** with a key the node pins at join (`node.json`), and the node acts on an answer only if it checks out.~~ Done: every answer, refusals too, tied to its request (PROTOCOL.md, "Signed answers"). | Anyone between the node and its control plane, or holding its DNS or a mis-issued certificate, telling the node whose tickets to take, what to probe, or to drain (5, 8). |
 | C3 | S | **Ban panics and silent overflow on the packet path by type and lint**: `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::arithmetic_side_effects)]` in the core (with the few invariant `expect`s allowed by name), and the fuzz run with `overflow-checks = true` (Tests, 14). | A packet crashing the node: with `panic = "abort"`, any reachable panic is an outage, and this makes one a compile error. |
 | C4 | M | **Unauthenticated answers no bigger than what was sent**, as QUIC does: a client's first request is padded to the size of the answer it wants. Needs checking against Chrome's, Firefox's and Safari's TURN clients first. | The node amplifying traffic at a third party, whatever the rates are set to. Today a per-IP budget bounds it (about 5x). |
@@ -51,7 +51,7 @@ C1 and C2 first: they remove the two classes this review found most of. C3 is ch
 
 ## Tests
 
-`cargo test --workspace` passes (124 tests, about 4 s), clippy is clean, and MSRV 1.85 builds.
+`cargo test --workspace` passes (139 tests, about 9 s), clippy is clean, and MSRV 1.85 builds.
 
 | # | Priority | Size | Item |
 |---|---|---|---|

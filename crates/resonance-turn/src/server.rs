@@ -11,6 +11,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::auth::{self, NonceCheck, Nonces, User};
+use crate::budget::Budget;
 use crate::counts::Counts;
 use crate::limiter::{Bucket, Reflection};
 use crate::stun::{self, Class, Message, Writer, attr, method};
@@ -49,6 +50,14 @@ pub struct Config {
     /// Channels one allocation may have at once: one per peer it talks to, so a room's worth.
     /// Each is a few bytes, but without a cap one allocation could bind all 16,384.
     pub max_channels: usize,
+    /// Bytes clients may make the node hold, all together (`budget`): allocations, the checked
+    /// tickets kept, and the node's streams. Past it, a charge is refused, never allocated.
+    pub memory_total: usize,
+    /// Of `memory_total`, what one client IP may hold. The default fits everything one IP's caps
+    /// allow (64 allocations, 64 streams with full queues and a message half read each), so a
+    /// busy NAT within its caps is never refused for memory; the total is what binds when many
+    /// IPs press at once.
+    pub memory_per_ip: usize,
     /// How long past its lifetime an allocation is kept: a refresh that's late by a lost packet
     /// or two (Firefox refreshes only 10 s before the end) still finds it.
     pub grace: Duration,
@@ -84,6 +93,8 @@ impl Config {
             permission_lifetime: Duration::from_secs(300),
             channel_lifetime: Duration::from_secs(600),
             max_channels: 16,
+            memory_total: 96 * 1024 * 1024,
+            memory_per_ip: 16 * 1024 * 1024,
             grace: Duration::from_secs(60),
             nonce_key,
             seal: None,
@@ -178,13 +189,45 @@ struct Allocation {
     lifetime_s: u32,
     /// A permission is per peer IP, and the only permitted peer IP is this relay's.
     permission_expires: Option<Instant>,
+    /// Made with room for `max_channels`, so it never grows.
     channels: Vec<Channel>,
     bucket: Bucket,
+    /// What it's charged in the budget, to its client's IP (`footprint`).
+    charged: usize,
     /// Its Allocate's transaction, so a retransmission gets the same answer, not a 437.
     allocate_tx: [u8; 12],
 }
 
 const NONE: u32 = u32::MAX;
+
+/// What one map entry costs besides its key and value: the hash table's control byte and spare
+/// room, rounded up.
+const MAP_ENTRY: usize = 32;
+
+/// What an allocation holds: itself, its strings, its channels' room, and its share of the maps
+/// keyed on it (by client, by port, its room, and the counts per player, IP, game and issuer,
+/// which copy its strings).
+fn footprint(username: &str, user: &User, channels: usize) -> usize {
+    let strings = user.instance.len() + user.room.len() + user.player.len();
+    std::mem::size_of::<Allocation>()
+        + username.len()
+        + 2 * strings
+        + channels * std::mem::size_of::<Channel>()
+        + 7 * MAP_ENTRY
+}
+
+/// A checked ticket kept: its key, who it's charged to and how much, and when it ends.
+struct Kept {
+    key: [u8; 16],
+    ip: IpAddr,
+    cost: usize,
+    expiry: u64,
+}
+
+/// What a checked ticket kept costs: its username, the entry, and its share of the map.
+fn ticket_footprint(username: &str) -> usize {
+    username.len() + std::mem::size_of::<Kept>() + MAP_ENTRY
+}
 
 /// A ticket's instance is `<kid>/<instance>` (`Ticket::user`): its issuer is the part before.
 fn issuer_of(user: &User) -> &str {
@@ -203,8 +246,11 @@ pub struct Server {
     /// And from everyone together (`ticket_check_rate`), so many IPs can't fill the loop either.
     all_ticket_checks: Bucket,
     /// Tickets already checked, username to key: a player's allocations share one ticket, and
-    /// a replayed ticket costs a hash, not a check. Emptied when full.
-    tickets: HashMap<String, [u8; 16]>,
+    /// a replayed ticket costs a hash, not a check. Emptied when full. Each is charged to the IP
+    /// that presented it (and its charge kept with it); with no room, it's checked, not kept.
+    tickets: HashMap<String, Kept>,
+    /// What clients make the node hold (`budget`), charged here and by the node's streams.
+    memory: Budget,
     allocs: Vec<Option<Allocation>>,
     free: Vec<u32>,
     by_client: HashMap<Client, u32>,
@@ -264,6 +310,7 @@ impl Server {
             ticket_checks: Reflection::new(cfg.unauth_rate, cfg.unauth_burst, cfg.unauth_tracked),
             all_ticket_checks: Bucket::full(cfg.ticket_check_rate, base),
             tickets: HashMap::new(),
+            memory: Budget::new(cfg.memory_total, cfg.memory_per_ip),
             allocs: Vec::new(),
             free: Vec::new(),
             by_client: HashMap::new(),
@@ -304,6 +351,15 @@ impl Server {
         self.by_client.len()
     }
 
+    /// What clients make the node hold. The node charges its streams to it too.
+    pub fn memory(&self) -> &Budget {
+        &self.memory
+    }
+
+    pub fn memory_mut(&mut self) -> &mut Budget {
+        &mut self.memory
+    }
+
     /// A TCP or TLS connection closed: its allocation ends with it (RFC 8656 §2.2).
     pub fn closed(&mut self, client: Client) {
         if let Some(&i) = self.by_client.get(&canonical(client)) {
@@ -326,6 +382,16 @@ impl Server {
         for i in expired {
             self.delete(i);
         }
+        // A ticket past its expiry is no use: what it was charged goes back.
+        let unix = self.unix(now);
+        let memory = &mut self.memory;
+        self.tickets.retain(|_, t| {
+            let keep = t.expiry > unix;
+            if !keep {
+                memory.refund(t.ip, t.cost);
+            }
+            keep
+        });
         for a in self.allocs.iter_mut().flatten() {
             a.channels.retain(|c| c.expires > now);
             if a.permission_expires.is_some_and(|t| t <= now) {
@@ -506,7 +572,7 @@ impl Server {
         // Its issuer's signature, then the password from its key and this node's sealing
         // secret: only when nothing cached matches, so a refresh or a player's next allocation
         // costs a hash, and only within the IP's budget.
-        let known = cached.or_else(|| self.tickets.get(username).copied());
+        let known = cached.or_else(|| self.tickets.get(username).map(|t| t.key));
         let key = match known {
             Some(k) => msg.integrity_ok(&k).then_some(k),
             None if self.ticket_checks.allow(from.addr.ip(), now)
@@ -526,10 +592,7 @@ impl Server {
                 // Only a ticket that checked out, and was used with its password, is remembered.
                 let k = k.filter(|k| msg.integrity_ok(k));
                 if let Some(k) = k {
-                    if self.tickets.len() >= TICKETS_KEPT {
-                        self.tickets.clear();
-                    }
-                    self.tickets.insert(username.to_owned(), k);
+                    self.keep_ticket(username, k, from.addr.ip(), user.expiry);
                 }
                 k
             }
@@ -591,6 +654,7 @@ impl Server {
             }
         }
         let ip = from.addr.ip();
+        let charged = footprint(&username, &user, self.cfg.max_channels);
         if self.per_player.get(&user.player) >= self.cfg.max_per_player
             || self.per_ip.get(&ip) >= self.cfg.max_per_ip
             || self.per_instance.get(&user.instance) >= self.cfg.max_per_instance
@@ -601,6 +665,11 @@ impl Server {
         let Some(slot) = self.free_port() else {
             return Err(refuse(508));
         };
+        // No room left in its IP's share of the memory, or in everyone's: as for no free port.
+        // (The slot isn't taken until it's filled below.)
+        if !self.memory.charge(ip, charged) {
+            return Err(refuse(508));
+        }
         let port = self.cfg.min_port + slot as u16;
         let lifetime_s = self.lifetime(msg);
         let room = self.intern_room(&user.room);
@@ -618,8 +687,9 @@ impl Server {
             expires: now + Duration::from_secs(lifetime_s.into()) + self.cfg.grace,
             lifetime_s,
             permission_expires: None,
-            channels: Vec::new(),
+            channels: Vec::with_capacity(self.cfg.max_channels),
             bucket: Bucket::full(self.cfg.burst_bytes, now),
+            charged,
             allocate_tx: msg.tx,
         };
         let i = match self.free.pop() {
@@ -701,6 +771,33 @@ impl Server {
         self.per_ip.release(&a.client.addr.ip());
         self.per_instance.release(&a.user.instance);
         self.per_issuer.release(issuer_of(&a.user));
+        self.memory.refund(a.client.addr.ip(), a.charged);
+    }
+
+    /// Keeps a checked ticket, charged to `ip`, if there's room for it, until it expires.
+    fn keep_ticket(&mut self, username: &str, key: [u8; 16], ip: IpAddr, expiry: u64) {
+        if self.tickets.len() >= TICKETS_KEPT {
+            for (_, t) in self.tickets.drain() {
+                self.memory.refund(t.ip, t.cost);
+            }
+        }
+        let cost = ticket_footprint(username);
+        if self.memory.charge(ip, cost) {
+            let kept = Kept {
+                key,
+                ip,
+                cost,
+                expiry,
+            };
+            if let Some(old) = self.tickets.insert(username.to_owned(), kept) {
+                self.memory.refund(old.ip, old.cost);
+            }
+        }
+    }
+
+    /// Checked tickets kept, for tests.
+    pub fn tickets_kept(&self) -> usize {
+        self.tickets.len()
     }
 
     /// The allocation this request is for, after authenticating it; remembers a fresher username.
@@ -714,10 +811,19 @@ impl Server {
         let Some(i) = self.live_alloc(from, now) else {
             return Err(Refusal::signed(437, key));
         };
-        let a = self.alloc_mut(i);
+        let a = self.alloc(i);
         if a.username != username {
+            // A fresher ticket, maybe longer: charged the difference, or refused like a new
+            // allocation past the budget.
+            let (ip, had) = (a.client.addr.ip(), a.charged);
+            let now_charged = footprint(&username, &a.user, self.cfg.max_channels);
+            if !self.memory.recharge(ip, had, now_charged) {
+                return Err(Refusal::signed(508, key));
+            }
+            let a = self.alloc_mut(i);
             a.username = username;
             a.key = key;
+            a.charged = now_charged;
         }
         Ok((i, key))
     }

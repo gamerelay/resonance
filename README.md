@@ -84,8 +84,9 @@ flowchart LR
 - **Limits:** 8 allocations per player, 64 per client IP, 4,096 per game, 8,192 per issuer, and
   128 KB/s per allocation (256 KB burst). Unsigned answers to unknown clients are capped at 20 a
   second per IP (burst: the per-IP cap), since a spoofed source could otherwise aim them at
-  someone. TCP and TLS streams are capped too (1,024; 64 per IP), with bounded queues, so a
-  node's memory stays bounded whatever its clients do. The full table, with each limit's
+  someone. TCP and TLS streams are capped too (1,024; 64 per IP), and everything a client can
+  make the node hold is charged to one memory budget (96 MB, 16 MB per IP), so a node's memory
+  stays bounded whatever its clients do. The full table, with each limit's
   setting, is in docs/PROTOCOL.md, "Limits"; the settings are read in
   `crates/resonance-node/src/settings.rs`. Every player holds an allocation per other player even
   when the LAN route wins, so a school or office behind one NAT may need a higher

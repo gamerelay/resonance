@@ -129,6 +129,13 @@ impl Settings {
         turn.max_per_instance = env.num("TURN_MAX_PER_INSTANCE", turn.max_per_instance)?;
         turn.max_per_issuer = env.num("TURN_MAX_PER_ISSUER", turn.max_per_issuer)?;
         turn.ticket_check_rate = env.num("TURN_TICKET_CHECK_RATE", turn.ticket_check_rate)?;
+        turn.memory_total = env.num("TURN_MEMORY_BYTES", turn.memory_total)?;
+        // Unset, one IP's share is the default or the whole total, whichever is less.
+        let per_ip = turn.memory_per_ip.min(turn.memory_total);
+        turn.memory_per_ip = env.num("TURN_MEMORY_PER_IP_BYTES", per_ip)?;
+        if turn.memory_per_ip > turn.memory_total {
+            return Err("TURN_MEMORY_PER_IP_BYTES is above TURN_MEMORY_BYTES".into());
+        }
         let control_key = env.get("RESONANCE_CONTROL_KEY");
         if let Some(k) = &control_key {
             if Issuer::parse(k).is_none() {
@@ -272,6 +279,10 @@ mod tests {
             (s.limits.max_streams, s.limits.max_streams_per_ip),
             (1024, 64)
         );
+        assert_eq!(
+            (t.memory_total, t.memory_per_ip),
+            (96 * 1024 * 1024, 16 * 1024 * 1024)
+        );
         assert_eq!(s.heartbeat, HEARTBEAT);
         assert_eq!(s.control, "https://gamerelay.io");
         assert!(s.ignored.is_empty());
@@ -347,6 +358,36 @@ mod tests {
                 "turn:192.0.2.1:3479?transport=tcp",
                 "turns:turn.example.com:443?transport=tcp",
             ]
+        );
+    }
+
+    #[test]
+    fn the_memory_budget_is_set_in_bytes_and_one_ips_share_fits_in_it() {
+        let s = settings(&[
+            ("TURN_PUBLIC_IP", "192.0.2.1"),
+            ("TURN_MEMORY_BYTES", "1000000"),
+            ("TURN_MEMORY_PER_IP_BYTES", "1000"),
+        ])
+        .unwrap();
+        assert_eq!(
+            (s.turn.memory_total, s.turn.memory_per_ip),
+            (1_000_000, 1000)
+        );
+        let e = error(&[
+            ("TURN_PUBLIC_IP", "192.0.2.1"),
+            ("TURN_MEMORY_BYTES", "1000"),
+            ("TURN_MEMORY_PER_IP_BYTES", "2000"),
+        ]);
+        assert!(e.contains("above"), "{e}");
+        // A total under the per-IP default, with no share given: the share is the whole total.
+        let s = settings(&[
+            ("TURN_PUBLIC_IP", "192.0.2.1"),
+            ("TURN_MEMORY_BYTES", "8000000"),
+        ])
+        .unwrap();
+        assert_eq!(
+            (s.turn.memory_total, s.turn.memory_per_ip),
+            (8_000_000, 8_000_000)
         );
     }
 
