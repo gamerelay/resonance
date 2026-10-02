@@ -197,15 +197,19 @@ fn streams_sitting_on_half_a_message_are_closed_once_the_memory_budget_is_nearly
     let mut half = vec![0x00, 0x01, 0xF0, 0x00, 0x21, 0x12, 0xA4, 0x42];
     half.extend_from_slice(&[7; 12]);
     half.resize(20 + 56 * 1024, 0);
+    // All of them bound first, while there's room: a stream that arrives once the budget is full
+    // is closed on its first read, as it should be, so the halves go after.
     let mut sitters: Vec<TcpStream> = (0..8)
         .map(|_| {
             let mut s = TcpStream::connect(node.tcp).unwrap();
             s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             bind(&mut s);
-            s.write_all(&half).unwrap();
             s
         })
         .collect();
+    for s in &mut sitters {
+        s.write_all(&half).unwrap();
+    }
     let deadline = Instant::now() + Duration::from_secs(4);
     let mut closed = 0;
     for s in &mut sitters {
