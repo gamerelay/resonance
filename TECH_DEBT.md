@@ -44,18 +44,19 @@ C1 and C2 first: they remove the two classes this review found most of. C3 is ch
 
 | # | Priority | Size | Item |
 |---|---|---|---|
-| 11 | **High** | S | **An IPv6 `TURN_PUBLIC_IP` is accepted but never served**: the node binds `0.0.0.0` only (`main.rs`), so it advertises URLs it doesn't answer. Fix: bind `[::]` dual-stack for a v6 address, or refuse v6 in settings until then. |
-| 12 | **High** | S | **The version doesn't show the breaking change.** The crates are still 0.1.0 (tagged `v0.1.0`) though tickets removed the HMAC credentials, `/nodes/key` and `key_version`, and the heartbeat's `software` reads `resonance-node 0.1.0` for builds from before and after. The API `2026-09-29` was also changed in place (CHANGELOG says so). Fix: 0.2.0 and a tag now; next time a breaking wire change bumps `resonance_proto::VERSION`. Both nodes run `afb2677`: the release would be that plus #12 and #13 (docs and dependencies, no change on the wire). |
+| 11 | ~~High~~ | S | ~~**An IPv6 `TURN_PUBLIC_IP` is accepted but never served**: the node binds `0.0.0.0` only (`main.rs`), so it advertises URLs it doesn't answer.~~ Fixed in v0.2.0: refused at startup until it's served (27). |
+| 12 | ~~High~~ | S | ~~**The version doesn't show the breaking change.** The crates are still 0.1.0 (tagged `v0.1.0`) though tickets removed the HMAC credentials, `/nodes/key` and `key_version`, and the heartbeat's `software` reads `resonance-node 0.1.0` for builds from before and after. The API `2026-09-29` was also changed in place (CHANGELOG says so). Fix: 0.2.0 and a tag now; next time a breaking wire change bumps `resonance_proto::VERSION`. Both nodes run `afb2677`: the release would be that plus #12 and #13 (docs and dependencies, no change on the wire).~~ Fixed: v0.2.0. |
+| 27 | Low | M | **Serve IPv6.** Bind `[::]` (v6 only) for a v6 `TURN_PUBLIC_IP`, with core tests that allocate and relay with a v6 public IP (none do yet). Probes between v4 and v6 nodes can't reach each other, so the control plane mustn't alert on those links. |
 | 13 | Low | S | A dead heartbeat thread goes unnoticed: `relay.rs` ignores `Disconnected` from its channel. Log it once. |
 
 ## Tests
 
-`cargo test --workspace` passes (115 tests, about 4 s), clippy is clean, and MSRV 1.85 builds.
+`cargo test --workspace` passes (116 tests, about 4 s), clippy is clean, and MSRV 1.85 builds.
 
 | # | Priority | Size | Item |
 |---|---|---|---|
-| 14 | Medium | S | **Overflow is never checked**: CI and the fuzz run use `--release`, which wraps integer overflow silently, so "nothing panics" misses it. Add a debug `cargo test` step, or `overflow-checks = true` for the fuzz run. |
-| 15 | Medium | S | **MSRV isn't enforced in CI** (stable only). Add a `cargo +1.85 check --workspace --all-targets` job. |
+| 14 | ~~Medium~~ | S | ~~**Overflow is never checked**: CI and the fuzz run use `--release`, which wraps integer overflow silently.~~ Fixed in v0.2.0: CI runs the tests and the 2M fuzz run in a debug build too. |
+| 15 | ~~Medium~~ | S | ~~**MSRV isn't enforced in CI** (stable only).~~ Fixed in v0.2.0: an `msrv` job checks with 1.85. |
 | 16 | Medium | S | **A conformance test now tests the old format**: `malformed_rest_usernames_are_refused_without_a_panic` (`tests/conformance.rs`) feeds `expiry:i:r:p` usernames, which all fail at the `t1:` prefix. Rewrite with malformed `t1:` tickets through the server (field counts, empty parts, bad base64, expiry overflow). |
 | 17 | Medium | M | **The control-plane client and heartbeat thread are untested**: `Client::post` (headers, the error fallback), `Heartbeats::run` (only control-plane issuers saved, the exit path, the first beat at once) and `post_alert`. Test against a tiny local HTTP server, checking the signature with proto's `signing_string`. |
 | 18 | Medium | M | **The node's own Rust tests can't relay**: `tests/relay.rs` builds a config with no sealing key or issuers, so no allocation succeeds. The data path, TLS and the `mint`/`seal-key`/`issuer` commands are covered only by interop and the browsers in CI. Add an allocate-and-relay test over UDP and TCP. |

@@ -306,7 +306,7 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "resonance-node"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "resonance-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "resonance-turn"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "crc32fast",
