@@ -1,6 +1,6 @@
 [package]
 name = "resonance-node"
-description = "A Resonance relay node: the room-scoped TURN core on a UDP socket."
+description = "A Resonance relay node: the room-scoped TURN core over UDP, TCP and TLS, joined to a control plane."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

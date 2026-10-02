@@ -1,4 +1,4 @@
-//! A Resonance relay node (v0 §4): the room-scoped TURN core on one UDP socket.
+//! A Resonance relay node (v0 §4): the room-scoped TURN core on a UDP socket, and TCP and TLS.
 //!
 //! Two ways to run it:
 //!
@@ -31,20 +31,24 @@
 //! - TLS when TURN_TLS_CERT and TURN_TLS_KEY name PEM files (certbot's fullchain.pem and
 //!   privkey.pem, read again when they change), on TURN_TLS_PORT (5349; 443 gets through the most
 //!   firewalls), for TURN_TLS_HOST, the name on the certificate that players connect to.
-//! - TURN_MAX_STREAMS (4096): open TCP and TLS connections, all together; per IP, TURN_MAX_PER_IP.
+//! - TURN_MAX_STREAMS (1024): open TCP and TLS connections, all together; TURN_MAX_STREAMS_PER_IP
+//!   (64) per client IP. Their queues are bounded too (docs/PROTOCOL.md, "Limits").
 //!
 //! Its URLs, sent when it joins and with every heartbeat, follow from these.
 //!
-//! Limits (defaults are the Go relay's):
+//! Limits (the allocation and rate defaults are the Go relay's):
 //!
 //! - TURN_MAX_PER_PLAYER (8): allocations per player, one per other player in a full room.
 //! - TURN_MAX_PER_IP (64): per client IP. Every player takes one per other player even when the
 //!   LAN route wins (ICE gathers the relay before it knows), so a school or office behind one NAT
 //!   with a few full rooms needs more: 8 players × 7 others is 56.
 //! - TURN_MAX_PER_INSTANCE (4096): per game, so one game can't take the whole node.
+//! - TURN_MAX_PER_ISSUER (8192, half the relay ports): per issuer, which names its own games.
 //! - TURN_UNAUTH_RATE (20/s) and TURN_UNAUTH_BURST (TURN_MAX_PER_IP): unsigned answers per
 //!   unknown client IP; the burst follows the per-IP cap, so a shared address can fill it at once.
 //! - TURN_RATE_BYTES (131072) and TURN_BURST_BYTES (twice that): per allocation.
+//! - TURN_TICKET_CHECK_RATE (5000/s): ticket checks from all clients together, on top of each
+//!   IP's own budget (TURN_UNAUTH_RATE).
 
 use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
 use std::sync::mpsc;

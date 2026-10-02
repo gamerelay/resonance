@@ -251,6 +251,9 @@ An error is `{ "error": "<code>", "message": "<for people>" }`, with a 4xx or 5x
 
 - **Refusals.** The codes include `bad_time`, `replayed`, `bad_signature`, `unknown_node`, `bad_token`,
   `revoked`, `bad_version`, `bad_request` and `too_large`. A 4xx is a refusal, not an outage.
+- **`unknown_node`** (401) on a heartbeat means the control plane has no such node, as when it
+  was deleted while offline. The node takes no new allocations until a heartbeat is answered
+  again. It doesn't exit, so a control plane that lost its registry can't stop every node.
 - **Outages.** A 5xx or a transport error means the control plane is unreachable. After
   `RESONANCE_ALERT_AFTER_S` (120 s) of that, the node posts to `RESONANCE_ALERT_WEBHOOK` (a
   Discord or Slack incoming webhook), once, and again when the control plane is back.

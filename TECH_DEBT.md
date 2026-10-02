@@ -45,12 +45,12 @@ C1 and C2 first: they remove the two classes this review found most of. C3 is ch
 | # | Priority | Size | Item |
 |---|---|---|---|
 | 11 | **High** | S | **An IPv6 `TURN_PUBLIC_IP` is accepted but never served**: the node binds `0.0.0.0` only (`main.rs`), so it advertises URLs it doesn't answer. Fix: bind `[::]` dual-stack for a v6 address, or refuse v6 in settings until then. |
-| 12 | **High** | S | **The version doesn't show the breaking change.** The crates are still 0.1.0 (tagged `v0.1.0`) though tickets removed the HMAC credentials, `/nodes/key` and `key_version`, and the heartbeat's `software` reads `resonance-node 0.1.0` for builds from before and after. The API `2026-09-29` was also changed in place (CHANGELOG says so). Fix: 0.2.0 and a tag now; next time a breaking wire change bumps `resonance_proto::VERSION`. |
+| 12 | **High** | S | **The version doesn't show the breaking change.** The crates are still 0.1.0 (tagged `v0.1.0`) though tickets removed the HMAC credentials, `/nodes/key` and `key_version`, and the heartbeat's `software` reads `resonance-node 0.1.0` for builds from before and after. The API `2026-09-29` was also changed in place (CHANGELOG says so). Fix: 0.2.0 and a tag now; next time a breaking wire change bumps `resonance_proto::VERSION`. Both nodes run `afb2677`: the release would be that plus #12 and #13 (docs and dependencies, no change on the wire). |
 | 13 | Low | S | A dead heartbeat thread goes unnoticed: `relay.rs` ignores `Disconnected` from its channel. Log it once. |
 
 ## Tests
 
-`cargo test --workspace` passes (113 tests, about 4 s), clippy is clean, and MSRV 1.85 builds.
+`cargo test --workspace` passes (115 tests, about 4 s), clippy is clean, and MSRV 1.85 builds.
 
 | # | Priority | Size | Item |
 |---|---|---|---|
@@ -59,7 +59,7 @@ C1 and C2 first: they remove the two classes this review found most of. C3 is ch
 | 16 | Medium | S | **A conformance test now tests the old format**: `malformed_rest_usernames_are_refused_without_a_panic` (`tests/conformance.rs`) feeds `expiry:i:r:p` usernames, which all fail at the `t1:` prefix. Rewrite with malformed `t1:` tickets through the server (field counts, empty parts, bad base64, expiry overflow). |
 | 17 | Medium | M | **The control-plane client and heartbeat thread are untested**: `Client::post` (headers, the error fallback), `Heartbeats::run` (only control-plane issuers saved, the exit path, the first beat at once) and `post_alert`. Test against a tiny local HTTP server, checking the signature with proto's `signing_string`. |
 | 18 | Medium | M | **The node's own Rust tests can't relay**: `tests/relay.rs` builds a config with no sealing key or issuers, so no allocation succeeds. The data path, TLS and the `mint`/`seal-key`/`issuer` commands are covered only by interop and the browsers in CI. Add an allocate-and-relay test over UDP and TCP. |
-| 19 | Low | M | No tests for `tls.rs` (`reload_if_changed`, the certbot renewal path) or for `relay.rs`'s outbox drop and stream back-pressure. |
+| 19 | Low | M | No tests for `tls.rs` (`reload_if_changed`, the certbot renewal path). (`relay.rs`'s outbox caps and the closing of streams that never read got tests in #9.) |
 | 20 | Low | S | Two node tests lean on wall-clock time (`elapsed < 2500ms`, an 8 s probe deadline in `tests/relay.rs`). Widen them or inject the tick. |
 
 ## Organization
@@ -82,4 +82,4 @@ INFRASTRUCTURE.md).
 
 | # | Priority | Size | Item |
 |---|---|---|---|
-| 26 | Low | S | The CHANGELOG's 2026-10-01 entry has no commit hashes, though its header promises them. Add them with the 0.2.0 release (#12). |
+| 26 | ~~Low~~ | S | ~~The CHANGELOG's 2026-10-01 entry has no commit hashes, though its header promises them.~~ Added for 2026-10-01 and 2026-10-02 in the docs refresh after #13. |
