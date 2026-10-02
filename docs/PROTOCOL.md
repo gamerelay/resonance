@@ -74,11 +74,19 @@ password = base64url( HMAC-SHA256( X25519(eph secret, node sealing key),
   heartbeat (`seal_key`), and `resonance-node status` prints it.
 - **Rooms are scoped by issuer.** On the node, a ticket's game is `<kid>/<instance>`, so one
   issuer can't mint a ticket into another issuer's rooms.
-- **Limits.** A ticket lasts at most a day. A node refuses tickets from issuers it doesn't trust,
-  and an issuer it stops trusting is refused at its allocations' next request.
+- **Limits.** A ticket lasts at most a day (plus 5 minutes for an issuer's clock running ahead).
+  A node refuses tickets from issuers it doesn't trust, and an issuer it stops trusting is
+  refused at its allocations' next request.
+- **Cost.** Checking a ticket (a signature and a key agreement, about 40 µs) is budgeted per IP,
+  on every transport, like unsigned answers. A ticket that checked out is remembered, so a
+  player's other allocations, and a ticket replayed with a wrong password, cost a hash.
+- **The sealing key goes with every heartbeat.** A heartbeat without one (a node rolled back to a
+  build without tickets) tells the control plane to stop minting tickets for it. A control plane
+  refuses a key that gives no shared secret (a low-order point).
 - **Whom a node trusts.** Its own `RESONANCE_ISSUERS` (ed25519 public keys, base64url,
   comma-separated), and the issuers its control plane lists in each heartbeat's answer. It saves
-  the last list (`issuers.json` in its state directory). If it restarts while its control plane
+  the control plane's last list (`issuers.json` in its state directory; its own come from
+  `RESONANCE_ISSUERS` at each start). If it restarts while its control plane
   is out of reach, it relays ticket holders from that list until the control plane is back,
   even before it has its own HMAC key.
 - **Fixture.** `crates/resonance-turn/src/ticket.rs` and GameRelay's `test/turn.test.ts` mint

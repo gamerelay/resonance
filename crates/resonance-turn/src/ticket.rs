@@ -23,6 +23,8 @@ use crate::auth::User;
 pub const PREFIX: &str = "t1:";
 /// A ticket lasts at most a day: an issuer can't mint one that outlives a revoked key by long.
 pub const MAX_LIFETIME_S: u64 = 86_400;
+/// How far ahead of this node an issuer's clock may be, on top of `MAX_LIFETIME_S`.
+pub const SKEW_S: u64 = 300;
 const DOMAIN: &[u8] = b"resonance/ticket/v1\n";
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 

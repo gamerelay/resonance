@@ -178,11 +178,19 @@ struct Allocation {
 }
 
 const NONE: u32 = u32::MAX;
+/// Checked tickets remembered (`Server::tickets`): about a player each.
+const TICKETS_KEPT: usize = 8192;
 
 pub struct Server {
     cfg: Config,
     nonces: Nonces,
     limiter: Reflection,
+    /// Ticket checks (a signature and a key agreement, ~40 µs) per IP, on every transport: a
+    /// client reusing one nonce can't make the loop do them faster than this.
+    ticket_checks: Reflection,
+    /// Tickets already checked, username to key: a player's allocations share one ticket, and
+    /// a replayed ticket costs a hash, not a check. Emptied when full.
+    tickets: HashMap<String, [u8; 16]>,
     allocs: Vec<Option<Allocation>>,
     free: Vec<u32>,
     by_client: HashMap<Client, u32>,
@@ -239,6 +247,8 @@ impl Server {
         Server {
             nonces: Nonces::new(cfg.nonce_key),
             limiter: Reflection::new(cfg.unauth_rate, cfg.unauth_burst, cfg.unauth_tracked),
+            ticket_checks: Reflection::new(cfg.unauth_rate, cfg.unauth_burst, cfg.unauth_tracked),
+            tickets: HashMap::new(),
             allocs: Vec::new(),
             free: Vec::new(),
             by_client: HashMap::new(),
@@ -480,7 +490,8 @@ impl Server {
         // No request succeeds past the credential's expiry, so an allocation outlives it by at
         // most one lifetime. A ticket lasts a day at most.
         let unix = self.unix(now);
-        if user.expiry <= unix || (ticket.is_some() && user.expiry > unix + ticket::MAX_LIFETIME_S)
+        if user.expiry <= unix
+            || (ticket.is_some() && user.expiry > unix + ticket::MAX_LIFETIME_S + ticket::SKEW_S)
         {
             return Err(Refusal::unsigned(401));
         }
@@ -508,14 +519,31 @@ impl Server {
         let key = match &ticket {
             // An issuer no longer trusted ends its tickets at their next request, cached or not.
             Some(t) if !self.cfg.issuers.iter().any(|i| i.kid == t.kid) => None,
-            Some(t) => cached.filter(|k| msg.integrity_ok(k)).or_else(|| {
-                let seal = self.cfg.seal.as_ref()?;
-                if !t.verify(&self.cfg.issuers) {
-                    return None;
+            Some(t) => {
+                let known = cached.or_else(|| self.tickets.get(username).copied());
+                match known {
+                    Some(k) => msg.integrity_ok(&k).then_some(k),
+                    None if self.ticket_checks.allow(from.addr.ip(), now) => {
+                        let k = self.cfg.seal.as_ref().and_then(|seal| {
+                            t.verify(&self.cfg.issuers)
+                                .then(|| t.password(seal))
+                                .flatten()
+                                .map(|p| auth::long_term_key(username, &self.cfg.realm, &p))
+                        });
+                        // Only a ticket that checked out, and was used with its password, is
+                        // remembered.
+                        let k = k.filter(|k| msg.integrity_ok(k));
+                        if let Some(k) = k {
+                            if self.tickets.len() >= TICKETS_KEPT {
+                                self.tickets.clear();
+                            }
+                            self.tickets.insert(username.to_owned(), k);
+                        }
+                        k
+                    }
+                    None => None,
                 }
-                let k = auth::long_term_key(username, &self.cfg.realm, &t.password(seal)?);
-                msg.integrity_ok(&k).then_some(k)
-            }),
+            }
             // No key yet: nothing is signed with an empty one, which anyone could do.
             None => [
                 cached,

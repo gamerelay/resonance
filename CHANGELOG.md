@@ -14,12 +14,15 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
   node shares no secret with the issuer, and one ticket serves every node (docs/PROTOCOL.md,
   "Tickets").
 - Rooms are scoped by issuer (`<kid>/<instance>`), so one issuer can't mint into another's rooms.
-  A ticket lasts a day at most. An issuer no longer trusted is refused at its allocations' next
-  request.
+  A ticket lasts a day at most (plus 5 minutes of clock skew). An issuer no longer trusted is
+  refused at its allocations' next request.
+- Ticket checks (~40 µs each) are budgeted per IP on every transport, and a checked ticket is
+  remembered (8,192 of them), so a flood of tickets can't hold the loop up and a player's other
+  allocations cost a hash.
 - The sealing key is derived from the node's ed25519 seed, so there's no new key file. It goes
   with the join and each heartbeat (`seal_key`); `status` prints it.
 - Trusted issuers: `RESONANCE_ISSUERS`, and the control plane's list in each heartbeat's answer
-  (`issuers`), saved to `issuers.json`.
+  (`issuers`); the control plane's are saved to `issuers.json`.
 - **A restart while the control plane is out of reach still relays.** With saved issuers, the
   node waits a few seconds for its key, then relays ticket holders, and fetches the key with the
   first heartbeat answered. Before, it waited for the control plane to come back. Nothing is
@@ -29,7 +32,7 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
 - Tests: the fixture shared with the control plane (the same ticket and password minted by
   GameRelay's `turn.test.ts`); untrusted, tampered, expired, over-long and wrongly keyed tickets;
   rooms scoped by issuer; an issuer dropped mid-allocation; a node with no key yet (and an empty
-  key signing nothing). In GameRelay's e2e: Chrome players relaying through a joined node with
+  key signing nothing); a flood of bad tickets over a stream spending only its IP's budget. In GameRelay's e2e: Chrome players relaying through a joined node with
   tickets, and through the same node restarted with its control plane out of reach.
 
 **v0.1.0**, the first tagged release: everything below, as in production on both nodes since

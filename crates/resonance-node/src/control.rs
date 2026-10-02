@@ -214,8 +214,8 @@ pub struct Heartbeats {
     pub controls: Sender<Control>,
     /// `RESONANCE_ISSUERS`: trusted whatever the control plane says.
     pub local_issuers: Vec<String>,
-    /// The issuers the relay loop started with (the local ones and the last saved), and where
-    /// to save them when the control plane changes them.
+    /// The issuers the relay loop started with (the local ones and the control plane's last
+    /// saved), and where to save the control plane's when they change.
     pub issuers: Vec<String>,
     pub state: crate::state::State,
     /// Where to say the control plane is out of reach (RESONANCE_ALERT_WEBHOOK), and who says it.
@@ -276,8 +276,15 @@ impl Heartbeats {
             for c in decide(&reply, &mut seen, &self.local_issuers, || {
                 self.client.fetch_key()
             }) {
+                // Only the control plane's: the node's own come from RESONANCE_ISSUERS at each
+                // start, so one taken out of it isn't kept trusted by the file.
                 if let Control::Issuers(keys) = &c {
-                    if let Err(e) = self.state.save_issuers(keys) {
+                    let theirs: Vec<String> = keys
+                        .iter()
+                        .filter(|k| !self.local_issuers.contains(k))
+                        .cloned()
+                        .collect();
+                    if let Err(e) = self.state.save_issuers(&theirs) {
                         eprintln!("saving the issuers: {e}");
                     }
                 }

@@ -160,9 +160,20 @@ fn a_ticket_is_refused_past_its_expiry_and_beyond_a_day() {
         allocate(&mut c, &mut s, t, &mint(&issuer(1), UNIX, "g1", "p_a")),
         401
     );
-    let long = mint(&issuer(1), UNIX + ticket::MAX_LIFETIME_S + 1, "g1", "p_a");
+    let long = mint(
+        &issuer(1),
+        UNIX + ticket::MAX_LIFETIME_S + ticket::SKEW_S + 1,
+        "g1",
+        "p_a",
+    );
     assert_eq!(allocate(&mut c, &mut s, t, &long), 401, "longer than a day");
-    let day = mint(&issuer(1), UNIX + ticket::MAX_LIFETIME_S, "g1", "p_a");
+    // A day, from an issuer whose clock is a few minutes ahead.
+    let day = mint(
+        &issuer(1),
+        UNIX + ticket::MAX_LIFETIME_S + ticket::SKEW_S,
+        "g1",
+        "p_a",
+    );
     assert_eq!(allocate(&mut c, &mut s, t, &day), 0);
 }
 
@@ -308,4 +319,54 @@ fn a_node_without_its_key_yet_takes_tickets_and_nothing_signed_with_an_empty_key
     );
     assert_eq!(r.code(), 401);
     c.allocate(&mut s, t, &name);
+}
+
+#[test]
+fn ticket_checks_are_budgeted_per_ip_on_every_transport_and_a_checked_ticket_is_remembered() {
+    let t = Instant::now();
+    let mut s = ticket_server(t);
+    let good = mint(&issuer(1), UNIX + 3600, "g1", "p_a");
+    // Checked once, on the first 5-tuple.
+    assert_eq!(
+        allocate(&mut Client::new("198.51.100.1:5000"), &mut s, t, &good),
+        0
+    );
+    // A flood of tickets that don't check out, over a stream (streams skip the UDP budget):
+    // each costs a check until the IP's budget is spent.
+    let junk = good.username.replacen(":g1:", ":gX:", 1);
+    let mut flood = Client::on("198.51.100.1:6000", 7);
+    for _ in 0..200 {
+        let r = flood.request_as(
+            &mut s,
+            t,
+            method::REFRESH,
+            &junk,
+            &password(&good),
+            &[],
+            None,
+        );
+        assert_eq!(r.code(), 401);
+    }
+    // Spent: a fresh ticket from that IP isn't checked now...
+    let fresh = mint(&issuer(1), UNIX + 3600, "g1", "p_b");
+    assert_eq!(
+        allocate(&mut Client::new("198.51.100.1:5001"), &mut s, t, &fresh),
+        401
+    );
+    // ...but the one already checked still works, from another port.
+    assert_eq!(
+        allocate(&mut Client::new("198.51.100.1:5002"), &mut s, t, &good),
+        0
+    );
+    // Another IP has its own budget, and this one's refills.
+    assert_eq!(
+        allocate(&mut Client::new("198.51.100.9:5000"), &mut s, t, &fresh),
+        0
+    );
+    let later = t + std::time::Duration::from_secs(5);
+    let other = mint(&issuer(1), UNIX + 3600, "g1", "p_c");
+    assert_eq!(
+        allocate(&mut Client::new("198.51.100.1:5003"), &mut s, later, &other),
+        0
+    );
 }
