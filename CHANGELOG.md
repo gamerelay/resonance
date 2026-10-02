@@ -14,6 +14,9 @@ separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it cha
   node shares no secret with the issuer, and one ticket serves every node (docs/PROTOCOL.md,
   "Tickets").
 - Rooms are scoped by issuer (`<kid>/<instance>`), so one issuer can't mint into another's rooms.
+  The control plane's own issuer (`home` in its list) is the exception: its tickets name rooms as
+  its HMAC credentials do, so players holding different kinds in one room, while a node switches
+  over, still reach each other (found in review: they were in different rooms).
   A ticket lasts a day at most (plus 5 minutes of clock skew). An issuer no longer trusted is
   refused at its allocations' next request.
 - Ticket checks (~40 µs each) are budgeted per IP on every transport, and a checked ticket is

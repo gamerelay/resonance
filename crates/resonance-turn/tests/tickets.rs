@@ -370,3 +370,69 @@ fn ticket_checks_are_budgeted_per_ip_on_every_transport_and_a_checked_ticket_is_
         0
     );
 }
+
+#[test]
+fn a_home_issuers_tickets_share_rooms_with_hmac_credentials_and_no_other_issuers_do() {
+    let t = Instant::now();
+    let mut s = server_with(t, |c| {
+        c.seal = Some(ticket::seal_secret(&SEED));
+        c.issuers = vec![
+            Issuer::new(&issuer(1).verifying_key().to_bytes())
+                .unwrap()
+                .home(true),
+            Issuer::new(&issuer(2).verifying_key().to_bytes()).unwrap(),
+        ];
+    });
+    // Mid switch-over: a got an HMAC credential, b a ticket, for one room ("ins", "g1").
+    let mut a = Client::new("198.51.100.1:5000");
+    let ra = a.allocate(&mut s, t, &user("g1", "p_a"));
+    let home = mint(&issuer(1), UNIX + 3600, "g1", "p_b");
+    let mut b = Client::new("198.51.100.2:5000");
+    let rb = relayed(&mut b, &mut s, t, &home);
+    assert_eq!(a.permit(&mut s, t, &user("g1", "p_a"), rb), 0);
+    let r = b.request_as(
+        &mut s,
+        t,
+        method::CREATE_PERMISSION,
+        &home.username,
+        &password(&home),
+        &[],
+        Some(ra),
+    );
+    assert_eq!(r.code(), 0);
+    let got = a.send_indication(&mut s, t, rb, b"hi");
+    assert_eq!(got.len(), 1, "the HMAC holder reaches the ticket holder");
+    assert_eq!(got[0].0, b.from);
+    assert_eq!(b.send_indication(&mut s, t, ra, b"yo").len(), 1, "and back");
+    // A renewal with the other kind for the same room and player is the same allocation.
+    let a_ticket = mint(&issuer(1), UNIX + 3600, "g1", "p_a");
+    let r = a.request_as(
+        &mut s,
+        t,
+        method::REFRESH,
+        &a_ticket.username,
+        &password(&a_ticket),
+        &[lifetime(600)],
+        None,
+    );
+    assert_eq!(r.code(), 0, "not a 441");
+    // Another issuer's same-named room is another room.
+    let foreign = mint(&issuer(2), UNIX + 3600, "g1", "p_c");
+    let mut c = Client::new("198.51.100.3:5000");
+    let rc = relayed(&mut c, &mut s, t, &foreign);
+    let r = c.request_as(
+        &mut s,
+        t,
+        method::CREATE_PERMISSION,
+        &foreign.username,
+        &password(&foreign),
+        &[],
+        Some(ra),
+    );
+    assert_eq!(r.code(), 0);
+    assert!(
+        c.send_indication(&mut s, t, ra, b"hi").is_empty(),
+        "nothing crosses into the home room"
+    );
+    assert!(a.send_indication(&mut s, t, rc, b"hi").is_empty());
+}

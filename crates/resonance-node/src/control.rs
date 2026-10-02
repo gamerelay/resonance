@@ -11,8 +11,8 @@ use resonance_turn::ticket;
 use std::net::SocketAddr;
 
 use resonance_proto::{
-    self as proto, ErrorResponse, Heartbeat, HeartbeatResponse, JoinRequest, JoinResponse,
-    KeyResponse, Peer, PeerReport, Status,
+    self as proto, ErrorResponse, Heartbeat, HeartbeatResponse, IssuerKey, JoinRequest,
+    JoinResponse, KeyResponse, Peer, PeerReport, Status,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -177,9 +177,9 @@ pub enum Control {
     Accepting(bool),
     /// The other nodes to measure (`probe`).
     Peers(Vec<(String, SocketAddr)>),
-    /// Whose tickets to accept: this node's own `RESONANCE_ISSUERS` and the control plane's, as
-    /// base64url public keys, each one a valid key.
-    Issuers(Vec<String>),
+    /// Whose tickets to accept: this node's own `RESONANCE_ISSUERS` and the control plane's
+    /// (its own marked `home`), each a valid key.
+    Issuers(Vec<IssuerKey>),
     /// Revoked: stop now.
     Exit,
 }
@@ -216,7 +216,7 @@ pub struct Heartbeats {
     pub local_issuers: Vec<String>,
     /// The issuers the relay loop started with (the local ones and the control plane's last
     /// saved), and where to save the control plane's when they change.
-    pub issuers: Vec<String>,
+    pub issuers: Vec<IssuerKey>,
     pub state: crate::state::State,
     /// Where to say the control plane is out of reach (RESONANCE_ALERT_WEBHOOK), and who says it.
     pub alert: Option<(String, Watch)>,
@@ -277,11 +277,12 @@ impl Heartbeats {
                 self.client.fetch_key()
             }) {
                 // Only the control plane's: the node's own come from RESONANCE_ISSUERS at each
-                // start, so one taken out of it isn't kept trusted by the file.
+                // start, so one taken out of it isn't kept trusted by the file. Its home one
+                // always, since that decides how its tickets name rooms.
                 if let Control::Issuers(keys) = &c {
-                    let theirs: Vec<String> = keys
+                    let theirs: Vec<IssuerKey> = keys
                         .iter()
-                        .filter(|k| !self.local_issuers.contains(k))
+                        .filter(|k| k.home || !self.local_issuers.contains(&k.pubkey))
                         .cloned()
                         .collect();
                     if let Err(e) = self.state.save_issuers(&theirs) {
@@ -302,7 +303,25 @@ struct Seen {
     accepting: bool,
     key_version: u32,
     peers: Vec<Peer>,
-    issuers: Vec<String>,
+    issuers: Vec<IssuerKey>,
+}
+
+/// `RESONANCE_ISSUERS` as issuers: none of them home.
+pub fn local(keys: &[String]) -> Vec<IssuerKey> {
+    keys.iter()
+        .map(|k| IssuerKey {
+            pubkey: k.clone(),
+            home: false,
+        })
+        .collect()
+}
+
+/// Adds an issuer once: a key listed twice is home if either says so.
+pub fn add_issuer(list: &mut Vec<IssuerKey>, k: &IssuerKey) {
+    match list.iter_mut().find(|i| i.pubkey == k.pubkey) {
+        Some(i) => i.home |= k.home,
+        None => list.push(k.clone()),
+    }
 }
 
 /// What one heartbeat answer means for the relay loop.
@@ -366,15 +385,15 @@ fn decide(
         );
         out.push(Control::Peers(peers));
     }
-    let mut issuers = local_issuers.to_vec();
+    let mut issuers = local(local_issuers);
     for i in &reply.issuers {
         if ticket::Issuer::parse(&i.pubkey).is_none() {
             eprintln!(
                 "the control plane's issuer {:?} isn't an ed25519 key: ignored",
                 i.pubkey
             );
-        } else if !issuers.contains(&i.pubkey) {
-            issuers.push(i.pubkey.clone());
+        } else {
+            add_issuer(&mut issuers, i);
         }
     }
     if issuers != seen.issuers {
@@ -557,33 +576,38 @@ mod tests {
     fn issuers_are_this_nodes_own_and_the_control_planes_passed_on_once() {
         const A: &str = "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w";
         const B: &str = "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw";
+        let key = |pubkey: &str, home| IssuerKey {
+            pubkey: pubkey.into(),
+            home,
+        };
         let local = vec![A.to_string()];
         let mut s = seen();
-        s.issuers = local.clone();
+        s.issuers = super::local(&local);
         let mut r = reply(Status::Active, 0);
         assert!(
             decide(&r, &mut s, &local, no_key).is_empty(),
             "the local ones from the start"
         );
-        r.issuers = vec![
-            IssuerKey { pubkey: A.into() },
-            IssuerKey { pubkey: B.into() },
-            IssuerKey {
-                pubkey: "not a key".into(),
-            },
-        ];
+        r.issuers = vec![key(B, true), key(A, false), key("not a key", false)];
         assert_eq!(
             decide(&r, &mut s, &local, no_key),
-            vec![Control::Issuers(vec![A.into(), B.into()])]
+            vec![Control::Issuers(vec![key(A, false), key(B, true)])],
+            "the control plane's home issuer stays marked"
         );
         assert!(
             decide(&r, &mut s, &local, no_key).is_empty(),
             "the same again"
         );
+        // The node's own key, named home by the control plane too: home.
+        r.issuers = vec![key(A, true)];
+        assert_eq!(
+            decide(&r, &mut s, &local, no_key),
+            vec![Control::Issuers(vec![key(A, true)])]
+        );
         r.issuers.clear();
         assert_eq!(
             decide(&r, &mut s, &local, no_key),
-            vec![Control::Issuers(vec![A.into()])],
+            vec![Control::Issuers(vec![key(A, false)])],
             "the control plane's gone; the node's own stay"
         );
     }

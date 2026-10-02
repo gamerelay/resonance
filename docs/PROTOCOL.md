@@ -73,7 +73,10 @@ password = base64url( HMAC-SHA256( X25519(eph secret, node sealing key),
   `HMAC-SHA256(seed, "resonance/seal/v1")`. Its public half goes with the join and every
   heartbeat (`seal_key`), and `resonance-node status` prints it.
 - **Rooms are scoped by issuer.** On the node, a ticket's game is `<kid>/<instance>`, so one
-  issuer can't mint a ticket into another issuer's rooms.
+  issuer can't mint a ticket into another issuer's rooms. The exception is the control plane's
+  own issuer, which it marks `home`. Its tickets name rooms as its HMAC credentials do, so while
+  a node switches from HMAC to tickets, players in one room holding different kinds still reach
+  each other.
 - **Limits.** A ticket lasts at most a day (plus 5 minutes for an issuer's clock running ahead).
   A node refuses tickets from issuers it doesn't trust, and an issuer it stops trusting is
   refused at its allocations' next request.
@@ -237,7 +240,7 @@ hour and can be used once; it carries the node's region.
     "status": "active", "key_version": 0,
     "latest_version": "2026-09-29", "min_version": "2026-09-29",
     "peers": [{ "node_id": "rn_b…", "addr": "198.51.100.2:3478" }],
-    "issuers": [{ "pubkey": "<base64url>" }]
+    "issuers": [{ "pubkey": "<base64url>", "home": true }]
   }
 ```
 
@@ -249,7 +252,7 @@ In the request:
   passwords with it.
 
 In the answer, `issuers` lists the ed25519 public keys whose tickets the node should accept,
-besides its own `RESONANCE_ISSUERS`.
+besides its own `RESONANCE_ISSUERS`. The control plane's own carries `"home": true`.
 
 ### Statuses
 

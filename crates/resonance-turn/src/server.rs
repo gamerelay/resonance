@@ -482,7 +482,7 @@ impl Server {
         let ticket = ticket::parse(username);
         let Some(user) = ticket
             .as_ref()
-            .map(|t| t.user())
+            .map(|t| t.user(self.cfg.issuers.iter().any(|i| i.home && i.kid == t.kid)))
             .or_else(|| auth::parse_username(username))
         else {
             return Err(Refusal::unsigned(401));

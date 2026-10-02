@@ -10,6 +10,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::SigningKey;
+use resonance_proto::IssuerKey;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -93,8 +94,8 @@ impl State {
         fs::rename(tmp, self.dir.join("node.json"))
     }
 
-    /// The issuers last saved (base64url public keys); none if there's no file yet.
-    pub fn issuers(&self) -> std::io::Result<Vec<String>> {
+    /// The issuers last saved; none if there's no file yet.
+    pub fn issuers(&self) -> std::io::Result<Vec<IssuerKey>> {
         match fs::read(self.dir.join("issuers.json")) {
             Ok(b) => serde_json::from_slice(&b).map_err(std::io::Error::other),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -102,7 +103,7 @@ impl State {
         }
     }
 
-    pub fn save_issuers(&self, keys: &[String]) -> std::io::Result<()> {
+    pub fn save_issuers(&self, keys: &[IssuerKey]) -> std::io::Result<()> {
         fs::create_dir_all(&self.dir)?;
         let tmp = self.dir.join("issuers.json.tmp");
         fs::write(
@@ -147,9 +148,19 @@ mod tests {
     #[test]
     fn issuers_round_trip() {
         let s = State::new(tmp());
-        assert_eq!(s.issuers().unwrap(), Vec::<String>::new());
-        s.save_issuers(&["a".into(), "b".into()]).unwrap();
-        assert_eq!(s.issuers().unwrap(), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(s.issuers().unwrap(), Vec::new());
+        let keys = vec![
+            IssuerKey {
+                pubkey: "a".into(),
+                home: true,
+            },
+            IssuerKey {
+                pubkey: "b".into(),
+                home: false,
+            },
+        ];
+        s.save_issuers(&keys).unwrap();
+        assert_eq!(s.issuers().unwrap(), keys);
         fs::remove_dir_all(s.dir()).unwrap();
     }
 

@@ -659,9 +659,11 @@ impl Relay {
                 Control::Peers(peers) => self.prober.set_peers(peers, now),
                 Control::Key(k) => self.server.set_node_key(k, now, self.limits.key_overlap),
                 Control::Accepting(yes) => self.server.set_accepting(yes),
-                Control::Issuers(keys) => self
-                    .server
-                    .set_issuers(keys.iter().filter_map(|k| Issuer::parse(k)).collect()),
+                Control::Issuers(keys) => self.server.set_issuers(
+                    keys.iter()
+                        .filter_map(|k| Issuer::parse(&k.pubkey).map(|i| i.home(k.home)))
+                        .collect(),
+                ),
                 Control::Exit => return false,
             }
         }

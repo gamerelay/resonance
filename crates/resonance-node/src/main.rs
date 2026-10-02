@@ -149,7 +149,7 @@ fn run_node(s: Settings) {
         .joined()
         .unwrap_or_else(|e| fail(&format!("state in {}: {e}", state.dir().display())));
     let mut seal = None;
-    let mut issuers = s.issuers.clone();
+    let mut issuers = control::local(&s.issuers);
     let (key, network) = match joined {
         Some(j) => {
             let signing = state
@@ -162,8 +162,8 @@ fn run_node(s: Settings) {
                 eprintln!("the saved issuers in {}: {e}", state.dir().display());
                 Vec::new()
             }) {
-                if !issuers.contains(&k) && ticket::Issuer::parse(&k).is_some() {
-                    issuers.push(k);
+                if ticket::Issuer::parse(&k.pubkey).is_some() {
+                    control::add_issuer(&mut issuers, &k);
                 }
             }
             let client = Client::new(&j.control, signing, Some(j.node_id.clone()), &j.api_version);
@@ -249,7 +249,7 @@ fn run_node(s: Settings) {
     cfg.seal = seal;
     cfg.issuers = issuers
         .iter()
-        .filter_map(|k| ticket::Issuer::parse(k))
+        .filter_map(|k| ticket::Issuer::parse(&k.pubkey).map(|i| i.home(k.home)))
         .collect();
     if seal.is_some() {
         eprintln!(

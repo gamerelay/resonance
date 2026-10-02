@@ -155,9 +155,14 @@ pub struct HeartbeatResponse {
 }
 
 /// An issuer's ed25519 public key, base64url (no padding).
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IssuerKey {
     pub pubkey: String,
+    /// The control plane's own issuer: its tickets name rooms as its HMAC credentials do, so a
+    /// room's players relay to each other whichever kind each holds. Others' rooms are scoped by
+    /// their key id. An addition within 2026-09-29.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub home: bool,
 }
 
 /// An error answer: `{ error, message }`.

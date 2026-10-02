@@ -38,6 +38,8 @@ pub fn kid(public: &[u8; 32]) -> String {
 pub struct Issuer {
     pub kid: String,
     key: VerifyingKey,
+    /// The control plane's own: its tickets name rooms as its HMAC credentials do.
+    pub home: bool,
 }
 
 impl Issuer {
@@ -45,7 +47,14 @@ impl Issuer {
         Some(Issuer {
             kid: kid(public),
             key: VerifyingKey::from_bytes(public).ok()?,
+            home: false,
         })
+    }
+
+    /// Marked as the control plane's own (`home`), or not.
+    pub fn home(mut self, home: bool) -> Self {
+        self.home = home;
+        self
     }
 
     /// From base64url (no padding), as settings and the control plane give it.
@@ -110,9 +119,15 @@ pub fn parse(username: &str) -> Option<Ticket<'_>> {
 }
 
 impl Ticket<'_> {
-    /// Who it names, scoped by its issuer: another issuer can't mint into this one's rooms.
-    pub fn user(&self) -> User {
-        let instance = format!("{}/{}", self.kid, self.instance);
+    /// Who it names. A home issuer's (the control plane's own) as its HMAC credentials name them,
+    /// so a room's players relay to each other whichever kind each holds. Any other issuer's
+    /// scoped by its key id, so it can't mint into anyone else's rooms.
+    pub fn user(&self, home: bool) -> User {
+        let instance = if home {
+            self.instance.to_owned()
+        } else {
+            format!("{}/{}", self.kid, self.instance)
+        };
         User {
             expiry: self.expiry,
             room: format!("{instance}:{}", self.room),
@@ -245,8 +260,14 @@ mod tests {
             "me",
         );
         let (ua, ub) = (
-            parse(&a.username).unwrap().user(),
-            parse(&b.username).unwrap().user(),
+            parse(&a.username).unwrap().user(false),
+            parse(&b.username).unwrap().user(false),
+        );
+        // A home issuer's: named as the control plane's HMAC credentials name them.
+        let home = parse(&a.username).unwrap().user(true);
+        assert_eq!(
+            (home.instance.as_str(), home.room.as_str()),
+            ("ins_a", "ins_a:room")
         );
         assert_ne!(ua.room, ub.room);
         assert_ne!(ua.player, ub.player);
