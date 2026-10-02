@@ -1,7 +1,7 @@
 # Tech debt
 
 What we know needs doing in the node, from the review of 2026-10-01 (main at `cdea8f1`): code
-organization, tests, docs and security. Items 1–10 are the security ones, kept privately for now. Ranked within each section. Size: S (an hour or two), M (a
+organization, tests, docs and security. Items 1–10 are the security ones: the fixed ones are listed below, the rest kept privately until fixed. Ranked within each section. Size: S (an hour or two), M (a
 day), L (more). Strike an item when it's fixed, with its commit or PR.
 
 ## Security
@@ -9,6 +9,11 @@ day), L (more). Strike an item when it's fixed, with its commit or PR.
 Nothing critical was found: the ticket cryptography, the STUN parser, room isolation and the
 signed control-plane requests all held up. The items it did find are tracked privately until
 they're fixed (SECURITY.md), then listed here.
+
+| # | Priority | Size | Item |
+|---|---|---|---|
+| 1 | ~~High~~ | S | ~~**Stream queues could exhaust a node's memory**: clients that sent over TCP or TLS and never read their answers piled them up, 256 KB a stream and 256 streams an IP.~~ Fixed in #9 (2026-10-02, deployed): 64 KB a stream, 16 MB in all, a fixed send buffer, streams holding the most closed past 32 MB, and their own caps (1,024; 64 per IP). |
+| 2 | ~~High~~ | S | ~~**Channel bindings per allocation were unlimited**: one allocation could bind 16,384.~~ Fixed in #9 (2026-10-02, deployed): 16 at once, then 508. |
 
 ## Correctness
 
