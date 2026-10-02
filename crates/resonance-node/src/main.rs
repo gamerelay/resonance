@@ -115,9 +115,18 @@ fn join(s: Settings, token: &str) {
     if let Some(k) = s.control_key.as_deref().and_then(control::control_key) {
         client.pin(k);
     }
-    let joined = client
-        .join(token, urls.clone())
-        .unwrap_or_else(|e| fail(&format!("join: {e}")));
+    let joined = client.join(token, urls.clone()).unwrap_or_else(|e| {
+        // An answer that didn't check out came after the control plane took the token.
+        let spent = matches!(&e, control::Error::Transport(m) if m.contains("didn't sign"));
+        fail(&format!(
+            "join: {e}{}",
+            if spent {
+                " (the control plane may have taken the token: mint another to join again)"
+            } else {
+                ""
+            }
+        ))
+    });
     let j = Joined {
         node_id: joined.node_id,
         region: joined.region,
