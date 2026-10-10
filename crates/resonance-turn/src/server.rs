@@ -279,16 +279,22 @@ pub struct Server {
     accepting: bool,
 }
 
-/// Why a request was refused, and whether the answer can carry MESSAGE-INTEGRITY.
+/// Why a request was refused, whether the answer can carry MESSAGE-INTEGRITY, and whether the
+/// request proved its credentials (an answer to one isn't budgeted).
 struct Refusal {
     code: u16,
     key: Option<[u8; 16]>,
+    proved: bool,
 }
 
 impl Refusal {
     /// To a client that hasn't proved its credentials.
     fn unsigned(code: u16) -> Self {
-        Refusal { code, key: None }
+        Refusal {
+            code,
+            key: None,
+            proved: false,
+        }
     }
 
     /// Signed with the key it proved.
@@ -296,6 +302,7 @@ impl Refusal {
         Refusal {
             code,
             key: Some(key),
+            proved: true,
         }
     }
 }
@@ -508,7 +515,7 @@ impl Server {
 
     fn refuse(&mut self, now: Instant, from: Client, msg: &Message, r: Refusal, out: &mut Output) {
         // A signed refusal went to a client that proved its credentials.
-        if r.key.is_none() && !self.budget(from, now) {
+        if !r.proved && !self.budget(from, now) {
             return;
         }
         let start = out.start();
@@ -574,7 +581,18 @@ impl Server {
         // Stale, from before a restart, or another client's: 438 with a fresh one, which every
         // browser retries (a 401 on a Refresh would end the allocation in Chrome).
         if self.nonces.check(nonce, self.unix(now), from.addr) != NonceCheck::Ok {
-            return Err(Refusal::unsigned(438));
+            // Unsigned, but not budgeted when the request checks out against the key this 5-tuple
+            // allocated with: only its client (or a replay of its own request) can send that, and
+            // the answer goes back to it. Spoofed requests from its address can spend its budget,
+            // and its own Refresh must still get through when its nonce goes stale.
+            let proved = self
+                .live_alloc(from, now)
+                .map(|i| self.alloc(i))
+                .is_some_and(|a| a.username == username && msg.integrity_ok(&a.key));
+            return Err(Refusal {
+                proved,
+                ..Refusal::unsigned(438)
+            });
         }
         // A ticket (`t1:`) from an issuer this node trusts. One it no longer trusts ends at its
         // allocations' next request, cached or not.

@@ -584,10 +584,15 @@ impl Relay {
         {
             return;
         }
-        // Refused here, before rustls has seen a byte: the handshake is what costs.
+        // Refused here, before rustls has seen a byte: the handshake is what costs. The node's
+        // budget first, so a stream it refuses doesn't spend its IP's; one its IP's rate refuses
+        // gives the node's back.
         let rate = self.limits.tls_handshake_rate;
-        if !self.new_streams.allow(ip, now) || (tls && !self.handshakes.spend(1.0, now, rate, rate))
-        {
+        let handshake = tls && self.handshakes.spend(1.0, now, rate, rate);
+        if (tls && !handshake) || !self.new_streams.allow(ip, now) {
+            if handshake {
+                self.handshakes.refund(1.0, rate);
+            }
             if self.limits.debug_streams {
                 eprintln!("stream from {addr}: refused, over the rate of new streams");
             }

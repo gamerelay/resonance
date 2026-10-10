@@ -270,7 +270,7 @@ impl Client {
     /// One line to a Discord (`content`) or Slack (`text`) incoming webhook; each ignores the
     /// other. Best effort: a webhook that's down loses the alert.
     pub fn post_alert(&self, webhook: &str, text: &str) {
-        let body = serde_json::json!({ "content": text, "text": text }).to_string();
+        let body = alert_body(text);
         let sent = self
             .agent
             .post(webhook)
@@ -280,6 +280,13 @@ impl Client {
             eprintln!("alert webhook: {e}");
         }
     }
+}
+
+/// What `post_alert` sends: the line for Discord and for Slack. Discord is told to ping nobody,
+/// whatever the line names.
+fn alert_body(text: &str) -> String {
+    serde_json::json!({ "content": text, "text": text, "allowed_mentions": { "parse": [] } })
+        .to_string()
 }
 
 pub fn software() -> String {
@@ -622,6 +629,14 @@ mod tests {
             peers: Vec::new(),
             issuers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn an_alert_pings_nobody() {
+        let body: serde_json::Value = serde_json::from_str(&alert_body("@everyone down")).unwrap();
+        assert_eq!(body["content"], "@everyone down");
+        assert_eq!(body["text"], "@everyone down");
+        assert_eq!(body["allowed_mentions"], serde_json::json!({ "parse": [] }));
     }
 
     #[test]

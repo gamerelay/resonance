@@ -576,3 +576,23 @@ fn tls_handshakes_are_budgeted_for_the_whole_node() {
     let mut later = TcpStream::connect(tls).unwrap();
     assert!(!hung_up(&mut later, Duration::from_millis(500)));
 }
+
+#[test]
+fn a_tls_stream_past_the_nodes_budget_doesnt_spend_its_ips_rate() {
+    let node = start_tls(|l| {
+        l.tls_handshake_rate = 1.0;
+        l.stream_rate = 0.1;
+        l.stream_burst = 3.0;
+    });
+    let tls = node.tls.unwrap();
+    let _first = TcpStream::connect(tls).unwrap();
+    for _ in 0..2 {
+        let mut over = TcpStream::connect(tls).unwrap();
+        assert!(hung_up(&mut over, Duration::from_secs(1)));
+    }
+    // Its IP still has two new streams left.
+    for _ in 0..2 {
+        let mut s = TcpStream::connect(node.tcp).unwrap();
+        bind(&mut s);
+    }
+}
