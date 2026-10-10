@@ -31,6 +31,8 @@ framed as RFC 8656 §12.5 describes:
   the plain port, any other junk.
 
 A stream that hasn't sent a whole message in 10 s is closed, and so is one silent for 15 minutes.
+One that holds no allocation is closed 30 s after it opened (or after its allocation ended),
+whatever it sends: clients open a TURN stream to allocate.
 Each stream is its own client, even at an `ip:port` a UDP client also uses. Its allocation ends
 when it closes.
 
@@ -146,11 +148,15 @@ Most are settings; the allocation and rate defaults are the Go relay's.
 | Allocations per issuer | 8,192 (half the relay ports) | `TURN_MAX_PER_ISSUER` |
 | Relay rate per allocation | 128 KB/s, 256 KB burst | `TURN_RATE_BYTES`, `TURN_BURST_BYTES` |
 | Unsigned answers per IP | 20/s, burst = the per-IP cap | `TURN_UNAUTH_RATE`, `TURN_UNAUTH_BURST` |
+| Unsigned answers to a client holding an allocation | 5/s, burst 8, per allocation (answers to signed requests aren't counted) | |
 | Ticket checks | as unsigned answers, per IP; and 5,000/s from everyone | `TURN_TICKET_CHECK_RATE` |
 | Other nodes measured | 64, and only addresses a node could have | |
 | Channels per allocation | 16, then 508 | |
 | Open streams (TCP + TLS) | 1,024 | `TURN_MAX_STREAMS` |
 | Open streams per client IP | 64 | `TURN_MAX_STREAMS_PER_IP` |
+| New streams per client IP | 5/s, burst 16; past it, closed at once | `TURN_STREAM_RATE`, `TURN_STREAM_BURST` |
+| TLS handshakes started | 500/s from everyone; past it, a new TLS stream is closed at once | `TURN_TLS_HANDSHAKE_RATE` |
+| A stream without an allocation | closed 30 s after it opened, or after its allocation ended | |
 | A stream's outgoing queue | 64 KB, then whole messages are dropped | |
 | Memory clients make the node hold: allocations, checked tickets kept, streams' queues and half-read messages | 96 MB in all, 16 MB per client IP (what one IP's caps allow): a charge past either is refused (an Allocate gets 508). Past three quarters, the streams holding the most are closed | `TURN_MEMORY_BYTES`, `TURN_MEMORY_PER_IP_BYTES` |
 

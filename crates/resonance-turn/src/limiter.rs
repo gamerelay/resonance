@@ -1,4 +1,5 @@
-//! Token buckets: bytes per allocation, and unauthenticated requests per client IP.
+//! Token buckets: bytes per allocation, and unauthenticated requests per client IP (and, in the
+//! node, new streams per client IP).
 
 use std::collections::HashMap;
 use std::net::IpAddr;

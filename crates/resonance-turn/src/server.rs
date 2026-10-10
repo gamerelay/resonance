@@ -43,6 +43,11 @@ pub struct Config {
     pub unauth_rate: f64,
     pub unauth_burst: f64,
     pub unauth_tracked: usize,
+    /// Unsigned answers to a 5-tuple holding an allocation, per allocation: its source can be
+    /// spoofed like any other's. Enough for a client's own (a Binding now and then, a 438 on a
+    /// Refresh and its retransmissions); answers to requests that proved credentials don't count.
+    pub alloc_unauth_rate: f64,
+    pub alloc_unauth_burst: f64,
     pub default_lifetime_s: u32,
     pub max_lifetime_s: u32,
     pub permission_lifetime: Duration,
@@ -88,6 +93,8 @@ impl Config {
             unauth_rate: 20.0,
             unauth_burst: max_per_ip as f64,
             unauth_tracked: 65536,
+            alloc_unauth_rate: 5.0,
+            alloc_unauth_burst: 8.0,
             default_lifetime_s: 600,
             max_lifetime_s: 3600,
             permission_lifetime: Duration::from_secs(300),
@@ -192,6 +199,8 @@ struct Allocation {
     /// Made with room for `max_channels`, so it never grows.
     channels: Vec<Channel>,
     bucket: Bucket,
+    /// Its unsigned answers (`alloc_unauth_rate`).
+    unsigned: Bucket,
     /// What it's charged in the budget, to its client's IP (`footprint`).
     charged: usize,
     /// Its Allocate's transaction, so a retransmission gets the same answer, not a 437.
@@ -331,7 +340,7 @@ impl Server {
 
     pub fn stats(&self) -> Stats {
         Stats {
-            unauthenticated_dropped: self.limiter.dropped,
+            unauthenticated_dropped: self.stats.unauthenticated_dropped + self.limiter.dropped,
             ..self.stats.clone()
         }
     }
@@ -349,6 +358,14 @@ impl Server {
 
     pub fn allocations(&self) -> usize {
         self.by_client.len()
+    }
+
+    /// Whether this client (a 5-tuple: its address and connection) holds an allocation that
+    /// hasn't run out. The node keeps a stream open for long only while it does.
+    pub fn holds_allocation(&self, client: Client, now: Instant) -> bool {
+        self.by_client
+            .get(&canonical(client))
+            .is_some_and(|&i| self.alloc(i).expires > now)
     }
 
     /// What clients make the node hold. The node charges its streams to it too.
@@ -467,16 +484,26 @@ impl Server {
         }
     }
 
-    /// May an unknown source get an unsigned answer? Every such answer (a Binding response, a
-    /// 401, a 438, a 400) goes to whatever source the request claims, a few times its size, so a
+    /// May this source get an unsigned answer? Every such answer (a Binding response, a 401, a
+    /// 438, a 400) goes to whatever source the request claims, a few times its size, so a
     /// spoofed source could aim this relay at someone: 20 a second per IP (burst 64, a shared
-    /// address filling its allocation cap at once). A client with an allocation is known.
-    /// A stream's source can't be spoofed (its handshake answered it), so it can't aim anything
-    /// at anyone: it isn't budgeted, and doesn't spend a UDP client's budget at its IP.
+    /// address filling its allocation cap at once). A 5-tuple holding an allocation can be
+    /// spoofed too, so it has a smaller budget of its own (`alloc_unauth_rate`) instead of its
+    /// IP's. A stream's source can't be spoofed (its handshake answered it), so it can't aim
+    /// anything at anyone: it isn't budgeted, and doesn't spend a UDP client's budget at its IP.
     fn budget(&mut self, from: Client, now: Instant) -> bool {
-        from.conn != Client::UDP
-            || self.live_alloc(from, now).is_some()
-            || self.limiter.allow(from.addr.ip(), now)
+        if from.conn != Client::UDP {
+            return true;
+        }
+        let Some(i) = self.live_alloc(from, now) else {
+            return self.limiter.allow(from.addr.ip(), now);
+        };
+        let (rate, burst) = (self.cfg.alloc_unauth_rate, self.cfg.alloc_unauth_burst);
+        let ok = self.alloc_mut(i).unsigned.spend(1.0, now, rate, burst);
+        if !ok {
+            self.stats.unauthenticated_dropped += 1;
+        }
+        ok
     }
 
     fn refuse(&mut self, now: Instant, from: Client, msg: &Message, r: Refusal, out: &mut Output) {
@@ -689,6 +716,7 @@ impl Server {
             permission_expires: None,
             channels: Vec::with_capacity(self.cfg.max_channels),
             bucket: Bucket::full(self.cfg.burst_bytes, now),
+            unsigned: Bucket::full(self.cfg.alloc_unauth_burst, now),
             charged,
             allocate_tx: msg.tx,
         };

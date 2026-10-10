@@ -787,7 +787,8 @@ fn unauthenticated_requests_are_capped_per_ip() {
             .count(),
         64
     );
-    // Never slowed: authenticated requests, and a 5-tuple with an allocation.
+    // Never slowed: authenticated requests. A 5-tuple with an allocation has its own budget for
+    // unsigned answers (the next test), not its IP's.
     let mut c = Client::new("192.0.2.50:1");
     c.allocate(&mut s, t, &user("g1", "p_a")); // its nonce request used one token
     for _ in 0..100 {
@@ -807,9 +808,9 @@ fn unauthenticated_requests_are_capped_per_ip() {
         (0..100)
             .filter(|_| !c.send(&mut s, t, &binding(1)).is_empty())
             .count(),
-        100
+        8
     );
-    assert_eq!(s.stats().unauthenticated_dropped, 136 + 1 + 180 + 36);
+    assert_eq!(s.stats().unauthenticated_dropped, 136 + 1 + 180 + 36 + 92);
 }
 
 #[test]
@@ -945,4 +946,85 @@ fn a_closed_stream_ends_its_allocation() {
     let mut again = Client::on("198.51.100.1:5001", 4);
     again.allocate(&mut s, t, &user("g1", "p_a"));
     assert_eq!(s.allocations(), 1);
+}
+
+#[test]
+fn unsigned_answers_to_a_client_with_an_allocation_are_capped_too() {
+    // A source holding an allocation can be spoofed like any other, so its unsigned answers (a
+    // Binding response, a 401 or 438) have a small budget of their own: 8, then 5 a second.
+    let t = Instant::now();
+    let mut s = server(t);
+    let mut c = Client::new("198.51.100.1:5000");
+    // Good for two hours, so it outlives the first nonce below.
+    let name = ticket(UNIX + 7200, "ins", "g1", "p_a");
+    c.allocate(&mut s, t, &name);
+    let answered = (0..100)
+        .filter(|_| !c.send(&mut s, t, &binding(1)).is_empty())
+        .count();
+    assert_eq!(answered, 8, "the burst");
+    let mut unsigned_refresh = Vec::new();
+    Writer::new(
+        &mut unsigned_refresh,
+        method::REFRESH,
+        Class::Request,
+        [3; 12],
+    );
+    assert!(
+        c.send(&mut s, t, &unsigned_refresh).is_empty(),
+        "a 401 is counted the same"
+    );
+    let later = t + Duration::from_secs(1);
+    let answered = (0..100)
+        .filter(|_| !c.send(&mut s, later, &binding(1)).is_empty())
+        .count();
+    assert_eq!(answered, 5, "a second's worth");
+    // Its own budget, not its IP's: another client there is answered as before.
+    let other = Client::new("198.51.100.1:5001");
+    assert!(!other.send(&mut s, later, &binding(1)).is_empty());
+    // Signed answers aren't counted: a client that proved its credentials gets every one.
+    for _ in 0..50 {
+        assert_eq!(
+            c.request(&mut s, later, method::REFRESH, &name, &[lifetime(3600)])
+                .code(),
+            0
+        );
+    }
+    // A stale nonce's 438 on a Refresh, and the retry, once the budget has had a moment.
+    let stale = t + Duration::from_secs(3601);
+    assert_eq!(
+        c.request(&mut s, stale, method::REFRESH, &name, &[lifetime(600)])
+            .code(),
+        0
+    );
+    assert_eq!(s.stats().unauthenticated_dropped, 92 + 1 + 95);
+}
+
+#[test]
+fn a_client_holds_an_allocation_until_it_ends() {
+    // What the node asks before it keeps a stream open past its first half minute.
+    let t = Instant::now();
+    let mut s = server(t);
+    let mut a = Client::on("198.51.100.1:5000", 3);
+    let name = user("g1", "p_a");
+    assert!(!s.holds_allocation(a.core(), t));
+    a.allocate(&mut s, t, &name);
+    assert!(s.holds_allocation(a.core(), t));
+    let mapped = resonance_turn::Client {
+        addr: addr("[::ffff:198.51.100.1]:5000"),
+        conn: 3,
+    };
+    assert!(s.holds_allocation(mapped, t), "its IPv4-mapped form");
+    assert!(
+        !s.holds_allocation(resonance_turn::Client::udp(a.from), t),
+        "another 5-tuple at the same address"
+    );
+    // Past its lifetime and grace, even before a tick removes it.
+    assert!(!s.holds_allocation(a.core(), t + Duration::from_secs(661)));
+    // Or deleted.
+    assert_eq!(
+        a.request(&mut s, t, method::REFRESH, &name, &[lifetime(0)])
+            .code(),
+        0
+    );
+    assert!(!s.holds_allocation(a.core(), t));
 }
