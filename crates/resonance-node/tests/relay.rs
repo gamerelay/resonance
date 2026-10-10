@@ -7,15 +7,21 @@ use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ed25519_dalek::SigningKey;
 use resonance_node::control::{Control, Snapshot};
 use resonance_node::relay::{self, Limits, Listeners, Network};
+use resonance_node::tls::Certificate;
+use resonance_turn::stun::{Class, Message, Writer, attr, method};
+use resonance_turn::ticket::{self, Issuer};
 use resonance_turn::{Config, Server};
 
 struct Node {
     udp: SocketAddr,
     tcp: SocketAddr,
+    /// With `start_tls`.
+    tls: Option<SocketAddr>,
     thread: JoinHandle<()>,
 }
 
@@ -30,10 +36,39 @@ fn start_with(
     f: impl FnOnce(&mut Limits),
     g: impl FnOnce(&mut Config),
 ) -> Node {
+    start_on(network, f, g, None)
+}
+
+/// A node with TLS too, on a certificate for "turn.test".
+fn start_tls(f: impl FnOnce(&mut Limits)) -> Node {
+    let dir = std::env::temp_dir().join(format!(
+        "resonance-relay-test-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (cert, key) = (dir.join("fullchain.pem"), dir.join("privkey.pem"));
+    std::fs::write(&cert, TEST_CERT).unwrap();
+    std::fs::write(&key, TEST_KEY).unwrap();
+    let cert = Certificate::open(cert, key).unwrap();
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    start_on(None, f, |_| {}, Some((l, cert)))
+}
+
+fn start_on(
+    network: Option<Network>,
+    f: impl FnOnce(&mut Limits),
+    g: impl FnOnce(&mut Config),
+    tls: Option<(TcpListener, Arc<Certificate>)>,
+) -> Node {
     let ip = IpAddr::from([127, 0, 0, 1]);
     let udp = UdpSocket::bind((ip, 0)).unwrap();
     let tcp = TcpListener::bind((ip, 0)).unwrap();
     let (udp_addr, tcp_addr) = (udp.local_addr().unwrap(), tcp.local_addr().unwrap());
+    let tls_addr = tls.as_ref().map(|(l, _)| l.local_addr().unwrap());
     let mut limits = Limits::default();
     f(&mut limits);
     let mut cfg = Config::new(ip, [7; 32]);
@@ -42,7 +77,7 @@ fn start_with(
     let listeners = Listeners {
         udp,
         tcp: Some(tcp),
-        tls: None,
+        tls,
     };
     let thread = std::thread::spawn(move || {
         relay::run(listeners, server, network, limits).unwrap();
@@ -50,8 +85,120 @@ fn start_with(
     Node {
         udp: udp_addr,
         tcp: tcp_addr,
+        tls: tls_addr,
         thread,
     }
+}
+
+/// A self-signed P-256 certificate for "turn.test" (to 2126), and its key: the loop only needs
+/// one to take TLS connections.
+const TEST_CERT: &str = "-----BEGIN CERTIFICATE-----
+MIIBlDCCATugAwIBAgIUTn0nfBi504jdZPj37k2J93uAJdUwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJdHVybi50ZXN0MCAXDTI2MTAxMDE2NDk1OVoYDzIxMjYwOTE2
+MTY0OTU5WjAUMRIwEAYDVQQDDAl0dXJuLnRlc3QwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAAQhiTs6E9hseZrURmxLHHEdbqceXkXfXxqi42U28+FDFEYiz4WsNYlK
+AkmAEct/Md43oPt9pnQ3CUxZB8BkL2PNo2kwZzAdBgNVHQ4EFgQUUzm7L05BEFvG
+/n963LSYN+L4dMYwHwYDVR0jBBgwFoAUUzm7L05BEFvG/n963LSYN+L4dMYwDwYD
+VR0TAQH/BAUwAwEB/zAUBgNVHREEDTALggl0dXJuLnRlc3QwCgYIKoZIzj0EAwID
+RwAwRAIgcqG+FhZ7Yb8wsCFwAPi8qUgyFgJdvUnhrkxmY9LdFGECIGysmcZd1X9M
+brwpwufKUubR0o2e5xPCTbIPNKMIlMYH
+-----END CERTIFICATE-----
+";
+const TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgBVTRk2LnnXCN0T27
+LpeRqdwcg47L3TPY+B7dHox3ky2hRANCAAQhiTs6E9hseZrURmxLHHEdbqceXkXf
+Xxqi42U28+FDFEYiz4WsNYlKAkmAEct/Md43oPt9pnQ3CUxZB8BkL2PN
+-----END PRIVATE KEY-----
+";
+
+/// The node's ed25519 seed, which its sealing key comes from, and the issuer it trusts.
+const SEED: [u8; 32] = [7; 32];
+
+fn issuer() -> SigningKey {
+    SigningKey::from_bytes(&[1; 32])
+}
+
+/// The core takes `issuer()`'s tickets.
+fn tickets(c: &mut Config) {
+    c.seal = Some(ticket::seal_secret(&SEED));
+    c.issuers = vec![Issuer::new(&issuer().verifying_key().to_bytes()).unwrap()];
+}
+
+/// A player over one stream: its ticket's username and key, and the nonce it was given.
+struct Player {
+    username: String,
+    key: [u8; 16],
+    nonce: String,
+    tx: u8,
+}
+
+impl Player {
+    /// Asks for a nonce (an unsigned Allocate gets a 401 with one).
+    fn new(s: &mut TcpStream, player: &str) -> Self {
+        let unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let username = ticket::mint(&issuer(), [9; 32], unix + 3600, "ins", "g1", player).username;
+        let password = ticket::parse(&username)
+            .and_then(|t| t.password(&ticket::seal_secret(&SEED)))
+            .unwrap();
+        let key = resonance_turn::auth::long_term_key(&username, "gamerelay", &password);
+        let mut first = Vec::new();
+        Writer::new(&mut first, method::ALLOCATE, Class::Request, [1; 12]);
+        let r = ask(s, &first);
+        let nonce = Message::parse(&r)
+            .and_then(|m| m.str_attr(attr::NONCE).map(str::to_owned))
+            .expect("a 401 with a nonce");
+        Player {
+            username,
+            key,
+            nonce,
+            tx: 1,
+        }
+    }
+
+    /// A signed request; its error code, 0 for success.
+    fn request(&mut self, s: &mut TcpStream, m: u16, attrs: &[(u16, [u8; 4])]) -> u16 {
+        self.tx += 1;
+        let mut buf = Vec::new();
+        let mut w = Writer::new(&mut buf, m, Class::Request, [self.tx; 12]);
+        for (k, v) in attrs {
+            w.attr(*k, v);
+        }
+        w.attr(attr::USERNAME, self.username.as_bytes())
+            .attr(attr::REALM, b"gamerelay")
+            .attr(attr::NONCE, self.nonce.as_bytes())
+            .integrity(&self.key)
+            .fingerprint();
+        let r = ask(s, &buf);
+        let m = Message::parse(&r).expect("a STUN answer");
+        match m.class {
+            Class::Success => 0,
+            _ => m
+                .get(attr::ERROR_CODE)
+                .map_or(1, |v| v[2] as u16 * 100 + v[3] as u16),
+        }
+    }
+
+    fn allocate(&mut self, s: &mut TcpStream) -> u16 {
+        self.request(
+            s,
+            method::ALLOCATE,
+            &[(attr::REQUESTED_TRANSPORT, [17, 0, 0, 0])],
+        )
+    }
+}
+
+/// A message over the stream, and the answer.
+fn ask(s: &mut TcpStream, m: &[u8]) -> Vec<u8> {
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(m).unwrap();
+    let mut msg = vec![0u8; 20];
+    s.read_exact(&mut msg).unwrap();
+    msg.resize(20 + u16::from_be_bytes([msg[2], msg[3]]) as usize, 0);
+    s.read_exact(&mut msg[20..]).unwrap();
+    msg
 }
 
 const BINDING: [u8; 20] = [
@@ -322,5 +469,130 @@ fn a_node_measures_the_peers_its_told_about_from_its_relay_socket() {
         }
         assert!(Instant::now() < deadline, "no measurements: {peers:?}");
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Whether the node hangs up on `s` within `wait` while it sends a Binding every 100 ms, so it's
+/// never idle.
+fn hung_up_while_chatting(s: &mut TcpStream, wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    let mut buf = [0u8; 1500];
+    while Instant::now() < deadline {
+        if s.write_all(&BINDING).is_err()
+            || s.set_read_timeout(Some(Duration::from_millis(100)))
+                .is_err()
+        {
+            return true;
+        }
+        match s.read(&mut buf) {
+            Ok(0) => return true,
+            Err(e) if e.kind() == ErrorKind::ConnectionReset => return true,
+            _ => {}
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+#[test]
+fn a_stream_without_an_allocation_is_closed_soon_however_much_it_says() {
+    // Browsers open TURN over TCP or TLS only to allocate, so a stream holding none is closed
+    // after `unallocated`, not the idle limit; one holding one stays, until it's gone.
+    let node = start_with(
+        None,
+        |l| l.unallocated = Duration::from_millis(500),
+        tickets,
+    );
+    let mut player = TcpStream::connect(node.tcp).unwrap();
+    let mut p = Player::new(&mut player, "p_a");
+    assert_eq!(p.allocate(&mut player), 0);
+    let mut talker = TcpStream::connect(node.tcp).unwrap();
+    let started = Instant::now();
+    assert!(hung_up_while_chatting(&mut talker, Duration::from_secs(4)));
+    assert!(started.elapsed() >= Duration::from_millis(500));
+    // Kept past it while its allocation lasts.
+    assert!(!hung_up_while_chatting(
+        &mut player,
+        Duration::from_millis(1500)
+    ));
+    // Once its allocation ends, it's closed the same way.
+    assert_eq!(
+        p.request(&mut player, method::REFRESH, &[(attr::LIFETIME, [0; 4])]),
+        0
+    );
+    assert!(hung_up_while_chatting(&mut player, Duration::from_secs(4)));
+}
+
+#[test]
+fn new_streams_from_one_ip_are_rate_limited() {
+    let node = start(None, |l| {
+        l.stream_rate = 1.0;
+        l.stream_burst = 3.0;
+    });
+    let mut open: Vec<TcpStream> = (0..3)
+        .map(|_| {
+            let mut s = TcpStream::connect(node.tcp).unwrap();
+            bind(&mut s);
+            s
+        })
+        .collect();
+    let mut over = TcpStream::connect(node.tcp).unwrap();
+    assert!(
+        hung_up(&mut over, Duration::from_secs(1)),
+        "past the burst: closed at once"
+    );
+    // A second on, one more.
+    std::thread::sleep(Duration::from_millis(1100));
+    let mut s = TcpStream::connect(node.tcp).unwrap();
+    bind(&mut s);
+    // Those already open carry on.
+    for s in &mut open {
+        bind(s);
+    }
+}
+
+#[test]
+fn tls_handshakes_are_budgeted_for_the_whole_node() {
+    // Each is a key exchange and a signature on the loop's thread: the node starts at most
+    // `tls_handshake_rate` a second, from everyone together.
+    let node = start_tls(|l| l.tls_handshake_rate = 2.0);
+    let tls = node.tls.unwrap();
+    let mut first: Vec<TcpStream> = (0..2).map(|_| TcpStream::connect(tls).unwrap()).collect();
+    let mut over = TcpStream::connect(tls).unwrap();
+    assert!(
+        hung_up(&mut over, Duration::from_secs(1)),
+        "past the budget: closed at once"
+    );
+    for s in &mut first {
+        assert!(
+            !hung_up(s, Duration::from_millis(200)),
+            "kept, waiting for its hello"
+        );
+    }
+    // TCP isn't a handshake: it's taken meanwhile.
+    let mut tcp = TcpStream::connect(node.tcp).unwrap();
+    bind(&mut tcp);
+    std::thread::sleep(Duration::from_millis(1100));
+    let mut later = TcpStream::connect(tls).unwrap();
+    assert!(!hung_up(&mut later, Duration::from_millis(500)));
+}
+
+#[test]
+fn a_tls_stream_past_the_nodes_budget_doesnt_spend_its_ips_rate() {
+    let node = start_tls(|l| {
+        l.tls_handshake_rate = 1.0;
+        l.stream_rate = 0.1;
+        l.stream_burst = 3.0;
+    });
+    let tls = node.tls.unwrap();
+    let _first = TcpStream::connect(tls).unwrap();
+    for _ in 0..2 {
+        let mut over = TcpStream::connect(tls).unwrap();
+        assert!(hung_up(&mut over, Duration::from_secs(1)));
+    }
+    // Its IP still has two new streams left.
+    for _ in 0..2 {
+        let mut s = TcpStream::connect(node.tcp).unwrap();
+        bind(&mut s);
     }
 }

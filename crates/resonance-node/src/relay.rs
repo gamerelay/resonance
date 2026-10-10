@@ -18,6 +18,7 @@ use mio::net::{TcpListener, TcpStream, UdpSocket};
 use mio::{Events, Interest, Poll, Registry, Token};
 use resonance_turn::budget::Budget;
 use resonance_turn::counts::Counts;
+use resonance_turn::limiter::{Bucket, Reflection};
 use resonance_turn::stream::{Frame, Framer, padding};
 use resonance_turn::ticket::Issuer;
 use resonance_turn::{Client, Output, Server};
@@ -43,6 +44,8 @@ const STREAM_SNDBUF: usize = 64 * 1024;
 /// rest waits for the next turn, so one busy client can't hold up everyone else.
 const STREAM_BUDGET: usize = 256 * 1024;
 const UDP_BUDGET: usize = 1024;
+/// IPs whose new streams are counted at once (`Relay::new_streams`).
+const STREAM_IPS_TRACKED: usize = 65536;
 
 /// The sockets, bound and ready.
 pub struct Listeners {
@@ -63,8 +66,20 @@ pub struct Limits {
     pub max_streams: usize,
     /// Open streams from one IP.
     pub max_streams_per_ip: usize,
+    /// New streams a second from one IP (TCP and TLS together), and how many at once: enough for
+    /// a player's few at a time and its reconnects. Past it, a new one is closed at accept.
+    pub stream_rate: f64,
+    pub stream_burst: f64,
+    /// TLS handshakes started a second, from everyone together. Each is a key exchange and the
+    /// certificate's signature, done on this thread: about 340 µs with an RSA certificate (which
+    /// WebKit needs), so 500 a second is about a sixth of the loop's time, at most, and the rest
+    /// stays for relaying. Past it, a new TLS stream is closed at accept.
+    pub tls_handshake_rate: f64,
     /// A stream that hasn't sent a whole message by then (its TLS handshake included) is closed.
     pub first_message: Duration,
+    /// A stream holding no allocation is closed this long after it opened, or after its
+    /// allocation ended, whatever it sends: browsers open TURN over TCP or TLS only to allocate.
+    pub unallocated: Duration,
     /// Silence after which a stream is closed: longer than any client leaves between refreshes.
     pub idle: Duration,
     /// Log each stream's opening and why it closed (TURN_DEBUG_STREAMS=1).
@@ -76,7 +91,11 @@ impl Default for Limits {
         Limits {
             max_streams: 1024,
             max_streams_per_ip: 64,
+            stream_rate: 5.0,
+            stream_burst: 16.0,
+            tls_handshake_rate: 500.0,
             first_message: Duration::from_secs(10),
+            unallocated: Duration::from_secs(30),
             idle: Duration::from_secs(15 * 60),
             debug_streams: false,
         }
@@ -148,6 +167,8 @@ struct Stream {
     /// What it's charged in the memory budget: its queue's room, and its framer's.
     charged: usize,
     opened: Instant,
+    /// When it was last seen holding an allocation (when it opened, until it holds one).
+    allocated: Instant,
     heard: Instant,
     spoke: bool,
     /// Registered for WRITABLE as well.
@@ -300,6 +321,8 @@ enum Why {
     Hangup,
     /// No whole message by `first_message`.
     Silent,
+    /// No allocation for `unallocated`.
+    Unallocated,
     Idle,
     /// Among the streams holding the most when the memory budget was nearly full.
     Hoarding,
@@ -314,6 +337,7 @@ impl fmt::Display for Why {
             Why::Junk => write!(f, "not TURN"),
             Why::Hangup => write!(f, "closed by the client"),
             Why::Silent => write!(f, "no message in time"),
+            Why::Unallocated => write!(f, "no allocation in time"),
             Why::Idle => write!(f, "idle"),
             Why::Hoarding => write!(f, "held too much (sent and didn't read)"),
             Why::OverBudget => write!(f, "past the memory budget"),
@@ -362,6 +386,11 @@ pub struct Relay {
     tcp: Option<TcpListener>,
     tls: Option<(TcpListener, Arc<Certificate>, Arc<ServerConfig>)>,
     per_ip: Counts<IpAddr>,
+    /// New streams per IP (`stream_rate`): opening one costs the loop a TLS handshake, or the
+    /// start of one, so one IP can't open and drop them as fast as it likes.
+    new_streams: Reflection,
+    /// TLS handshakes started, from everyone (`tls_handshake_rate`).
+    handshakes: Bucket,
     next_conn: u32,
     limits: Limits,
     network: Option<Network>,
@@ -431,6 +460,12 @@ impl Relay {
             tcp,
             tls,
             per_ip: Counts::default(),
+            new_streams: Reflection::new(
+                limits.stream_rate,
+                limits.stream_burst,
+                STREAM_IPS_TRACKED,
+            ),
+            handshakes: Bucket::full(limits.tls_handshake_rate, now),
             next_conn: 1,
             limits,
             network,
@@ -541,12 +576,26 @@ impl Relay {
         }
     }
 
-    /// A new connection, unless it's over the caps (dropped: that closes it).
+    /// A new connection, unless it's over the caps or the rates (dropped: that closes it).
     fn open(&mut self, socket: TcpStream, addr: SocketAddr, tls: bool, now: Instant) {
         let ip = addr.ip().to_canonical();
         if self.links.streams.len() >= self.limits.max_streams
             || self.per_ip.get(&ip) as usize >= self.limits.max_streams_per_ip
         {
+            return;
+        }
+        // Refused here, before rustls has seen a byte: the handshake is what costs. The node's
+        // budget first, so a stream it refuses doesn't spend its IP's; one its IP's rate refuses
+        // gives the node's back.
+        let rate = self.limits.tls_handshake_rate;
+        let handshake = tls && self.handshakes.spend(1.0, now, rate, rate);
+        if (tls && !handshake) || !self.new_streams.allow(ip, now) {
+            if handshake {
+                self.handshakes.refund(1.0, rate);
+            }
+            if self.limits.debug_streams {
+                eprintln!("stream from {addr}: refused, over the rate of new streams");
+            }
             return;
         }
         let tls_conn = match &self.tls {
@@ -570,6 +619,7 @@ impl Relay {
             queue: Outbox::new(),
             charged: 0,
             opened: now,
+            allocated: now,
             heard: now,
             spoke: false,
             waiting: false,
@@ -707,14 +757,24 @@ impl Relay {
     /// once revoked.
     fn every_second(&mut self, now: Instant) -> bool {
         self.server.tick(now);
-        let (first, idle) = (self.limits.first_message, self.limits.idle);
+        let (first, unallocated, idle) = (
+            self.limits.first_message,
+            self.limits.unallocated,
+            self.limits.idle,
+        );
+        let server = &self.server;
         let stale: Vec<(u32, Why)> = self
             .links
             .streams
-            .iter()
+            .iter_mut()
             .filter_map(|(&c, s)| {
+                if server.holds_allocation(s.client, now) {
+                    s.allocated = now;
+                }
                 if !s.spoke && now - s.opened > first {
                     Some((c, Why::Silent))
+                } else if now - s.allocated > unallocated {
+                    Some((c, Why::Unallocated))
                 } else if now - s.heard > idle {
                     Some((c, Why::Idle))
                 } else {

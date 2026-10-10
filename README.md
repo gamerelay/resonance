@@ -82,11 +82,13 @@ flowchart LR
   password for this node only (docs/PROTOCOL.md, "Tickets"). A leaked node can compute passwords
   for tickets sent to it, but can't mint any.
 - **Limits:** 8 allocations per player, 64 per client IP, 4,096 per game, 8,192 per issuer, and
-  128 KB/s per allocation (256 KB burst). Unsigned answers to unknown clients are capped at 20 a
-  second per IP (burst: the per-IP cap), since a spoofed source could otherwise aim them at
-  someone. TCP and TLS streams are capped too (1,024; 64 per IP), and everything a client can
-  make the node hold is charged to one memory budget (96 MB, 16 MB per IP), so a node's memory
-  stays bounded whatever its clients do. The full table, with each limit's
+  128 KB/s per allocation (256 KB burst). Unsigned answers are capped, since a spoofed source
+  could otherwise aim them at someone: 20 a second per IP to unknown clients (burst: the per-IP
+  cap), and 5 a second per allocation (burst 8) to a client holding one. TCP and TLS streams are
+  capped too (1,024; 64 per IP), new ones at 5 a second per IP (burst 16), TLS handshakes at 500
+  a second in all, and a stream without an allocation is closed after 30 s. Everything a client
+  can make the node hold is charged to one memory budget (96 MB, 16 MB per IP), so a node's
+  memory stays bounded whatever its clients do. The full table, with each limit's
   setting, is in docs/PROTOCOL.md, "Limits"; the settings are read in
   `crates/resonance-node/src/settings.rs`. Every player holds an allocation per other player even
   when the LAN route wins, so a school or office behind one NAT may need a higher

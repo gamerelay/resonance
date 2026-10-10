@@ -35,6 +35,13 @@
 //!   firewalls), for TURN_TLS_HOST, the name on the certificate that players connect to.
 //! - TURN_MAX_STREAMS (1024): open TCP and TLS connections, all together; TURN_MAX_STREAMS_PER_IP
 //!   (64) per client IP. Their queues are bounded too (docs/PROTOCOL.md, "Limits").
+//! - TURN_STREAM_RATE (5/s) and TURN_STREAM_BURST (16): new TCP and TLS connections per client
+//!   IP; past them, a new one is closed at once. A school or office behind one NAT may need more.
+//! - TURN_TLS_HANDSHAKE_RATE (500/s): TLS handshakes started, from everyone together. Each costs
+//!   the relay loop about 340 µs with an RSA certificate, so this keeps them to about a sixth of
+//!   its time; past it, a new TLS connection is closed at once.
+//! - A connection holding no allocation is closed 30 s after it opened (or after its allocation
+//!   ended), whatever it sends; one holding an allocation, after 15 minutes of silence.
 //!
 //! Its URLs, sent when it joins and with every heartbeat, follow from these.
 //!
@@ -359,6 +366,11 @@ fn run_node(s: Settings) {
         cfg.ticket_check_rate,
         cfg.memory_total / (1024 * 1024),
         cfg.memory_per_ip / 1024
+    );
+    let l = &s.limits;
+    eprintln!(
+        "streams: {} open ({} per IP); new ones {}/s per IP (burst {}); TLS handshakes {}/s",
+        l.max_streams, l.max_streams_per_ip, l.stream_rate, l.stream_burst, l.tls_handshake_rate
     );
     // It returns once the control plane revokes this node.
     relay::run(

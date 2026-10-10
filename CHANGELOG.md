@@ -4,6 +4,43 @@ What changed in the node, newest first, by date, with the commits. Releases are 
 `v<version>` (the crates' version, `Cargo.toml`); an entry says where one was cut. The control plane's API is dated
 separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it changes.
 
+## 2026-10-10
+
+**Streams and unsigned answers have tighter limits.** No change on the wire or to the API.
+
+- **New streams are rate-limited per IP**: 5 a second, burst 16, TCP and TLS together
+  (`TURN_STREAM_RATE`, `TURN_STREAM_BURST`). A stream past it is closed at accept. The burst
+  covers a player opening a full room's streams at once and reconnecting; a school or office
+  behind one NAT may want more, as with `TURN_MAX_PER_IP`.
+- **TLS handshakes are budgeted for the whole node**: at most 500 started a second
+  (`TURN_TLS_HANDSHAKE_RATE`). Each is a key exchange and a signature on the relay loop's
+  thread, about 340 µs with an RSA certificate, so this keeps them to about a sixth of its time
+  and the rest for relaying. A TLS stream past it is closed at accept, before its handshake,
+  without spending its IP's rate.
+- **A stream without an allocation closes after 30 s**, whatever it sends, and one whose
+  allocation ended closes 30 s after. Clients open TURN over TCP or TLS to allocate, so this
+  doesn't touch them; the 15-minute idle limit now matters only for streams holding one.
+- **Unsigned answers to a client holding an allocation are rate-limited**: 5 a second, burst 8,
+  per allocation (a Binding response, a 401, a 438), as they are per IP for clients without
+  one. Answers to signed requests aren't counted, so a client that proves its credentials is
+  never slowed. Nor is a 438 to a request that checks out against the key its 5-tuple
+  allocated with, so a client's Refresh gets its fresh nonce whatever else arrives from its
+  address. What's dropped counts in the stats line's "unauthenticated requests dropped".
+- **Alerts to a Discord webhook ping nobody** (`allowed_mentions` empty), as the control plane's
+  do.
+- The startup log has a `streams:` line with the stream limits.
+- Tests: the core answers a client holding an allocation 8 unsigned answers, then 5 a second,
+  apart from its IP's budget, and every signed one; a stale-nonce Refresh and each of its
+  retransmissions answered with a 438 through a flood of Bindings from the client's address,
+  while one with the wrong password isn't; it says whether a client holds an allocation
+  (on its own 5-tuple, in its IPv4-mapped form, until it expires or is deleted). On loopback: new
+  streams past the per-IP burst closed at once and taken again a second on; TLS streams past the
+  node's handshake budget closed at once while TCP is still taken, without spending their IP's
+  rate; a stream sending Bindings and
+  never allocating closed after `unallocated`, one holding an allocation kept until it's
+  deleted, then closed the same way. Each fails without its change. The node's tests now
+  allocate over TCP with a ticket, and run a TLS listener.
+
 ## 2026-10-02
 
 **One memory budget** (TECH_DEBT C1). Everything a client can make the node hold is charged to

@@ -57,8 +57,10 @@ The design also holds the following:
   addresses are names, not sockets (PROTOCOL.md, "The room rule"). A compromised credential
   reaches other allocations in the same room, nothing else.
 - **A node can't read what it relays.** The node never sees plaintext.
-- **The node is safe to point at the internet.** The answers it sends to sources it doesn't know
-  are rate-limited per IP, so it can't be used to reflect traffic at a third party. Nonces are
+- **The node is safe to point at the internet.** The unsigned answers it sends are rate-limited,
+  per IP to sources it doesn't know and per allocation to those it does, so it can't be used to
+  reflect traffic at a third party. New streams are rate-limited per IP, and TLS handshakes for
+  the whole node, so connections can't crowd out relaying. Nonces are
   bound to the client's address, and every allocation limit is per player, per IP, per game and per issuer.
 - **Control requests can't be forged or replayed, nor can their answers.** Each request is
   signed, timestamped within 30 s, and remembered. Each answer is signed by the control plane's
@@ -122,8 +124,8 @@ read, handled and answered in one go.
 - **The sweep.** Once a second, past three quarters of the budget, the loop closes the streams
   holding the most until it's back under half: a client that reads what it's sent holds about a
   message, so those are clients sending and never reading, or sitting on half a message.
-- **Timers.** Once a second the loop expires allocations, permissions and stream deadlines, and
-  sends due probes. Once a minute it logs a stats line.
+- **Timers.** Once a second the loop expires allocations, permissions and stream deadlines (a
+  stream holding no allocation goes after 30 s), and sends due probes. Once a minute it logs a stats line.
 
 ### The control thread
 

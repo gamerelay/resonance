@@ -787,7 +787,8 @@ fn unauthenticated_requests_are_capped_per_ip() {
             .count(),
         64
     );
-    // Never slowed: authenticated requests, and a 5-tuple with an allocation.
+    // Never slowed: authenticated requests. A 5-tuple with an allocation has its own budget for
+    // unsigned answers (the next test), not its IP's.
     let mut c = Client::new("192.0.2.50:1");
     c.allocate(&mut s, t, &user("g1", "p_a")); // its nonce request used one token
     for _ in 0..100 {
@@ -807,9 +808,9 @@ fn unauthenticated_requests_are_capped_per_ip() {
         (0..100)
             .filter(|_| !c.send(&mut s, t, &binding(1)).is_empty())
             .count(),
-        100
+        8
     );
-    assert_eq!(s.stats().unauthenticated_dropped, 136 + 1 + 180 + 36);
+    assert_eq!(s.stats().unauthenticated_dropped, 136 + 1 + 180 + 36 + 92);
 }
 
 #[test]
@@ -945,4 +946,150 @@ fn a_closed_stream_ends_its_allocation() {
     let mut again = Client::on("198.51.100.1:5001", 4);
     again.allocate(&mut s, t, &user("g1", "p_a"));
     assert_eq!(s.allocations(), 1);
+}
+
+#[test]
+fn unsigned_answers_to_a_client_with_an_allocation_are_capped_too() {
+    // A source holding an allocation can be spoofed like any other, so its unsigned answers (a
+    // Binding response, a 401 or 438) have a small budget of their own: 8, then 5 a second.
+    let t = Instant::now();
+    let mut s = server(t);
+    let mut c = Client::new("198.51.100.1:5000");
+    // Good for two hours, so it outlives the first nonce below.
+    let name = ticket(UNIX + 7200, "ins", "g1", "p_a");
+    c.allocate(&mut s, t, &name);
+    let answered = (0..100)
+        .filter(|_| !c.send(&mut s, t, &binding(1)).is_empty())
+        .count();
+    assert_eq!(answered, 8, "the burst");
+    let mut unsigned_refresh = Vec::new();
+    Writer::new(
+        &mut unsigned_refresh,
+        method::REFRESH,
+        Class::Request,
+        [3; 12],
+    );
+    assert!(
+        c.send(&mut s, t, &unsigned_refresh).is_empty(),
+        "a 401 is counted the same"
+    );
+    let later = t + Duration::from_secs(1);
+    let answered = (0..100)
+        .filter(|_| !c.send(&mut s, later, &binding(1)).is_empty())
+        .count();
+    assert_eq!(answered, 5, "a second's worth");
+    // Its own budget, not its IP's: another client there is answered as before.
+    let other = Client::new("198.51.100.1:5001");
+    assert!(!other.send(&mut s, later, &binding(1)).is_empty());
+    // Signed answers aren't counted: a client that proved its credentials gets every one.
+    for _ in 0..50 {
+        assert_eq!(
+            c.request(&mut s, later, method::REFRESH, &name, &[lifetime(3600)])
+                .code(),
+            0
+        );
+    }
+    // A stale nonce's 438 on a Refresh, and the retry, once the budget has had a moment.
+    let stale = t + Duration::from_secs(3601);
+    assert_eq!(
+        c.request(&mut s, stale, method::REFRESH, &name, &[lifetime(600)])
+            .code(),
+        0
+    );
+    assert_eq!(s.stats().unauthenticated_dropped, 92 + 1 + 95);
+}
+
+#[test]
+fn a_client_holds_an_allocation_until_it_ends() {
+    // What the node asks before it keeps a stream open past its first half minute.
+    let t = Instant::now();
+    let mut s = server(t);
+    let mut a = Client::on("198.51.100.1:5000", 3);
+    let name = user("g1", "p_a");
+    assert!(!s.holds_allocation(a.core(), t));
+    a.allocate(&mut s, t, &name);
+    assert!(s.holds_allocation(a.core(), t));
+    let mapped = resonance_turn::Client {
+        addr: addr("[::ffff:198.51.100.1]:5000"),
+        conn: 3,
+    };
+    assert!(s.holds_allocation(mapped, t), "its IPv4-mapped form");
+    assert!(
+        !s.holds_allocation(resonance_turn::Client::udp(a.from), t),
+        "another 5-tuple at the same address"
+    );
+    // Past its lifetime and grace, even before a tick removes it.
+    assert!(!s.holds_allocation(a.core(), t + Duration::from_secs(661)));
+    // Or deleted.
+    assert_eq!(
+        a.request(&mut s, t, method::REFRESH, &name, &[lifetime(0)])
+            .code(),
+        0
+    );
+    assert!(!s.holds_allocation(a.core(), t));
+}
+
+#[test]
+fn spoofed_bindings_dont_keep_a_client_from_its_stale_nonce() {
+    // Bindings spoofed from a client's 5-tuple spend its allocation's budget for unsigned
+    // answers. The 438 its own Refresh gets once its nonce goes stale must still reach it, or
+    // every retransmission is lost and the browser drops the relay.
+    let t = Instant::now();
+    let mut s = server(t);
+    let mut c = Client::new("198.51.100.1:5000");
+    let name = ticket(UNIX + 7200, "ins", "g1", "p_a");
+    c.allocate(&mut s, t, &name);
+    assert_eq!(
+        c.request(&mut s, t, method::REFRESH, &name, &[lifetime(3600)])
+            .code(),
+        0
+    );
+    let spoofed = Client::new("198.51.100.1:5000");
+    let tx = c.next_tx();
+    let refresh = c.build(
+        method::REFRESH,
+        tx,
+        &name,
+        &pass(&name),
+        "gamerelay",
+        &[lifetime(3600)],
+        None,
+    );
+    // The same, with another password: anyone could send it.
+    let tx = c.next_tx();
+    let forged = c.build(
+        method::REFRESH,
+        tx,
+        &name,
+        "wrong",
+        "gamerelay",
+        &[lifetime(3600)],
+        None,
+    );
+    // From 5 s before the nonce goes stale, 100 a second; the Refresh and its retransmissions.
+    let resends = [0, 500, 1500, 3500, 7500, 15500, 31500];
+    let mut fresh = None;
+    for ms in (0..45_000u64).step_by(10) {
+        let at = t + Duration::from_millis(3_595_000 + ms);
+        spoofed.send(&mut s, at, &binding(1));
+        if ms >= 5000 && resends.contains(&(ms - 5000)) {
+            let r = c.ask(&mut s, at, &refresh);
+            assert_eq!(r.code(), 438, "at +{} ms", ms - 5000);
+            fresh = r.msg().str_attr(attr::NONCE).map(str::to_owned);
+        }
+    }
+    // And its retry with the fresh nonce succeeds.
+    c.nonce = fresh;
+    let at = t + Duration::from_secs(3640);
+    assert_eq!(
+        c.request(&mut s, at, method::REFRESH, &name, &[lifetime(600)])
+            .code(),
+        0
+    );
+    // A 438 to a request that doesn't check out against the allocation's key is still counted
+    // (the flood has just spent the budget).
+    let answered = (0..20)
+        .filter(|_| !spoofed.send(&mut s, at, &forged).is_empty())
+        .count();
+    assert!(answered < 10, "{answered}");
 }

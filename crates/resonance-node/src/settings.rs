@@ -170,6 +170,9 @@ impl Settings {
         let limits = Limits {
             max_streams: env.num("TURN_MAX_STREAMS", 1024)?,
             max_streams_per_ip: env.num("TURN_MAX_STREAMS_PER_IP", 64)?,
+            stream_rate: env.num("TURN_STREAM_RATE", 5.0)?,
+            stream_burst: env.num("TURN_STREAM_BURST", 16.0)?,
+            tls_handshake_rate: env.num("TURN_TLS_HANDSHAKE_RATE", 500.0)?,
             debug_streams: env.flag("TURN_DEBUG_STREAMS"),
             ..Limits::default()
         };
@@ -280,6 +283,15 @@ mod tests {
             (1024, 64)
         );
         assert_eq!(
+            (
+                s.limits.stream_rate,
+                s.limits.stream_burst,
+                s.limits.tls_handshake_rate
+            ),
+            (5.0, 16.0, 500.0)
+        );
+        assert_eq!(s.limits.unallocated, Duration::from_secs(30));
+        assert_eq!(
             (t.memory_total, t.memory_per_ip),
             (96 * 1024 * 1024, 16 * 1024 * 1024)
         );
@@ -337,6 +349,30 @@ mod tests {
         .unwrap();
         assert_eq!(s.turn.unauth_burst, 10.0);
         assert_eq!(s.turn.burst_bytes, 2000.0, "twice the rate");
+    }
+
+    #[test]
+    fn new_streams_and_tls_handshakes_have_their_own_rates() {
+        let s = settings(&[
+            ("TURN_PUBLIC_IP", "192.0.2.1"),
+            ("TURN_STREAM_RATE", "20"),
+            ("TURN_STREAM_BURST", "64"),
+            ("TURN_TLS_HANDSHAKE_RATE", "200"),
+        ])
+        .unwrap();
+        assert_eq!(
+            (
+                s.limits.stream_rate,
+                s.limits.stream_burst,
+                s.limits.tls_handshake_rate
+            ),
+            (20.0, 64.0, 200.0)
+        );
+        let e = error(&[
+            ("TURN_PUBLIC_IP", "192.0.2.1"),
+            ("TURN_TLS_HANDSHAKE_RATE", "0"),
+        ]);
+        assert!(e.contains("positive"), "{e}");
     }
 
     #[test]

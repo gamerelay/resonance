@@ -1,4 +1,5 @@
-//! Token buckets: bytes per allocation, and unauthenticated requests per client IP.
+//! Token buckets: bytes per allocation, and unauthenticated requests per client IP (and, in the
+//! node, new streams per client IP).
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -32,6 +33,11 @@ impl Bucket {
         }
         self.tokens -= n;
         true
+    }
+
+    /// Gives back n tokens taken for something that then didn't happen.
+    pub fn refund(&mut self, n: f64, burst: f64) {
+        self.tokens = (self.tokens + n).min(burst);
     }
 
     /// Would be full by now: nothing is lost by forgetting it.
@@ -110,6 +116,19 @@ mod tests {
         assert!(
             !b.spend(11.0, t + Duration::from_secs(100), 5.0, 10.0),
             "never more than the burst"
+        );
+        let later = t + Duration::from_secs(200);
+        assert!(b.spend(10.0, later, 5.0, 10.0));
+        b.refund(4.0, 10.0);
+        assert!(
+            b.spend(4.0, later, 5.0, 10.0),
+            "what's refunded is there again"
+        );
+        assert!(!b.spend(1.0, later, 5.0, 10.0));
+        b.refund(100.0, 10.0);
+        assert!(
+            !b.spend(11.0, later, 5.0, 10.0),
+            "a refund stops at the burst too"
         );
     }
 
