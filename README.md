@@ -33,7 +33,7 @@ first customer.
 This repo is the **node**: a room-scoped TURN relay in Rust. It replaced GameRelay's Go relay
 in production, and is the base for the network's later roles.
 
-**Status: v0, in production.** GameRelay's relays (San Francisco and New York) run it, joined
+**Status: v0, in production.** GameRelay's four relays (San Francisco, New York, Singapore and Frankfurt) run it, joined
 to GameRelay's registry (heartbeats, drain, revoke, tickets), measuring each other every
 2 s. pion's and coturn's TURN clients and Chromium, Firefox and WebKit relay through it, over
 UDP, TCP and TLS.
