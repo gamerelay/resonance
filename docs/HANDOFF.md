@@ -14,15 +14,17 @@ control-plane side.
   joined to GameRelay's registry: join, heartbeats, drain, revoke. Four nodes, `sfo-1`,
   `nyc-1`, `sgp-1` and `fra-1` (the last two since 2026-10-08), run `69f6e26` (#20, installed
   2026-10-10 one at a time with no allocations: the stream, TLS handshake and unsigned answer
-  limits, on top of v0.2.0's signed answers and memory budget), each on its own droplet with
+  limits, on top of the signed answers and the memory budget, #16 and #17), each on its own droplet with
   TLS on 443 and the unit's `LimitNOFILE=8192` and `TURN_STREAM_BURST=64`; they measure each
   other in GameRelay's Admin → Network, and all have `RESONANCE_ALERT_WEBHOOK` set. All have
   the control plane's answer key pinned, given out of band (`RESONANCE_CONTROL_KEY`), and
   believe no other answer. Checked from outside on 2026-10-13: each answers a STUN Binding over
   UDP, and its certificate runs to late December or early January.
-- **`69f6e26` has no tag:** it came after `v0.2.0` (`d1820f2`) with no version bump. Cut
-  `v0.2.1` (or the next) at it, so what runs is a recorded release (GameRelay's
-  RESONANCE-SECURITY.md, the deploy hardening items: a recorded build per release).
+- **`v0.3.0` is what runs, but not its build yet:** `v0.2.0` (`0cdf9a5`) came before the
+  signed answers, so everything the nodes run (#16, #17, #19, #20) went out untagged. `v0.3.0`
+  is `69f6e26` plus the version bump; the nodes report `resonance-node 0.2.0` until they're
+  reinstalled from the tag (GameRelay's `deploy/turn/`, one at a time, as on 2026-10-10), so what
+  runs is a recorded release (GameRelay's RESONANCE-SECURITY.md, the deploy hardening items).
 - **Players' credentials are tickets** since 2026-10-01 (PR #7; docs/PROTOCOL.md, "Tickets"):
   the shared-key credentials are gone. A control plane that mints only tickets doesn't hand out
   a node that hasn't sent its sealing key.
