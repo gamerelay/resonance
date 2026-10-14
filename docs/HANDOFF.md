@@ -1,6 +1,6 @@
 # Handoff
 
-Read this first when picking up work on the node. **Last updated:** 2026-10-02.
+Read this first when picking up work on the node. **Last updated:** 2026-10-13.
 
 What changed and when: [CHANGELOG.md](../CHANGELOG.md). The design (roles, the registry API,
 credentials, versioning, rollout) is GameRelay's
@@ -11,11 +11,18 @@ control-plane side.
 ## Where things stand
 
 - **v0's node is done and in production.** The room-scoped TURN relay (UDP, and TCP and TLS),
-  joined to GameRelay's registry: join, heartbeats, drain, revoke. Both nodes, `sfo-1` and
-  `nyc-1`, run `d1820f2` (installed 2026-10-02: v0.2.0, with signed answers and the memory
-  budget), each on its own droplet with TLS on 443; they measure each other in GameRelay's
-  Admin → Network, and both have `RESONANCE_ALERT_WEBHOOK` set. Both have the control plane's
-  answer key pinned, given out of band (`RESONANCE_CONTROL_KEY`), and believe no other answer.
+  joined to GameRelay's registry: join, heartbeats, drain, revoke. Four nodes, `sfo-1`,
+  `nyc-1`, `sgp-1` and `fra-1` (the last two since 2026-10-08), run `69f6e26` (#20, installed
+  2026-10-10 one at a time with no allocations: the stream, TLS handshake and unsigned answer
+  limits, on top of v0.2.0's signed answers and memory budget), each on its own droplet with
+  TLS on 443 and the unit's `LimitNOFILE=8192` and `TURN_STREAM_BURST=64`; they measure each
+  other in GameRelay's Admin → Network, and all have `RESONANCE_ALERT_WEBHOOK` set. All have
+  the control plane's answer key pinned, given out of band (`RESONANCE_CONTROL_KEY`), and
+  believe no other answer. Checked from outside on 2026-10-13: each answers a STUN Binding over
+  UDP, and its certificate runs to late December or early January.
+- **`69f6e26` has no tag:** it came after `v0.2.0` (`d1820f2`) with no version bump. Cut
+  `v0.2.1` (or the next) at it, so what runs is a recorded release (GameRelay's
+  RESONANCE-SECURITY.md, the deploy hardening items: a recorded build per release).
 - **Players' credentials are tickets** since 2026-10-01 (PR #7; docs/PROTOCOL.md, "Tickets"):
   the shared-key credentials are gone. A control plane that mints only tickets doesn't hand out
   a node that hasn't sent its sealing key.
@@ -31,7 +38,7 @@ control-plane side.
   (PROTOCOL.md, "Limits"; TECH_DEBT C1). GameRelay's unit caps the process at 384 MB.
 - **GameRelay is the only control plane** (`https://gamerelay.io/resonance/v0/…`, API
   `2026-09-29`). Nodes are minted, drained, revoked and deleted in its Admin → Nodes tab.
-- **Dependencies** are current as of #13 (dalek 3, RustCrypto 0.11). The crypto crates share
+- **Dependencies** are current as of #19 (Dependabot's cargo group, 2026-10-10; dalek 3 and RustCrypto 0.11 since #13). The crypto crates share
   `digest` and `curve25519-dalek`, so bump them together, not one Dependabot PR at a time.
 - CI (`.github/workflows/ci.yml`, actions pinned to commits) is green: the core's tests and a
   fuzz run, pion's and coturn's clients, and Chromium, Firefox and WebKit over UDP, TCP and TLS.
