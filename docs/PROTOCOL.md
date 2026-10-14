@@ -248,7 +248,7 @@ Both endpoints are `POST`.
 hour and can be used once; it carries the node's region.
 
 ```json
-→ { "token": "rjt_…", "pubkey": "<base64url>", "urls": ["turn:203.0.113.7:3478"], "software": "resonance-node 0.2.0", "seal_key": "<base64url>" }
+→ { "token": "rjt_…", "pubkey": "<base64url>", "urls": ["turn:203.0.113.7:3478"], "software": "resonance-node 0.3.0", "seal_key": "<base64url>" }
 ← { "node_id": "rn_…", "region": "nyc", "heartbeat_s": 15, "control_key": "<base64url>" }
 ```
 
@@ -257,7 +257,7 @@ hour and can be used once; it carries the node's region.
 ```json
 → {
     "allocations": 12, "bytes_in": 48211, "bytes_out": 47980, "cpu": 0.04, "uptime_s": 86400,
-    "software": "resonance-node 0.2.0",
+    "software": "resonance-node 0.3.0",
     "urls": ["turn:203.0.113.7:3478", "turns:turn.example.com:443?transport=tcp"],
     "peers": [{ "node": "rn_b…", "sent": 14, "answered": 14, "rtt_ms": 62.5 }],
     "seal_key": "<base64url>"

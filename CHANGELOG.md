@@ -4,6 +4,24 @@ What changed in the node, newest first, by date, with the commits. Releases are 
 `v<version>` (the crates' version, `Cargo.toml`); an entry says where one was cut. The control plane's API is dated
 separately (`resonance-proto::VERSION`, `2026-09-29`); an entry says when it changes.
 
+## 2026-10-14
+
+**v0.3.0.** Everything since v0.2.0, as on all four nodes (`69f6e26`), with the version bumped.
+A minor version, not a patch: since the signed answers, a node believes only answers signed by the
+key it pinned, so a control plane that doesn't sign them is out of reach to it. The control plane's
+API is still `2026-09-29`. In it:
+
+- **Signed answers** (#16, 2026-10-02 below): the control plane signs every answer, tied to the
+  request it answers; a node pins its key at join, from its first signed heartbeat answer, or from
+  `RESONANCE_CONTROL_KEY`.
+- **One memory budget** (#17, 2026-10-02 below): 96 MB, 16 MB per IP, charged by allocations,
+  kept tickets and streams.
+- **Tighter limits on streams and unsigned answers** (#20, 2026-10-10 below).
+- **Dependabot's cargo group** (#19).
+
+Nodes running `69f6e26` have the same code and report `resonance-node 0.2.0` until reinstalled
+from this tag.
+
 ## 2026-10-10
 
 **Streams and unsigned answers have tighter limits.** No change on the wire or to the API.
