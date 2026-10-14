@@ -1,6 +1,6 @@
 # Handoff
 
-Read this first when picking up work on the node. **Last updated:** 2026-10-13.
+Read this first when picking up work on the node. **Last updated:** 2026-10-14.
 
 What changed and when: [CHANGELOG.md](../CHANGELOG.md). The design (roles, the registry API,
 credentials, versioning, rollout) is GameRelay's
@@ -20,11 +20,11 @@ control-plane side.
   the control plane's answer key pinned, given out of band (`RESONANCE_CONTROL_KEY`), and
   believe no other answer. Checked from outside on 2026-10-13: each answers a STUN Binding over
   UDP, and its certificate runs to late December or early January.
-- **`v0.3.0` is what runs, but not its build yet:** `v0.2.0` (`0cdf9a5`) came before the
-  signed answers, so everything the nodes run (#16, #17, #19, #20) went out untagged. `v0.3.0`
-  is `69f6e26` plus the version bump; the nodes report `resonance-node 0.2.0` until they're
-  reinstalled from the tag (GameRelay's `deploy/turn/`, one at a time, as on 2026-10-10), so what
-  runs is a recorded release (GameRelay's RESONANCE-SECURITY.md, the deploy hardening items).
+- **`v0.3.0` is tagged (2026-10-14, #22) and is what runs, but not its build yet:** it is
+  `69f6e26` plus the version bump, so the nodes have its code and report `resonance-node 0.2.0`
+  until they're reinstalled from the tag (GameRelay's `deploy/turn/`, one at a time, as on
+  2026-10-10). Then what runs is a recorded release (GameRelay's RESONANCE-SECURITY.md, the
+  deploy hardening items).
 - **Players' credentials are tickets** since 2026-10-01 (PR #7; docs/PROTOCOL.md, "Tickets"):
   the shared-key credentials are gone. A control plane that mints only tickets doesn't hand out
   a node that hasn't sent its sealing key.
@@ -39,9 +39,13 @@ control-plane side.
   allocations, kept tickets and streams all charge, streams per IP, and channels per allocation
   (PROTOCOL.md, "Limits"; TECH_DEBT C1). GameRelay's unit caps the process at 384 MB.
 - **GameRelay is the only control plane** (`https://gamerelay.io/resonance/v0/…`, API
-  `2026-09-29`). Nodes are minted, drained, revoked and deleted in its Admin → Nodes tab.
-- **Dependencies** are current as of #19 (Dependabot's cargo group, 2026-10-10; dalek 3 and RustCrypto 0.11 since #13). The crypto crates share
-  `digest` and `curve25519-dalek`, so bump them together, not one Dependabot PR at a time.
+  `2026-09-29`). Nodes are minted, drained, revoked and deleted in its Admin → Network tab (the nodes are listed
+  below the live map since 2026-10-14; `?tab=nodes` still opens them).
+- **Dependencies** are current: the node's as of #19 (Dependabot's cargo group, 2026-10-10;
+  dalek 3 and RustCrypto 0.11 since #13), and `interop/`'s Go module (test-only, never in the
+  node) as of #23 and #24 (2026-10-14: pion/stun 3.1.5, which brought pion/dtls 3.1.4, and
+  `golang.org/x/crypto` 0.52). The crypto crates share `digest` and `curve25519-dalek`, so bump
+  them together, not one Dependabot PR at a time. Merged PRs' branches are deleted on merge.
 - CI (`.github/workflows/ci.yml`, actions pinned to commits) is green: the core's tests and a
   fuzz run, pion's and coturn's clients, and Chromium, Firefox and WebKit over UDP, TCP and TLS.
 
